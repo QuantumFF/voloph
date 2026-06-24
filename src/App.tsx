@@ -1,5 +1,6 @@
-import type { CSSProperties } from "react"
+import { useState, type CSSProperties } from "react"
 import { AppSidebar } from "@/components/app-sidebar"
+import { RecordingPlayer } from "@/components/recording-player"
 import { SessionList } from "@/components/session-list"
 import { SiteHeader } from "@/components/site-header"
 import {
@@ -9,6 +10,8 @@ import {
 import { TooltipProvider } from "@/components/ui/tooltip"
 
 export default function App() {
+  const [playingPath, setPlayingPath] = useState<string | null>(null)
+
   return (
     <TooltipProvider>
       <SidebarProvider
@@ -26,7 +29,14 @@ export default function App() {
             <div className="@container/main flex flex-1 flex-col gap-2">
               <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6">
                 <div className="px-4 lg:px-6">
-                  <SessionList />
+                  {playingPath ? (
+                    <RecordingPlayer
+                      path={playingPath}
+                      onBack={() => setPlayingPath(null)}
+                    />
+                  ) : (
+                    <SessionList onPlay={setPlayingPath} />
+                  )}
                 </div>
               </div>
             </div>

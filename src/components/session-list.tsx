@@ -46,7 +46,12 @@ function fileName(path: string): string {
   return parts[parts.length - 1] || path
 }
 
-export function SessionList() {
+interface SessionListProps {
+  /** Open a recording in the player by its on-disk path. */
+  onPlay: (path: string) => void
+}
+
+export function SessionList({ onPlay }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -120,17 +125,20 @@ export function SessionList() {
               </div>
               <ul className="divide-y">
                 {session.recordings.map((recording) => (
-                  <li
-                    key={recording.id}
-                    className="flex items-center gap-3 px-4 py-2 text-sm"
-                  >
-                    <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate font-medium" title={recording.path}>
-                      {fileName(recording.path)}
-                    </span>
-                    <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
-                      {formatSize(recording.file_size)}
-                    </span>
+                  <li key={recording.id}>
+                    <button
+                      type="button"
+                      onClick={() => onPlay(recording.path)}
+                      className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-accent"
+                    >
+                      <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="truncate font-medium" title={recording.path}>
+                        {fileName(recording.path)}
+                      </span>
+                      <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
+                        {formatSize(recording.file_size)}
+                      </span>
+                    </button>
                   </li>
                 ))}
               </ul>
