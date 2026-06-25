@@ -1,4 +1,5 @@
 mod db;
+mod media;
 
 use std::sync::Mutex;
 
@@ -72,7 +73,12 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .plugin(external_navigation_plugin())
+        // Player playback source: probe + passthrough-or-transcode via ffmpeg.
+        .register_asynchronous_uri_scheme_protocol(media::SCHEME, |ctx, request, responder| {
+            media::handle(ctx.app_handle().clone(), request, responder);
+        })
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
