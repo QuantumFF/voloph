@@ -114,6 +114,46 @@ fn reanalyze_recording(app: AppHandle, db: State<'_, Db>, path: String) -> Resul
     Ok(())
 }
 
+/// Move a rally's boundaries in the draft timeline (issue #7). Backs the
+/// adjust-boundary correction directly, and the split and merge corrections
+/// indirectly (the frontend composes those from update + add/delete). Persists
+/// immediately so gap-free playback reflects the corrected timeline on its next
+/// read, with no reload. Returns whether a rally was actually updated.
+#[tauri::command]
+fn update_rally(
+    db: State<'_, Db>,
+    path: String,
+    rally_id: i64,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::update_rally(&conn, &path, rally_id, start_ms, end_ms).map_err(|e| e.to_string())
+}
+
+/// Create a rally over a span the segmenter missed (issue #7 — the add
+/// correction, and the new half of a split). Persists immediately; returns the
+/// new rally's id, or `None` when `path` is not a registered recording.
+#[tauri::command]
+fn add_rally(
+    db: State<'_, Db>,
+    path: String,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Option<i64>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::add_rally(&conn, &path, start_ms, end_ms).map_err(|e| e.to_string())
+}
+
+/// Remove a rally from the draft timeline (issue #7 — delete a false positive,
+/// whose span then becomes a derived gap; also the discarded half of a merge).
+/// Persists immediately. Returns whether a rally was actually removed.
+#[tauri::command]
+fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::delete_rally(&conn, &path, rally_id).map_err(|e| e.to_string())
+}
+
 /// Start the background media worker unless one is already running. It drains
 /// every pending unit of work — probe each `unknown` recording, transcode each
 /// `pending` one in place (ADR 0005), then segment each playable-but-unsegmented
@@ -320,6 +360,9 @@ pub fn run() {
             resolve_playback,
             recording_timeline,
             reanalyze_recording,
+            update_rally,
+            add_rally,
+            delete_rally,
             playback_endpoint
         ])
         .on_page_load(|webview, payload| {

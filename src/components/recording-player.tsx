@@ -6,7 +6,11 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   Loader2Icon,
+  PencilIcon,
+  PlusIcon,
   RotateCwIcon,
+  ScissorsIcon,
+  Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react"
 
@@ -43,8 +47,10 @@ interface PlaybackEndpoint {
   token: string
 }
 
-/** A detected rally interval over the recording (see `src-tauri/src/segment.rs`). */
+/** A rally interval over the recording (see `TimelineRally` in `src-tauri/src/db.rs`). */
 interface Rally {
+  /** Database row id, so inline corrections (issue #7) can target this rally. */
+  id: number
   start_ms: number
   end_ms: number
   /** Per-region confidence in [0, 1]; low values are uncertain regions. */
@@ -138,6 +144,10 @@ export function RecordingPlayer({ recordings, startIndex = 0, onBack }: Recordin
   // re-segments (the tuning loop, ADR 0002); `reanalyzing` guards the button.
   const [reanalyzeNonce, setReanalyzeNonce] = useState(0)
   const [reanalyzing, setReanalyzing] = useState(false)
+  // Whether the timeline strip is in correction mode (issue #7): the five inline
+  // edits (adjust, split, merge, add, delete) are exposed only while editing, so
+  // ordinary review stays a click-to-seek strip.
+  const [editing, setEditing] = useState(false)
 
   // Which recording in the playlist is loaded, and where to resume once its
   // timeline arrives after a boundary crossing: "start" plays from the first
@@ -368,6 +378,96 @@ export function RecordingPlayer({ recordings, startIndex = 0, onBack }: Recordin
       .finally(() => setReanalyzing(false))
   }, [path])
 
+  // Re-fetch the saved timeline after an inline correction (issue #7) without
+  // blanking the strip or restarting segmentation polling — the recording stays
+  // `ready`, only its rallies changed. Gap-free playback reads `rallies` on the
+  // next tick, so the correction takes effect immediately with no reload.
+  const refreshTimeline = useCallback(() => {
+    if (!path) return
+    trackedInvoke<Timeline>("recording_timeline", { path })
+      .then(setTimeline)
+      .catch(() => {})
+  }, [path])
+
+  // The five inline corrections (issue #7). Each persists immediately to SQLite
+  // (surviving restart) and re-reads the timeline so playback reflects it at
+  // once. Split and merge are composed from the same row-level edits as the
+  // primitive add/adjust/delete — these are the complete set on a rally-interval
+  // timeline. Confidence is set certain server-side (a hand-corrected rally is
+  // no longer an uncertain region).
+  const adjustRally = useCallback(
+    (rallyId: number, startMs: number, endMs: number) => {
+      if (!path) return
+      void trackedInvoke("update_rally", { path, rallyId, startMs, endMs })
+        .then(refreshTimeline)
+        .catch(() => {})
+    },
+    [path, refreshTimeline],
+  )
+
+  const addRally = useCallback(
+    (startMs: number, endMs: number) => {
+      if (!path) return
+      void trackedInvoke("add_rally", { path, startMs, endMs })
+        .then(refreshTimeline)
+        .catch(() => {})
+    },
+    [path, refreshTimeline],
+  )
+
+  const deleteRally = useCallback(
+    (rallyId: number) => {
+      if (!path) return
+      void trackedInvoke("delete_rally", { path, rallyId })
+        .then(refreshTimeline)
+        .catch(() => {})
+    },
+    [path, refreshTimeline],
+  )
+
+  // Split a rally in two at `atMs`: shrink it to end at the cut, then add a new
+  // rally from the cut to the old end. A no-op unless the cut falls strictly
+  // inside the rally.
+  const splitRally = useCallback(
+    (rally: Rally, atMs: number) => {
+      if (!path || atMs <= rally.start_ms || atMs >= rally.end_ms) return
+      void trackedInvoke("update_rally", {
+        path,
+        rallyId: rally.id,
+        startMs: rally.start_ms,
+        endMs: Math.round(atMs),
+      })
+        .then(() =>
+          trackedInvoke("add_rally", {
+            path,
+            startMs: Math.round(atMs),
+            endMs: rally.end_ms,
+          }),
+        )
+        .then(refreshTimeline)
+        .catch(() => {})
+    },
+    [path, refreshTimeline],
+  )
+
+  // Merge a rally with the one after it: stretch the first to cover both, then
+  // delete the second. The gap between them is absorbed into the joined rally.
+  const mergeRallies = useCallback(
+    (first: Rally, second: Rally) => {
+      if (!path) return
+      void trackedInvoke("update_rally", {
+        path,
+        rallyId: first.id,
+        startMs: Math.min(first.start_ms, second.start_ms),
+        endMs: Math.max(first.end_ms, second.end_ms),
+      })
+        .then(() => trackedInvoke("delete_rally", { path, rallyId: second.id }))
+        .then(refreshTimeline)
+        .catch(() => {})
+    },
+    [path, refreshTimeline],
+  )
+
   const handleError = useCallback(() => {
     const media = videoRef.current
     const err = media?.error
@@ -444,6 +544,13 @@ export function RecordingPlayer({ recordings, startIndex = 0, onBack }: Recordin
             reanalyzing={reanalyzing}
             canPrev={!atFirstRecording}
             canNext={!atLastRecording}
+            editing={editing}
+            onToggleEditing={() => setEditing((e) => !e)}
+            onAdjustRally={adjustRally}
+            onAddRally={addRally}
+            onDeleteRally={deleteRally}
+            onSplitRally={splitRally}
+            onMergeRallies={mergeRallies}
           />
         </>
       ) : (
@@ -477,6 +584,13 @@ function RallyTimeline({
   reanalyzing,
   canPrev,
   canNext,
+  editing,
+  onToggleEditing,
+  onAdjustRally,
+  onAddRally,
+  onDeleteRally,
+  onSplitRally,
+  onMergeRallies,
 }: {
   timeline: Timeline | null
   currentMs: number
@@ -488,11 +602,73 @@ function RallyTimeline({
   reanalyzing: boolean
   canPrev: boolean
   canNext: boolean
+  editing: boolean
+  onToggleEditing: () => void
+  onAdjustRally: (rallyId: number, startMs: number, endMs: number) => void
+  onAddRally: (startMs: number, endMs: number) => void
+  onDeleteRally: (rallyId: number) => void
+  onSplitRally: (rally: Rally, atMs: number) => void
+  onMergeRallies: (first: Rally, second: Rally) => void
 }) {
+  // The rally currently picked for split/merge/delete in correction mode.
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  // While dragging an edge: which rally/edge and the in-progress ms, so the
+  // block redraws live and we only persist on release.
+  const [drag, setDrag] = useState<{
+    rallyId: number
+    edge: "start" | "end"
+    ms: number
+  } | null>(null)
+  const stripRef = useRef<HTMLDivElement>(null)
+
+  const duration = timeline?.duration_ms ?? 0
+
+  // Map a client x-coordinate over the strip to a time in ms (clamped). Drives
+  // both edge-dragging and the live position while dragging.
+  const xToMs = useCallback(
+    (clientX: number): number => {
+      const rect = stripRef.current?.getBoundingClientRect()
+      if (!rect || rect.width === 0) return 0
+      const frac = (clientX - rect.left) / rect.width
+      return Math.round(Math.min(Math.max(frac, 0), 1) * duration)
+    },
+    [duration],
+  )
+
+  // While dragging a rally edge, follow the pointer anywhere on the page and
+  // persist the new boundary on release. Bound globally so the drag survives the
+  // pointer leaving the thin strip. Hooks run before the early return below, so
+  // this is unconditional even when there's no timeline (then `drag` stays null
+  // and the effect is inert).
+  useEffect(() => {
+    if (!drag) return
+    const rallies = timeline?.rallies ?? []
+    const move = (e: PointerEvent) =>
+      setDrag((d) => (d ? { ...d, ms: xToMs(e.clientX) } : d))
+    const up = () => {
+      setDrag((d) => {
+        if (d) {
+          const rally = rallies.find((r) => r.id === d.rallyId)
+          if (rally) {
+            const start = d.edge === "start" ? d.ms : rally.start_ms
+            const end = d.edge === "end" ? d.ms : rally.end_ms
+            onAdjustRally(rally.id, start, end)
+          }
+        }
+        return null
+      })
+    }
+    window.addEventListener("pointermove", move)
+    window.addEventListener("pointerup", up)
+    return () => {
+      window.removeEventListener("pointermove", move)
+      window.removeEventListener("pointerup", up)
+    }
+  }, [drag, timeline, xToMs, onAdjustRally])
+
   if (!timeline) return null
 
   const analyzing = reanalyzing || timeline.segment_state === "unknown"
-  const duration = timeline.duration_ms ?? 0
   const hasRallies = duration > 0 && timeline.rallies.length > 0
   const uncertainCount = timeline.rallies.filter(
     (r) => r.confidence < UNCERTAIN_CONFIDENCE,
@@ -532,6 +708,18 @@ function RallyTimeline({
   // Clamp the playhead into the strip; only shown once we know the duration.
   const playheadPct =
     duration > 0 ? Math.min(Math.max((currentMs / duration) * 100, 0), 100) : null
+
+  // The selected rally and its neighbour (for merge), recomputed each render so
+  // they stay valid as the timeline changes under an edit.
+  const rallies = timeline.rallies
+  const selectedIndex = rallies.findIndex((r) => r.id === selectedId)
+  const selected = selectedIndex >= 0 ? rallies[selectedIndex] : null
+  const nextRally = selectedIndex >= 0 ? rallies[selectedIndex + 1] ?? null : null
+  // A split is only meaningful when the playhead falls strictly inside the
+  // selected rally; merge needs a following rally to join.
+  const canSplit =
+    selected !== null && currentMs > selected.start_ms && currentMs < selected.end_ms
+  const canMerge = selected !== null && nextRally !== null
 
   return (
     <div className="space-y-2">
@@ -578,45 +766,165 @@ function RallyTimeline({
             <RotateCwIcon className={`size-4 ${reanalyzing ? "animate-spin" : ""}`} />
             Re-analyze
           </Button>
+          <Button
+            variant={editing ? "default" : "outline"}
+            size="sm"
+            onClick={onToggleEditing}
+            disabled={analyzing || timeline.segment_state === "failed"}
+            title="Correct the draft timeline: drag rally edges, split, merge, add, or delete."
+          >
+            <PencilIcon className="size-4" />
+            {editing ? "Done editing" : "Edit timeline"}
+          </Button>
         </div>
       </div>
+      {editing ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+          <span>
+            {selected
+              ? `Rally ${selectedIndex + 1} selected (${formatClock(
+                  selected.start_ms,
+                )}–${formatClock(selected.end_ms)})`
+              : "Drag a rally's edge to adjust it, or click a rally to select it."}
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                // Add a rally over the missed span around the playhead, then
+                // select it for further tweaking.
+                const start = Math.max(0, Math.round(currentMs - 2000))
+                const end = Math.min(duration, Math.round(currentMs + 2000))
+                onAddRally(start, end)
+              }}
+              title="Add a rally over a span the segmenter missed (around the playhead)."
+            >
+              <PlusIcon className="size-4" />
+              Add at playhead
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => selected && onSplitRally(selected, currentMs)}
+              disabled={!canSplit}
+              title="Split the selected rally in two at the playhead."
+            >
+              <ScissorsIcon className="size-4" />
+              Split at playhead
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => selected && nextRally && onMergeRallies(selected, nextRally)}
+              disabled={!canMerge}
+              title="Merge the selected rally with the next one."
+            >
+              Merge with next
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                if (selected) {
+                  onDeleteRally(selected.id)
+                  setSelectedId(null)
+                }
+              }}
+              disabled={!selected}
+              title="Delete the selected rally (its span becomes a gap)."
+            >
+              <Trash2Icon className="size-4" />
+              Delete
+            </Button>
+          </div>
+        </div>
+      ) : null}
       {hasRallies ? (
         <div
+          ref={stripRef}
           className="relative h-12 w-full cursor-pointer overflow-hidden rounded-md bg-muted"
           onClick={(e) => {
-            // Clicking the strip seeks playback to that point (issue #6): map the
-            // click's x within the strip to a fraction of the recording. Rally
-            // blocks stop propagation and seek to their own start instead.
+            // Clicking empty strip seeks playback to that point (issue #6): map
+            // the click's x within the strip to a fraction of the recording.
+            // While editing, clicking empty strip clears the selection instead.
+            // Rally blocks stop propagation (seek, or select while editing).
+            if (editing) {
+              setSelectedId(null)
+              return
+            }
             const rect = e.currentTarget.getBoundingClientRect()
             const frac = (e.clientX - rect.left) / rect.width
             onSeek(Math.min(Math.max(frac, 0), 1) * duration)
           }}
         >
           <Waveform peaks={timeline.waveform} />
-          {timeline.rallies.map((rally, i) => {
-            const left = (rally.start_ms / duration) * 100
-            const width = ((rally.end_ms - rally.start_ms) / duration) * 100
+          {rallies.map((rally, i) => {
+            // While dragging this rally's edge, draw it at the live position so
+            // the resize is visible before it persists on release.
+            const dragging = drag?.rallyId === rally.id ? drag : null
+            const startMs = dragging?.edge === "start" ? dragging.ms : rally.start_ms
+            const endMs = dragging?.edge === "end" ? dragging.ms : rally.end_ms
+            const lo = Math.min(startMs, endMs)
+            const hi = Math.max(startMs, endMs)
+            const left = (lo / duration) * 100
+            const width = ((hi - lo) / duration) * 100
             const uncertain = rally.confidence < UNCERTAIN_CONFIDENCE
+            const isSelected = editing && rally.id === selectedId
             return (
               <button
-                key={i}
+                key={rally.id}
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation()
-                  onSeek(rally.start_ms)
+                  if (editing) {
+                    setSelectedId(rally.id)
+                  } else {
+                    onSeek(rally.start_ms)
+                  }
                 }}
-                className={
+                className={`absolute inset-y-0 rounded-sm transition-opacity hover:opacity-80 ${
                   uncertain
-                    ? "absolute inset-y-0 rounded-sm border border-amber-500/70 bg-amber-500/40 transition-opacity hover:opacity-80"
-                    : "absolute inset-y-0 rounded-sm bg-primary/70 transition-opacity hover:opacity-80"
-                }
+                    ? "border border-amber-500/70 bg-amber-500/40"
+                    : "bg-primary/70"
+                } ${isSelected ? "ring-2 ring-foreground ring-offset-1 ring-offset-muted" : ""}`}
                 style={{ left: `${left}%`, width: `${Math.max(width, 0.4)}%` }}
                 title={`Rally ${i + 1}: ${formatClock(rally.start_ms)}–${formatClock(
                   rally.end_ms,
                 )}${uncertain ? " (uncertain)" : ""} · confidence ${Math.round(
                   rally.confidence * 100,
                 )}%`}
-              />
+              >
+                {editing ? (
+                  <>
+                    {/* Drag handles to adjust each boundary (issue #7). */}
+                    <span
+                      role="separator"
+                      aria-label="Drag rally start"
+                      onClick={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => {
+                        e.stopPropagation()
+                        e.preventDefault()
+                        setSelectedId(rally.id)
+                        setDrag({ rallyId: rally.id, edge: "start", ms: rally.start_ms })
+                      }}
+                      className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize rounded-l-sm bg-foreground/70 hover:bg-foreground"
+                    />
+                    <span
+                      role="separator"
+                      aria-label="Drag rally end"
+                      onClick={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => {
+                        e.stopPropagation()
+                        e.preventDefault()
+                        setSelectedId(rally.id)
+                        setDrag({ rallyId: rally.id, edge: "end", ms: rally.end_ms })
+                      }}
+                      className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize rounded-r-sm bg-foreground/70 hover:bg-foreground"
+                    />
+                  </>
+                ) : null}
+              </button>
             )
           })}
           {playheadPct !== null ? (

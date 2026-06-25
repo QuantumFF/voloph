@@ -416,6 +416,19 @@ pub fn save_rallies(
     tx.commit()
 }
 
+/// A rally as the player needs it: the segmenter's interval plus its database
+/// `id`, so inline timeline corrections (issue #7) can target a specific rally
+/// row. Distinct from [`crate::segment::Rally`] (the segmenter's id-less output)
+/// because once persisted a rally is identified by its row, not by re-running
+/// the heuristic.
+#[derive(Debug, Serialize)]
+pub struct TimelineRally {
+    pub id: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub confidence: f64,
+}
+
 /// A recording's draft timeline as the player needs it: where the recording is
 /// in its segmentation lifecycle, its duration, and the rally intervals.
 #[derive(Debug, Serialize)]
@@ -426,7 +439,7 @@ pub struct Timeline {
     /// Recording duration in ms (`None` until segmented), so the player can lay
     /// rallies out over the full span.
     pub duration_ms: Option<i64>,
-    pub rallies: Vec<crate::segment::Rally>,
+    pub rallies: Vec<TimelineRally>,
     /// Downsampled audio waveform peaks in `[0, 1]` (issue #6) for the timeline
     /// strip; empty until segmented. Shuttle hits show as spikes, so rally
     /// boundaries can be eyeballed against the rally blocks laid over them.
@@ -455,15 +468,16 @@ pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Opt
     let waveform = parse_waveform(waveform_json.as_deref());
 
     let mut stmt = conn.prepare(
-        "SELECT start_ms, end_ms, confidence FROM rallies
+        "SELECT id, start_ms, end_ms, confidence FROM rallies
          WHERE recording_id = ?1 ORDER BY start_ms",
     )?;
     let rallies = stmt
         .query_map([id], |row| {
-            Ok(crate::segment::Rally {
-                start_ms: row.get(0)?,
-                end_ms: row.get(1)?,
-                confidence: row.get(2)?,
+            Ok(TimelineRally {
+                id: row.get(0)?,
+                start_ms: row.get(1)?,
+                end_ms: row.get(2)?,
+                confidence: row.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -474,6 +488,91 @@ pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Opt
         rallies,
         waveform,
     }))
+}
+
+/// Confidence stamped on a hand-corrected rally. The user has confirmed it by
+/// editing it, so it is fully certain — never an uncertain region (ADR 0002).
+const CORRECTED_CONFIDENCE: f64 = 1.0;
+
+/// The database id of the recording at `path`, or `None` when unregistered.
+/// The inline-correction commands resolve the recording first, then scope every
+/// edit to its rallies, so a stray id from another recording cannot be touched.
+fn recording_id(conn: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
+    conn.query_row("SELECT id FROM recordings WHERE path = ?1", [path], |row| {
+        row.get(0)
+    })
+    .optional()
+}
+
+/// Move a rally's boundaries (issue #7 — adjust, and the mechanic behind split
+/// and merge). `start_ms`/`end_ms` are clamped to a sane order and the edit is
+/// scoped to the recording at `path` so only its own rally can be moved. The
+/// rally becomes fully certain (a hand-corrected boundary is no longer doubted).
+/// Returns `false` when the recording or rally is not found.
+///
+/// Annotations are pinned to absolute time, not to a rally (glossary), so moving
+/// a boundary cannot disturb them — there is nothing to cascade.
+pub fn update_rally(
+    conn: &Connection,
+    path: &str,
+    rally_id: i64,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<bool> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(false);
+    };
+    let (lo, hi) = if start_ms <= end_ms {
+        (start_ms, end_ms)
+    } else {
+        (end_ms, start_ms)
+    };
+    let changed = conn.execute(
+        "UPDATE rallies SET start_ms = ?1, end_ms = ?2, confidence = ?3
+         WHERE id = ?4 AND recording_id = ?5",
+        rusqlite::params![lo, hi, CORRECTED_CONFIDENCE, rally_id, rid],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Create a rally over a span the segmenter missed (issue #7 — add, and the
+/// mechanic behind split). Scoped to the recording at `path`; the new rally is
+/// fully certain. Returns the new rally's id, or `None` when `path` is not
+/// registered.
+pub fn add_rally(
+    conn: &Connection,
+    path: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> rusqlite::Result<Option<i64>> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(None);
+    };
+    let (lo, hi) = if start_ms <= end_ms {
+        (start_ms, end_ms)
+    } else {
+        (end_ms, start_ms)
+    };
+    conn.execute(
+        "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![rid, lo, hi, CORRECTED_CONFIDENCE],
+    )?;
+    Ok(Some(conn.last_insert_rowid()))
+}
+
+/// Remove a rally (issue #7 — delete a false positive, leaving its span a
+/// derived gap; also the mechanic behind merge). Scoped to the recording at
+/// `path`. Returns `false` when the recording or rally is not found.
+pub fn delete_rally(conn: &Connection, path: &str, rally_id: i64) -> rusqlite::Result<bool> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(false);
+    };
+    let changed = conn.execute(
+        "DELETE FROM rallies WHERE id = ?1 AND recording_id = ?2",
+        rusqlite::params![rally_id, rid],
+    )?;
+    Ok(changed > 0)
 }
 
 /// Parse the stored waveform JSON (a bare array of floats written by
@@ -490,4 +589,131 @@ fn parse_waveform(json: Option<&str>) -> Vec<f32> {
         .split(',')
         .filter_map(|s| s.trim().parse::<f32>().ok())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An in-memory DB with the schema and one segmented recording carrying the
+    /// given rally intervals — the starting point for an inline-correction test.
+    fn db_with_rallies(path: &str, intervals: &[(i64, i64)]) -> (Connection, i64) {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (capture_day) VALUES ('2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, transcode_state, segment_state, duration_ms)
+             VALUES (1, ?1, 0, '', '2026-01-01', 'ready', 'ready', 100000)",
+            [path],
+        )
+        .unwrap();
+        let rallies: Vec<crate::segment::Rally> = intervals
+            .iter()
+            .map(|&(start_ms, end_ms)| crate::segment::Rally {
+                start_ms,
+                end_ms,
+                confidence: 0.3, // start uncertain, so a correction flipping to 1.0 is visible
+            })
+            .collect();
+        save_rallies(&mut conn, 1, 100_000, &rallies, &[]).unwrap();
+        (conn, 1)
+    }
+
+    fn intervals(conn: &Connection, path: &str) -> Vec<(i64, i64, f64)> {
+        recording_timeline(conn, path)
+            .unwrap()
+            .unwrap()
+            .rallies
+            .into_iter()
+            .map(|r| (r.start_ms, r.end_ms, r.confidence))
+            .collect()
+    }
+
+    #[test]
+    fn adjust_moves_a_boundary_and_marks_it_certain() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        let id = recording_timeline(&conn, "/r.mp4").unwrap().unwrap().rallies[0].id;
+        assert!(update_rally(&conn, "/r.mp4", id, 2000, 6000).unwrap());
+        assert_eq!(intervals(&conn, "/r.mp4"), vec![(2000, 6000, 1.0)]);
+    }
+
+    #[test]
+    fn add_creates_a_rally_over_a_missed_span() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        let new_id = add_rally(&conn, "/r.mp4", 8000, 12000).unwrap().unwrap();
+        assert!(new_id > 0);
+        // Ordered by start, the new rally lands after the original, fully certain.
+        assert_eq!(
+            intervals(&conn, "/r.mp4"),
+            vec![(1000, 5000, 0.3), (8000, 12000, 1.0)]
+        );
+    }
+
+    #[test]
+    fn delete_removes_a_false_rally() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000), (8000, 12000)]);
+        let id = recording_timeline(&conn, "/r.mp4").unwrap().unwrap().rallies[0].id;
+        assert!(delete_rally(&conn, "/r.mp4", id).unwrap());
+        assert_eq!(intervals(&conn, "/r.mp4"), vec![(8000, 12000, 0.3)]);
+    }
+
+    #[test]
+    fn split_is_update_plus_add() {
+        // The frontend composes split from update + add; exercise the same here.
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 9000)]);
+        let id = recording_timeline(&conn, "/r.mp4").unwrap().unwrap().rallies[0].id;
+        update_rally(&conn, "/r.mp4", id, 1000, 5000).unwrap();
+        add_rally(&conn, "/r.mp4", 5000, 9000).unwrap();
+        assert_eq!(
+            intervals(&conn, "/r.mp4"),
+            vec![(1000, 5000, 1.0), (5000, 9000, 1.0)]
+        );
+    }
+
+    #[test]
+    fn merge_is_update_plus_delete() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000), (8000, 12000)]);
+        let tl = recording_timeline(&conn, "/r.mp4").unwrap().unwrap();
+        let (first, second) = (tl.rallies[0].id, tl.rallies[1].id);
+        update_rally(&conn, "/r.mp4", first, 1000, 12000).unwrap();
+        delete_rally(&conn, "/r.mp4", second).unwrap();
+        assert_eq!(intervals(&conn, "/r.mp4"), vec![(1000, 12000, 1.0)]);
+    }
+
+    #[test]
+    fn reversed_drag_is_normalized() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        let id = recording_timeline(&conn, "/r.mp4").unwrap().unwrap().rallies[0].id;
+        // Dragging the start edge past the end swaps them rather than storing a
+        // backwards interval.
+        update_rally(&conn, "/r.mp4", id, 7000, 3000).unwrap();
+        assert_eq!(intervals(&conn, "/r.mp4"), vec![(3000, 7000, 1.0)]);
+    }
+
+    #[test]
+    fn edits_are_scoped_to_their_recording() {
+        let (conn, _) = db_with_rallies("/a.mp4", &[(1000, 5000)]);
+        conn.execute(
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, transcode_state, segment_state, duration_ms)
+             VALUES (1, '/b.mp4', 0, '', '2026-01-01', 'ready', 'ready', 100000)",
+            [],
+        )
+        .unwrap();
+        let a_id = recording_timeline(&conn, "/a.mp4").unwrap().unwrap().rallies[0].id;
+        // Using /a.mp4's rally id under /b.mp4's path must touch nothing.
+        assert!(!update_rally(&conn, "/b.mp4", a_id, 0, 1).unwrap());
+        assert!(!delete_rally(&conn, "/b.mp4", a_id).unwrap());
+        assert_eq!(intervals(&conn, "/a.mp4"), vec![(1000, 5000, 0.3)]);
+    }
+
+    #[test]
+    fn edits_on_an_unregistered_path_are_no_ops() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        assert!(!update_rally(&conn, "/missing.mp4", 1, 0, 1).unwrap());
+        assert!(add_rally(&conn, "/missing.mp4", 0, 1).unwrap().is_none());
+        assert!(!delete_rally(&conn, "/missing.mp4", 1).unwrap());
+    }
 }
