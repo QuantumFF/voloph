@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 /// Video file extensions we register as recordings.
@@ -16,6 +16,11 @@ pub struct Recording {
     pub file_size: i64,
     pub quick_hash: String,
     pub capture_day: String,
+    /// Transcode lifecycle (see ADR 0005): `unknown` (not yet probed), `pending`
+    /// (web-incompatible, transcode queued/in progress), `ready` (playable —
+    /// either already web-playable or transcoded in place), or `failed`
+    /// (probe/transcode error).
+    pub transcode_state: String,
 }
 
 /// A session: one capture day, holding one or more recordings.
@@ -48,9 +53,17 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             path        TEXT NOT NULL UNIQUE,
             file_size   INTEGER NOT NULL,
             quick_hash  TEXT NOT NULL,
-            capture_day TEXT NOT NULL
+            capture_day TEXT NOT NULL,
+            transcode_state TEXT NOT NULL DEFAULT 'unknown'
         );",
     )?;
+    // Upgrade DBs created before in-place transcoding (ADR 0005). The CREATE
+    // above is a no-op when the table already exists, so add the column here;
+    // ignore the duplicate-column error when it is already present.
+    let _ = conn.execute(
+        "ALTER TABLE recordings ADD COLUMN transcode_state TEXT NOT NULL DEFAULT 'unknown'",
+        [],
+    );
     Ok(conn)
 }
 
@@ -177,7 +190,7 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
     let mut out = Vec::with_capacity(sessions.len());
     for (id, capture_day) in sessions {
         let mut rstmt = conn.prepare(
-            "SELECT id, path, file_size, quick_hash, capture_day
+            "SELECT id, path, file_size, quick_hash, capture_day, transcode_state
              FROM recordings WHERE session_id = ?1 ORDER BY path",
         )?;
         let recordings = rstmt
@@ -188,6 +201,7 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
                     file_size: row.get(2)?,
                     quick_hash: row.get(3)?,
                     capture_day: row.get(4)?,
+                    transcode_state: row.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -198,4 +212,59 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
         });
     }
     Ok(out)
+}
+
+/// One unit of work for the background transcode worker: the next recording
+/// still needing a probe (`unknown`) or a transcode (`pending`), lowest id
+/// first. Returns `(id, path, transcode_state)`, or `None` when every registered
+/// recording is settled (`ready`/`failed`).
+pub fn next_transcode_work(conn: &Connection) -> rusqlite::Result<Option<(i64, String, String)>> {
+    conn.query_row(
+        "SELECT id, path, transcode_state
+         FROM recordings
+         WHERE transcode_state IN ('unknown', 'pending')
+         ORDER BY id LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+/// Advance a recording's transcode lifecycle state.
+pub fn set_transcode_state(conn: &Connection, id: i64, state: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recordings SET transcode_state = ?1 WHERE id = ?2",
+        rusqlite::params![state, id],
+    )?;
+    Ok(())
+}
+
+/// Mark a recording `ready` after an in-place transcode, refreshing the stored
+/// file size and quick hash to match the new bytes on disk (ADR 0003) so the
+/// move-detection fingerprint stays valid.
+pub fn mark_transcoded(conn: &Connection, id: i64, path: &str) -> rusqlite::Result<()> {
+    let p = Path::new(path);
+    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let hash = quick_hash(p, size).unwrap_or_default();
+    conn.execute(
+        "UPDATE recordings
+         SET file_size = ?1, quick_hash = ?2, transcode_state = 'ready'
+         WHERE id = ?3",
+        rusqlite::params![size as i64, hash, id],
+    )?;
+    Ok(())
+}
+
+/// The transcode state of the recording at `path`, used by the player to decide
+/// whether it can load the file yet. `None` when the path is not registered.
+pub fn recording_transcode_state(
+    conn: &Connection,
+    path: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT transcode_state FROM recordings WHERE path = ?1",
+        [path],
+        |row| row.get(0),
+    )
+    .optional()
 }

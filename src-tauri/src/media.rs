@@ -1,30 +1,26 @@
-//! Playback source for the in-app player.
+//! Playback source for the in-app player: a loopback HTTP server + in-place
+//! codec normalization.
 //!
-//! Recordings are served to the webview `<video>` element over a small HTTP
-//! server bound to `127.0.0.1` on an ephemeral port, rather than the raw asset
-//! protocol. WebKitGTK on Linux cannot decode HEVC/H.265 (the iPhone default),
-//! so a source whose codec is not web-playable is transcoded on the fly to
-//! H.264 video + AAC audio via the bundled ffmpeg sidecar (ADR 0004) and
-//! **streamed** to the webview with chunked transfer encoding, so playback
-//! starts as the first fragments arrive instead of waiting for the whole file.
-//! Web-friendly sources (H.264/AAC in an mp4/mov container) are served straight
-//! from disk, honoring HTTP range requests so native seeking works without
-//! re-encoding.
+//! WebKitGTK on Linux cannot decode HEVC/H.265 (the iPhone default) in a
+//! `<video>` element, even though the OS can. Each web-incompatible recording is
+//! therefore transcoded **once, in place**, to a complete, seekable H.264/AAC
+//! file that replaces the original at its path (ADR 0005). The transcode is
+//! destructive — the source codec is discarded — which ADRs 0001 and 0003 permit
+//! only as one-time import normalization.
 //!
-//! Transcoding is live (no transcoded artifact is ever written to disk, keeping
-//! the reference-in-place model intact). Because a transcoded stream has no
-//! stable byte layout, seeking into it is done by restarting ffmpeg from the
-//! requested timestamp via the `t` query parameter (`-ss`); the player reloads
-//! the stream and the previous ffmpeg process is killed when its connection
-//! drops.
+//! The playable file is served to the webview over a tiny HTTP server bound to
+//! `127.0.0.1` on an ephemeral port — **not** the asset protocol or a custom URI
+//! scheme. WebKitGTK plays HTML5 media through GStreamer, which loads from real
+//! `http://` sources (with byte-range seeking via `souphttpsrc`) but does not
+//! route through WebKit's custom-scheme handlers, so `asset://`/`stream://`
+//! sources fail with `MediaError` code 4. Serving over loopback HTTP, with an
+//! explicit `video/mp4` Content-Type and range support, is what actually plays.
 //!
-//! A streaming HTTP server is used because Tauri's custom-protocol responder
-//! only accepts a fully-owned response body, which would force the entire
-//! transcode to be buffered in memory before a single byte reached the webview.
+//! ffmpeg/ffprobe are the bundled sidecars from ADR 0004.
 
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,13 +28,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
-/// Number of worker threads draining the request queue. A handful is plenty:
-/// at most one recording plays at a time, plus the odd seek-restart overlap.
+/// Number of worker threads draining the request queue. A handful is plenty: at
+/// most one recording plays at a time, plus the odd overlapping range request.
 const WORKERS: usize = 4;
 
 /// How the frontend reaches the playback server: the origin to build URLs from
 /// and a per-launch token that must accompany every request, so other local
-/// processes can't drive the ffmpeg sidecar against arbitrary files.
+/// processes can't drive the server against arbitrary files.
 #[derive(Clone, Serialize)]
 pub struct PlaybackEndpoint {
     pub origin: String,
@@ -77,7 +73,7 @@ pub fn start() -> Result<PlaybackEndpoint, String> {
 
 /// An unguessable per-launch token derived from launch time and pid. Loopback
 /// binding is the primary defense; this just stops other local processes from
-/// guessing the URL and using us as an ffmpeg gadget against arbitrary paths.
+/// guessing the URL and reading arbitrary files through us.
 fn generate_token() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -90,25 +86,17 @@ fn generate_token() -> String {
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// What a probe tells us about whether a source can play in the webview as-is.
-struct Probe {
-    /// True when the container + codecs are web-playable (H.264/AAC in mp4/mov)
-    /// and so can be served without re-encoding.
-    passthrough: bool,
-}
-
-/// Route one request: validate the token, probe the source, then pass it
-/// through (with range support) or stream a live transcode.
+/// Route one request: validate the token, then serve the file with range
+/// support. By playback time every recording is already web-playable (ADR
+/// 0005), so this only ever passes bytes through — it never transcodes.
 fn handle_request(request: Request, token: &str) {
     let url = request.url().to_string();
     let (route, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
     if route != "/play" {
-        respond_error(request, 404, "not found");
-        return;
+        return respond_error(request, 404, "not found");
     }
 
     let mut path = None;
-    let mut start = None;
     let mut supplied_token = None;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
@@ -117,118 +105,23 @@ fn handle_request(request: Request, token: &str) {
         let decoded = percent_decode(value);
         match key {
             "path" => path = Some(decoded),
-            "t" => start = decoded.parse::<f64>().ok(),
             "token" => supplied_token = Some(decoded),
             _ => {}
         }
     }
 
     if supplied_token.as_deref() != Some(token) {
-        respond_error(request, 403, "forbidden");
-        return;
+        return respond_error(request, 403, "forbidden");
     }
     let Some(path) = path else {
-        respond_error(request, 400, "missing `path` query parameter");
-        return;
+        return respond_error(request, 400, "missing `path` query parameter");
     };
 
-    match probe(&path) {
-        Ok(probe) if probe.passthrough => serve_passthrough(request, &path),
-        Ok(_) => serve_transcode(request, &path, start),
-        Err(message) => respond_error(request, 500, &message),
-    }
+    serve_file(request, &path);
 }
 
 fn respond_error(request: Request, code: u16, message: &str) {
     let _ = request.respond(Response::from_string(message).with_status_code(StatusCode(code)));
-}
-
-/// Resolve a bundled sidecar binary. Tauri places `externalBin` next to the
-/// app executable (and copies them beside the dev binary), so we look there.
-fn sidecar_path(name: &str) -> PathBuf {
-    let file = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(&file)))
-        .unwrap_or_else(|| PathBuf::from(file))
-}
-
-/// Probe a recording with the `ffprobe` sidecar to decide passthrough vs
-/// transcode. Returns an error string if the probe fails entirely (missing
-/// file, unreadable, sidecar not resolvable) — the handler surfaces it to the
-/// player rather than serving a black frame.
-fn probe(path: &str) -> Result<Probe, String> {
-    let output = Command::new(sidecar_path("ffprobe"))
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=codec_type,codec_name:format=format_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=0",
-            path,
-        ])
-        .output()
-        .map_err(|e| format!("ffprobe could not run: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffprobe could not read the file: {stderr}"));
-    }
-
-    let report = String::from_utf8_lossy(&output.stdout);
-    Ok(Probe {
-        passthrough: is_web_playable(&report),
-    })
-}
-
-/// Decide whether an ffprobe report describes a source the webview can play
-/// directly: an mp4/mov-family container carrying H.264 video and, if present,
-/// AAC audio. Anything else (HEVC, AV1, mkv, AC-3 audio, …) is transcoded.
-fn is_web_playable(report: &str) -> bool {
-    let mut web_container = false;
-    let mut video_codecs = Vec::new();
-    let mut audio_codecs = Vec::new();
-    // ffprobe emits `codec_name` and `codec_type` for each stream in an order
-    // we do not control, so we hold the most recent name until its type is
-    // known and pair them then. A new name before a type means an unnamed
-    // stream — drop the stale name.
-    let mut pending_name: Option<String> = None;
-
-    for line in report.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key {
-            "format_name" => {
-                // ffprobe lists comma-separated container names, e.g.
-                // "mov,mp4,m4a,3gp,3g2,mj2".
-                web_container = value
-                    .split(',')
-                    .any(|name| matches!(name, "mp4" | "mov" | "m4a" | "3gp" | "3g2"));
-            }
-            "codec_name" => pending_name = Some(value.to_string()),
-            "codec_type" => {
-                if let Some(name) = pending_name.take() {
-                    match value {
-                        "video" => video_codecs.push(name),
-                        "audio" => audio_codecs.push(name),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let video_ok = video_codecs.iter().all(|c| c == "h264") && !video_codecs.is_empty();
-    let audio_ok = audio_codecs.iter().all(|c| c == "aac");
-    web_container && video_ok && audio_ok
 }
 
 fn header(name: &str, value: &str) -> Header {
@@ -236,9 +129,11 @@ fn header(name: &str, value: &str) -> Header {
         .expect("static header name/value are ASCII")
 }
 
-/// Serve a web-playable source straight from disk, honoring a `Range` header so
-/// the webview's native seek bar works. No ffmpeg process is spawned.
-fn serve_passthrough(request: Request, path: &str) {
+/// Serve a recording from disk, honoring a `Range` header so the webview's
+/// native seek bar works, and always declaring `video/mp4` so WebKitGTK accepts
+/// it regardless of the file's extension. The body streams lazily from the file
+/// handle, so a multi-gigabyte recording is never buffered in memory.
+fn serve_file(request: Request, path: &str) {
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => return respond_error(request, 500, &format!("could not open recording: {e}")),
@@ -304,90 +199,163 @@ fn serve_passthrough(request: Request, path: &str) {
     let _ = result;
 }
 
-/// ffmpeg's piped stdout, paired with its `Child` so the process is killed when
-/// the response reader is dropped — i.e. when the webview disconnects (seek or
-/// navigate-away). Without this, every seek would orphan an ffmpeg process.
-struct TranscodeStream {
-    child: Child,
-    stdout: ChildStdout,
+/// What a probe tells us about whether a source can play in the webview as-is.
+pub struct Probe {
+    /// True when the container + codecs are web-playable (H.264/AAC in mp4/mov)
+    /// and so need no transcode.
+    pub passthrough: bool,
 }
 
-impl Read for TranscodeStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stdout.read(buf)
+/// Resolve a bundled sidecar binary. Tauri places `externalBin` next to the
+/// app executable (and copies them beside the dev binary), so we look there.
+fn sidecar_path(name: &str) -> PathBuf {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&file)))
+        .unwrap_or_else(|| PathBuf::from(file))
+}
+
+/// Probe a recording with the `ffprobe` sidecar to decide transcode vs direct
+/// play. Returns an error string if the probe fails entirely (missing file,
+/// unreadable, sidecar not resolvable) so the caller can mark the recording
+/// rather than silently retry forever.
+pub fn probe(path: &str) -> Result<Probe, String> {
+    let output = Command::new(sidecar_path("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name:format=format_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=0",
+            path,
+        ])
+        .output()
+        .map_err(|e| format!("ffprobe could not run: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe could not read the file: {stderr}"));
     }
+
+    let report = String::from_utf8_lossy(&output.stdout);
+    Ok(Probe {
+        passthrough: is_web_playable(&report),
+    })
 }
 
-impl Drop for TranscodeStream {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+/// Decide whether an ffprobe report describes a source the webview can play
+/// directly: an mp4/mov-family container carrying H.264 video and, if present,
+/// AAC audio. Anything else (HEVC, AV1, mkv, AC-3 audio, …) needs transcoding.
+fn is_web_playable(report: &str) -> bool {
+    let mut web_container = false;
+    let mut video_codecs = Vec::new();
+    let mut audio_codecs = Vec::new();
+    // ffprobe emits `codec_name` and `codec_type` for each stream in an order
+    // we do not control, so we hold the most recent name until its type is
+    // known and pair them then. A new name before a type means an unnamed
+    // stream — drop the stale name.
+    let mut pending_name: Option<String> = None;
 
-/// Transcode a source to fragmented H.264/AAC mp4 with the ffmpeg sidecar and
-/// stream stdout to the webview with chunked transfer encoding, so playback
-/// starts almost immediately. `start` (seconds) seeks via `-ss` before input,
-/// so a seek restarts the pipeline from that point. Nothing is written to disk.
-fn serve_transcode(request: Request, path: &str, start: Option<f64>) {
-    let mut command = Command::new(sidecar_path("ffmpeg"));
-    command.args(["-v", "error", "-nostats"]);
-    if let Some(t) = start {
-        if t > 0.0 {
-            // Seek before -i for a fast keyframe-accurate restart.
-            command.args(["-ss", &format!("{t}")]);
+    for line in report.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "format_name" => {
+                // ffprobe lists comma-separated container names, e.g.
+                // "mov,mp4,m4a,3gp,3g2,mj2".
+                web_container = value
+                    .split(',')
+                    .any(|name| matches!(name, "mp4" | "mov" | "m4a" | "3gp" | "3g2"));
+            }
+            "codec_name" => pending_name = Some(value.to_string()),
+            "codec_type" => {
+                if let Some(name) = pending_name.take() {
+                    match value {
+                        "video" => video_codecs.push(name),
+                        "audio" => audio_codecs.push(name),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    command
+
+    let video_ok = video_codecs.iter().all(|c| c == "h264") && !video_codecs.is_empty();
+    let audio_ok = audio_codecs.iter().all(|c| c == "aac");
+    web_container && video_ok && audio_ok
+}
+
+/// Transcode the recording at `path` to a complete, seekable H.264/AAC file and
+/// replace the original in place via the ffmpeg sidecar. The source codec is
+/// discarded (ADR 0005). Writes to a hidden temp file in the same directory and
+/// atomically renames over the original, so an interrupted run never leaves a
+/// recording half-written. `+faststart` moves the moov atom to the front for
+/// instant playback; the output is a normal (non-fragmented) mp4 with a real
+/// duration. The path (and its extension) are preserved — the playback server
+/// declares `video/mp4` regardless of extension.
+pub fn transcode_in_place(path: &str) -> Result<(), String> {
+    let src = Path::new(path);
+    let parent = src
+        .parent()
+        .ok_or_else(|| "recording has no parent directory".to_string())?;
+    let file_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "recording has no file name".to_string())?;
+    // Hidden, same-directory temp so the rename is atomic (same filesystem) and
+    // the in-progress file is neither user-visible nor picked up by a re-scan.
+    let temp = parent.join(format!(".{file_name}.voloph-transcoding.tmp"));
+
+    let output = Command::new(sidecar_path("ffmpeg"))
         .args([
+            "-v",
+            "error",
+            "-nostats",
+            "-y",
             "-i",
             path,
             "-c:v",
             "libx264",
             "-preset",
-            "ultrafast",
+            "veryfast",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
             "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
+            "+faststart",
             "-f",
             "mp4",
-            "pipe:1",
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null());
+        .arg(&temp)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg could not run: {e}"))?;
 
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => return respond_error(request, 500, &format!("transcode failed to start: {e}")),
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        return respond_error(request, 500, "transcode produced no output stream");
-    };
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temp);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg failed to transcode: {stderr}"));
+    }
 
-    // No Content-Length → chunked transfer; the body streams as ffmpeg emits it.
-    let response = Response::new(
-        StatusCode(200),
-        vec![
-            header("Content-Type", "video/mp4"),
-            // Transcoded output has no stable byte layout for range seeking; the
-            // player seeks by restarting the stream from a timestamp instead.
-            header("Accept-Ranges", "none"),
-            header("Cache-Control", "no-store"),
-        ],
-        TranscodeStream { child, stdout },
-        None,
-        None,
-    );
-    let _ = request.respond(response);
+    std::fs::rename(&temp, src).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("could not replace original with transcode: {e}")
+    })?;
+    Ok(())
 }
 
-/// Minimal percent-decoding for query values (avoids a url-crate dep, matching
-/// the no-extra-dependency style of `db.rs`). Handles `%XX` and `+`.
+/// Minimal percent-decoding for query values (avoids a url-crate dependency).
+/// Handles `%XX` and `+`.
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -420,7 +388,9 @@ fn percent_decode(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_web_playable, percent_decode};
+    use super::{is_web_playable, percent_decode, start};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
 
     // codec_name precedes codec_type per stream in ffprobe's real output.
     const H264_AAC_MP4: &str = "\
@@ -476,5 +446,80 @@ format_name=mov,mp4,m4a,3gp,3g2,mj2";
     #[test]
     fn percent_decode_handles_paths_and_spaces() {
         assert_eq!(percent_decode("%2Fhome%2Fa+b.mov"), "/home/a b.mov");
+    }
+
+    /// End-to-end: the loopback server serves a ranged `video/mp4` body to a real
+    /// TCP client (what WebKitGTK's GStreamer source does), and rejects a bad
+    /// token. Guards the transport that actually makes playback work.
+    #[test]
+    fn server_serves_ranged_mp4_and_checks_token() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("voloph-server-test.bin");
+        let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&data)
+            .unwrap();
+
+        let endpoint = start().unwrap();
+        let host = endpoint.origin.strip_prefix("http://").unwrap().to_string();
+        let encoded: String = path
+            .to_string_lossy()
+            .bytes()
+            .map(|b| format!("%{b:02X}"))
+            .collect();
+
+        // Valid token + range → 206 with the exact slice and video/mp4.
+        let ok = http_get(
+            &host,
+            &format!("/play?path={encoded}&token={}", endpoint.token),
+            Some("bytes=10-19"),
+        );
+        assert!(ok.status_line.contains("206"), "status: {}", ok.status_line);
+        assert!(ok.headers.to_lowercase().contains("content-type: video/mp4"));
+        assert!(ok.headers.contains("Content-Range: bytes 10-19/1000"));
+        assert_eq!(ok.body, data[10..=19]);
+
+        // Wrong token → 403, no bytes served.
+        let denied = http_get(
+            &host,
+            &format!("/play?path={encoded}&token=wrong"),
+            Some("bytes=0-9"),
+        );
+        assert!(denied.status_line.contains("403"), "status: {}", denied.status_line);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    struct HttpResponse {
+        status_line: String,
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    /// Bare-bones HTTP/1.0 GET so the test needs no HTTP-client dependency.
+    fn http_get(host: &str, target: &str, range: Option<&str>) -> HttpResponse {
+        let mut stream = TcpStream::connect(host).unwrap();
+        let mut req = format!("GET {target} HTTP/1.0\r\nHost: {host}\r\n");
+        if let Some(r) = range {
+            req.push_str(&format!("Range: {r}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response has header/body separator");
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        let body = raw[split + 4..].to_vec();
+        let (status_line, headers) = head.split_once("\r\n").unwrap_or((head.as_str(), ""));
+        HttpResponse {
+            status_line: status_line.to_string(),
+            headers: headers.to_string(),
+            body,
+        }
     }
 }

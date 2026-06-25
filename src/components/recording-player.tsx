@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { ArrowLeftIcon } from "lucide-react"
+import { ArrowLeftIcon, Loader2Icon } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { trackedInvoke } from "@/lib/tauri"
@@ -13,60 +13,58 @@ interface RecordingPlayerProps {
   onBack: () => void
 }
 
+/** Result of the `resolve_playback` command (see `src-tauri/src/lib.rs`). */
+interface PlaybackSource {
+  path: string
+  state: "ready" | "unknown" | "pending" | "failed"
+}
+
 /** Loopback origin + token of the playback server (see `src-tauri/src/media.rs`). */
 interface PlaybackEndpoint {
   origin: string
   token: string
 }
 
+/** How long to wait before re-checking a recording that is still transcoding. */
+const TRANSCODE_POLL_MS = 2000
+
 function fileName(path: string): string {
   const parts = path.split(/[\\/]/)
   return parts[parts.length - 1] || path
 }
 
-/**
- * Build a playback URL the webview's `<video>` element can load. The recording
- * path, an optional seek offset, and the per-launch token travel as query
- * parameters so absolute paths survive intact. The origin is the loopback
- * playback server (e.g. `http://127.0.0.1:54321`).
- */
-function streamUrl(endpoint: PlaybackEndpoint, path: string, startSeconds: number): string {
+/** Build the loopback `/play` URL for a recording path. */
+function playUrl(endpoint: PlaybackEndpoint, path: string): string {
   const url = new URL(`${endpoint.origin}/play`)
   url.searchParams.set("path", path)
   url.searchParams.set("token", endpoint.token)
-  if (startSeconds > 0) {
-    url.searchParams.set("t", String(startSeconds))
-  }
   return url.toString()
 }
 
 /**
  * Plays a single recording in the in-app player.
  *
- * The source is served through the custom `stream://` protocol (see
- * `src-tauri/src/media.rs`) rather than the raw asset protocol. The Rust side
- * probes the codec and either passes a web-friendly file through untouched
- * (native byte-range seeking) or transcodes it to H.264/AAC on the fly via the
- * ffmpeg sidecar — so HEVC/H.265 iPhone recordings, which WebKitGTK cannot
- * decode, still play.
+ * The source is served by a loopback HTTP server (see `src-tauri/src/media.rs`),
+ * not the asset protocol or a custom scheme: WebKitGTK plays HTML5 media through
+ * GStreamer, which only loads real `http://` sources, so a `<video>` pointed at
+ * `asset://`/`stream://` fails with `MediaError` code 4. The server declares
+ * `video/mp4` and supports range requests, so native frame-accurate seeking
+ * works. Web-incompatible recordings are transcoded to H.264/AAC in place at
+ * import (ADR 0005); the bytes streamed here are always already playable.
  *
- * Because a transcoded stream has no stable byte layout, seeking on it cannot
- * use byte ranges; instead a seek restarts the ffmpeg pipeline from the target
- * timestamp. We detect a seek the webview could not satisfy natively and reload
- * the source with a `t` offset, resuming playback from there. Passthrough
- * sources seek natively and never hit this path.
+ * Because that transcode runs in the background, a freshly imported recording
+ * may still be converting when first opened. Rather than point the player at a
+ * still-undecodable file, we surface a "preparing" state and poll until ready.
  */
 export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
-  // Seconds the current stream was started at (the `-ss` offset). A restart on
-  // a transcoded source bumps this so reported player time maps back to the
-  // real recording position.
-  const [startOffset, setStartOffset] = useState(0)
-  const [error, setError] = useState<string | null>(null)
-  // The loopback playback server endpoint, fetched once from the backend.
   const [endpoint, setEndpoint] = useState<PlaybackEndpoint | null>(null)
-  // Guard so the seek handler does not re-trigger itself after we reload.
-  const restartingRef = useRef(false)
+  const [src, setSrc] = useState<string | null>(null)
+  // loading: resolving; preparing: still transcoding; error: unplayable.
+  const [status, setStatus] = useState<"loading" | "preparing" | "ready" | "error">("loading")
+  // Exact MediaError detail surfaced on failure, so a playback problem reports
+  // its cause (decode vs. fetch vs. unsupported source) instead of a black box.
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
 
   // Fetch the playback server endpoint once on mount.
   useEffect(() => {
@@ -76,56 +74,69 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
         if (!cancelled) setEndpoint(result)
       })
       .catch(() => {
-        if (!cancelled) setError("Playback is unavailable: the media server did not start.")
+        if (!cancelled) {
+          setErrorDetail("the media server did not start")
+          setStatus("error")
+        }
       })
     return () => {
       cancelled = true
     }
   }, [])
 
-  // Reset offset and error when the recording changes.
   useEffect(() => {
-    setStartOffset(0)
-    setError(null)
-    restartingRef.current = false
-  }, [path])
+    if (!endpoint) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    // Reset to a clean loading state when the recording changes before it
+    // resolves. (Consistent with the codebase's other reset effects.)
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSrc(null)
+    setStatus("loading")
+    setErrorDetail(null)
 
-  const handleSeeking = useCallback(() => {
-    const video = videoRef.current
-    if (!video || restartingRef.current) return
-
-    // Where the user wants to be, in real recording time.
-    const target = video.currentTime + startOffset
-    const buffered = video.buffered
-    let withinBuffer = false
-    for (let i = 0; i < buffered.length; i += 1) {
-      if (video.currentTime >= buffered.start(i) && video.currentTime <= buffered.end(i)) {
-        withinBuffer = true
-        break
-      }
+    const resolve = () => {
+      trackedInvoke<PlaybackSource>("resolve_playback", { path })
+        .then((source) => {
+          if (cancelled) return
+          if (source.state === "ready") {
+            setSrc(playUrl(endpoint, source.path))
+            setStatus("ready")
+          } else if (source.state === "failed") {
+            setStatus("error")
+          } else {
+            // unknown | pending — still transcoding; re-check shortly.
+            setStatus("preparing")
+            timer = setTimeout(resolve, TRANSCODE_POLL_MS)
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setStatus("error")
+        })
     }
-    // If the position is already buffered (passthrough or a spot we hold),
-    // let the native seek stand. Otherwise restart the stream at the target.
-    if (withinBuffer) return
+    resolve()
 
-    restartingRef.current = true
-    setStartOffset(target)
-  }, [startOffset])
-
-  // After a restart, begin playback from the new stream's origin.
-  const handleLoadedMetadata = useCallback(() => {
-    const video = videoRef.current
-    if (!video) return
-    if (restartingRef.current) {
-      restartingRef.current = false
-      void video.play().catch(() => {})
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
     }
-  }, [])
+  }, [path, endpoint])
 
   const handleError = useCallback(() => {
-    setError(
-      "This recording could not be played. The file may be corrupt or in an unsupported format.",
-    )
+    const media = videoRef.current
+    const err = media?.error
+    const codes: Record<number, string> = {
+      1: "ABORTED",
+      2: "NETWORK",
+      3: "DECODE",
+      4: "SRC_NOT_SUPPORTED",
+    }
+    const detail = err
+      ? `MediaError code ${err.code} (${codes[err.code] ?? "?"})${err.message ? ` — ${err.message}` : ""} · networkState ${media?.networkState} · src ${media?.currentSrc}`
+      : `unknown video error · src ${media?.currentSrc}`
+    console.error("[recording-player]", detail)
+    setErrorDetail(detail)
+    setStatus("error")
   }, [])
 
   return (
@@ -139,22 +150,29 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
           {fileName(path)}
         </span>
       </div>
-      {error ? (
-        <div className="flex aspect-video w-full items-center justify-center rounded-lg bg-black p-6 text-center text-sm text-destructive-foreground">
-          {error}
+      {status === "error" ? (
+        <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-lg bg-black p-6 text-center text-sm text-destructive-foreground">
+          <p>This recording could not be played.</p>
+          {errorDetail ? (
+            <p className="max-w-full break-words font-mono text-xs text-muted-foreground">
+              {errorDetail}
+            </p>
+          ) : null}
         </div>
-      ) : endpoint ? (
+      ) : status === "preparing" ? (
+        <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-lg bg-black p-6 text-center text-sm text-muted-foreground">
+          <Loader2Icon className="size-6 animate-spin" />
+          Preparing this recording for playback (transcoding for the first time)…
+        </div>
+      ) : status === "ready" && src ? (
         <video
           ref={videoRef}
-          // Re-mount when the path or seek offset changes so the source reloads
-          // and the ffmpeg pipeline restarts at the new timestamp.
-          key={`${path}#${startOffset}`}
+          // Re-mount when the resolved source changes so the element reloads.
+          key={src}
           className="w-full rounded-lg bg-black"
-          src={streamUrl(endpoint, path, startOffset)}
+          src={src}
           controls
           autoPlay
-          onSeeking={handleSeeking}
-          onLoadedMetadata={handleLoadedMetadata}
           onError={handleError}
         />
       ) : (

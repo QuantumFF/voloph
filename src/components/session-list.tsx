@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { FolderOpenIcon, VideoIcon } from "lucide-react"
+import { AlertTriangleIcon, FolderOpenIcon, Loader2Icon, VideoIcon } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -21,6 +21,13 @@ interface Recording {
   file_size: number
   quick_hash: string
   capture_day: string
+  /** Transcode lifecycle: unknown | pending | ready | failed (ADR 0005). */
+  transcode_state: string
+}
+
+/** True while a recording is still being probed or transcoded for playback. */
+function isProcessing(state: string): boolean {
+  return state === "unknown" || state === "pending"
 }
 
 interface Session {
@@ -72,6 +79,17 @@ export function SessionList({ onPlay }: SessionListProps) {
     void refresh()
   }, [refresh])
 
+  // While any recording is still being transcoded in the background, poll so
+  // the row flips from "Processing…" to its size once it becomes playable.
+  useEffect(() => {
+    const stillWorking = sessions.some((session) =>
+      session.recordings.some((recording) => isProcessing(recording.transcode_state)),
+    )
+    if (!stillWorking) return
+    const interval = setInterval(() => void refresh(), 3000)
+    return () => clearInterval(interval)
+  }, [sessions, refresh])
+
   async function handlePickFolder() {
     setError(null)
     const folder = await open({ directory: true, multiple: false })
@@ -93,8 +111,8 @@ export function SessionList({ onPlay }: SessionListProps) {
       <CardHeader>
         <CardTitle>Sessions</CardTitle>
         <CardDescription>
-          Recordings grouped by capture day. Files are referenced in place —
-          never copied or moved.
+          Recordings grouped by capture day, referenced in place. Recordings in a
+          format the player can&apos;t handle are converted once on import.
         </CardDescription>
         <CardAction>
           <Button onClick={handlePickFolder} disabled={scanning}>
@@ -135,9 +153,27 @@ export function SessionList({ onPlay }: SessionListProps) {
                       <span className="truncate font-medium" title={recording.path}>
                         {fileName(recording.path)}
                       </span>
-                      <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
-                        {formatSize(recording.file_size)}
-                      </span>
+                      {isProcessing(recording.transcode_state) ? (
+                        <span
+                          className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
+                          title="Converting this recording for playback…"
+                        >
+                          <Loader2Icon className="size-3.5 animate-spin" />
+                          Processing…
+                        </span>
+                      ) : recording.transcode_state === "failed" ? (
+                        <span
+                          className="ml-auto flex shrink-0 items-center gap-1.5 text-destructive"
+                          title="This recording could not be converted for playback."
+                        >
+                          <AlertTriangleIcon className="size-3.5" />
+                          Failed
+                        </span>
+                      ) : (
+                        <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
+                          {formatSize(recording.file_size)}
+                        </span>
+                      )}
                     </button>
                   </li>
                 ))}
