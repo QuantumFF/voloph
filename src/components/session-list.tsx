@@ -23,11 +23,32 @@ interface Recording {
   capture_day: string
   /** Transcode lifecycle: unknown | pending | ready | failed (ADR 0005). */
   transcode_state: string
+  /** Segmentation lifecycle: unknown | ready | failed (ADR 0002). */
+  segment_state: string
+  /** Recording duration in ms; null until segmented. */
+  duration_ms: number | null
+  /** Rallies in the draft timeline (0 until segmented). */
+  rally_count: number
 }
 
 /** True while a recording is still being probed or transcoded for playback. */
-function isProcessing(state: string): boolean {
+function isTranscoding(state: string): boolean {
   return state === "unknown" || state === "pending"
+}
+
+/**
+ * True while a recording is playable but its draft timeline is still being
+ * produced — audio extraction + segmentation (ADR 0002). Segmentation only
+ * starts once the transcode is `ready`, so a still-`unknown` segment state on a
+ * ready recording means "queued or analyzing".
+ */
+function isAnalyzing(recording: Recording): boolean {
+  return recording.transcode_state === "ready" && recording.segment_state === "unknown"
+}
+
+/** True while any background media work is still pending for this recording. */
+function isProcessing(recording: Recording): boolean {
+  return isTranscoding(recording.transcode_state) || isAnalyzing(recording)
 }
 
 interface Session {
@@ -79,11 +100,12 @@ export function SessionList({ onPlay }: SessionListProps) {
     void refresh()
   }, [refresh])
 
-  // While any recording is still being transcoded in the background, poll so
-  // the row flips from "Processing…" to its size once it becomes playable.
+  // While any recording is still being transcoded or segmented in the
+  // background, poll so the row flips from "Converting…"/"Analyzing…" to its
+  // rally count once the draft timeline is ready.
   useEffect(() => {
     const stillWorking = sessions.some((session) =>
-      session.recordings.some((recording) => isProcessing(recording.transcode_state)),
+      session.recordings.some((recording) => isProcessing(recording)),
     )
     if (!stillWorking) return
     const interval = setInterval(() => void refresh(), 3000)
@@ -153,13 +175,13 @@ export function SessionList({ onPlay }: SessionListProps) {
                       <span className="truncate font-medium" title={recording.path}>
                         {fileName(recording.path)}
                       </span>
-                      {isProcessing(recording.transcode_state) ? (
+                      {isTranscoding(recording.transcode_state) ? (
                         <span
                           className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
                           title="Converting this recording for playback…"
                         >
                           <Loader2Icon className="size-3.5 animate-spin" />
-                          Processing…
+                          Converting…
                         </span>
                       ) : recording.transcode_state === "failed" ? (
                         <span
@@ -169,8 +191,30 @@ export function SessionList({ onPlay }: SessionListProps) {
                           <AlertTriangleIcon className="size-3.5" />
                           Failed
                         </span>
+                      ) : isAnalyzing(recording) ? (
+                        <span
+                          className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
+                          title="Detecting rallies in this recording…"
+                        >
+                          <Loader2Icon className="size-3.5 animate-spin" />
+                          Analyzing…
+                        </span>
                       ) : (
-                        <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
+                        <span className="ml-auto flex shrink-0 items-center gap-3 tabular-nums text-muted-foreground">
+                          {recording.segment_state === "ready" ? (
+                            <span title="Rallies detected in the draft timeline">
+                              {recording.rally_count}{" "}
+                              {recording.rally_count === 1 ? "rally" : "rallies"}
+                            </span>
+                          ) : recording.segment_state === "failed" ? (
+                            <span
+                              className="flex items-center gap-1.5 text-amber-600 dark:text-amber-500"
+                              title="Could not analyze this recording's audio for rallies."
+                            >
+                              <AlertTriangleIcon className="size-3.5" />
+                              No timeline
+                            </span>
+                          ) : null}
                           {formatSize(recording.file_size)}
                         </span>
                       )}

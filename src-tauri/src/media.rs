@@ -199,6 +199,110 @@ fn serve_file(request: Request, path: &str) {
     let _ = result;
 }
 
+/// Sample rate the segmenter analyzes at (ADR 0002). 16 kHz comfortably
+/// resolves the rhythm of shuttle hits while keeping an hour of mono f32 audio
+/// to a manageable ~230 MB in memory.
+pub const SEGMENT_SAMPLE_RATE: u32 = 16_000;
+
+/// Extract a recording's audio as mono little-endian f32 PCM at
+/// [`SEGMENT_SAMPLE_RATE`] via the ffmpeg sidecar (ADR 0004), returning the
+/// decoded samples in memory for the segmenter. ffmpeg downmixes to one channel
+/// and resamples for us, so the caller does no audio work. Errors if the sidecar
+/// cannot run, exits non-zero, or the recording carries no decodable audio
+/// (nothing on stdout) — the worker then marks the recording rather than looping.
+pub fn extract_pcm(path: &str) -> Result<Vec<f32>, String> {
+    let rate = SEGMENT_SAMPLE_RATE.to_string();
+    let output = Command::new(sidecar_path("ffmpeg"))
+        .args([
+            "-v", "error", "-nostats",
+            "-i", path,
+            "-vn", // drop video; we only want the audio track
+            "-ac", "1", // downmix to mono
+            "-ar", &rate, // resample
+            "-f", "f32le", // raw little-endian float samples
+            "-", // write to stdout
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg could not run: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg failed to extract audio: {stderr}"));
+    }
+    if output.stdout.is_empty() {
+        return Err("recording has no decodable audio track".to_string());
+    }
+
+    // Reinterpret the raw byte stream as f32 samples. A trailing partial sample
+    // (impossible from clean ffmpeg output, but cheap to guard) is dropped.
+    let samples = output
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok(samples)
+}
+
+/// Frames per second the motion track is sampled at (ADR 0006). A low rate is
+/// plenty to see a rally's movement envelope rise and fall, and keeps an hour of
+/// downscaled grayscale frames small.
+pub const MOTION_FPS: u32 = 5;
+/// Downscaled frame dimensions for motion analysis. Small enough to be cheap,
+/// large enough that whole-court player movement still registers.
+const MOTION_WIDTH: u32 = 96;
+const MOTION_HEIGHT: u32 = 54;
+
+/// Extract a per-frame **motion** track via the ffmpeg sidecar (ADR 0004): decode
+/// the video as downscaled grayscale frames at [`MOTION_FPS`] and return the mean
+/// absolute pixel difference between consecutive frames. High values mean lots of
+/// movement (a rally); low values mean stillness (a gap). This is the primary
+/// boundary signal for segmentation (ADR 0006) and assumes a roughly static
+/// camera. Returns one value per frame transition (so `frames - 1` values), or an
+/// error if the sidecar cannot run, fails, or the video yields no frames.
+pub fn extract_motion(path: &str) -> Result<Vec<f64>, String> {
+    let vf = format!("fps={MOTION_FPS},scale={MOTION_WIDTH}:{MOTION_HEIGHT},format=gray");
+    let output = Command::new(sidecar_path("ffmpeg"))
+        .args([
+            "-v", "error", "-nostats",
+            "-i", path,
+            "-an", // drop audio; the motion track is video-only
+            "-vf", &vf,
+            "-f", "rawvideo",
+            "-pix_fmt", "gray",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg could not run: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg failed to extract frames: {stderr}"));
+    }
+
+    let frame_size = (MOTION_WIDTH * MOTION_HEIGHT) as usize;
+    if output.stdout.len() < frame_size * 2 {
+        return Err("video yielded too few frames for motion analysis".to_string());
+    }
+
+    // Mean absolute difference between each frame and its predecessor.
+    let mut energy = Vec::with_capacity(output.stdout.len() / frame_size);
+    let mut prev: Option<&[u8]> = None;
+    for frame in output.stdout.chunks_exact(frame_size) {
+        if let Some(previous) = prev {
+            let sum: u64 = frame
+                .iter()
+                .zip(previous)
+                .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs() as u64)
+                .sum();
+            energy.push(sum as f64 / frame_size as f64);
+        }
+        prev = Some(frame);
+    }
+    Ok(energy)
+}
+
 /// What a probe tells us about whether a source can play in the webview as-is.
 pub struct Probe {
     /// True when the container + codecs are web-playable (H.264/AAC in mp4/mov)

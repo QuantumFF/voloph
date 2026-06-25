@@ -21,6 +21,17 @@ pub struct Recording {
     /// either already web-playable or transcoded in place), or `failed`
     /// (probe/transcode error).
     pub transcode_state: String,
+    /// Segmentation lifecycle (ADR 0002): `unknown` (not yet segmented or
+    /// queued), `ready` (draft timeline produced), or `failed` (audio
+    /// extraction / segmentation error). Only starts once `transcode_state` is
+    /// `ready`, so it always runs against the final, playable bytes.
+    pub segment_state: String,
+    /// Recording duration in milliseconds, learned during segmentation. `None`
+    /// until segmented; the player uses it to lay rallies out over the timeline.
+    pub duration_ms: Option<i64>,
+    /// Number of rallies in the draft timeline — a glanceable count in the
+    /// session list once segmentation is done.
+    pub rally_count: i64,
 }
 
 /// A session: one capture day, holding one or more recordings.
@@ -54,16 +65,31 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             file_size   INTEGER NOT NULL,
             quick_hash  TEXT NOT NULL,
             capture_day TEXT NOT NULL,
-            transcode_state TEXT NOT NULL DEFAULT 'unknown'
-        );",
+            transcode_state TEXT NOT NULL DEFAULT 'unknown',
+            segment_state   TEXT NOT NULL DEFAULT 'unknown',
+            duration_ms     INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS rallies (
+            id           INTEGER PRIMARY KEY,
+            recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+            start_ms     INTEGER NOT NULL,
+            end_ms       INTEGER NOT NULL,
+            confidence   REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rallies_recording ON rallies(recording_id);",
     )?;
-    // Upgrade DBs created before in-place transcoding (ADR 0005). The CREATE
-    // above is a no-op when the table already exists, so add the column here;
-    // ignore the duplicate-column error when it is already present.
+    // Upgrade DBs created before later slices. The CREATE above is a no-op when
+    // a table already exists, so add new columns here; ignore the
+    // duplicate-column error when one is already present.
     let _ = conn.execute(
         "ALTER TABLE recordings ADD COLUMN transcode_state TEXT NOT NULL DEFAULT 'unknown'",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE recordings ADD COLUMN segment_state TEXT NOT NULL DEFAULT 'unknown'",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE recordings ADD COLUMN duration_ms INTEGER", []);
     Ok(conn)
 }
 
@@ -190,8 +216,10 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
     let mut out = Vec::with_capacity(sessions.len());
     for (id, capture_day) in sessions {
         let mut rstmt = conn.prepare(
-            "SELECT id, path, file_size, quick_hash, capture_day, transcode_state
-             FROM recordings WHERE session_id = ?1 ORDER BY path",
+            "SELECT r.id, r.path, r.file_size, r.quick_hash, r.capture_day,
+                    r.transcode_state, r.segment_state, r.duration_ms,
+                    (SELECT COUNT(*) FROM rallies WHERE recording_id = r.id)
+             FROM recordings r WHERE r.session_id = ?1 ORDER BY r.path",
         )?;
         let recordings = rstmt
             .query_map([id], |row| {
@@ -202,6 +230,9 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
                     quick_hash: row.get(3)?,
                     capture_day: row.get(4)?,
                     transcode_state: row.get(5)?,
+                    segment_state: row.get(6)?,
+                    duration_ms: row.get(7)?,
+                    rally_count: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -214,18 +245,54 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
     Ok(out)
 }
 
-/// One unit of work for the background transcode worker: the next recording
-/// still needing a probe (`unknown`) or a transcode (`pending`), lowest id
-/// first. Returns `(id, path, transcode_state)`, or `None` when every registered
-/// recording is settled (`ready`/`failed`).
-pub fn next_transcode_work(conn: &Connection) -> rusqlite::Result<Option<(i64, String, String)>> {
+/// One unit of work for the background media worker, in priority order: make a
+/// recording playable first (probe, then transcode), then produce its draft
+/// timeline (segment). Segmentation is gated on `transcode_state = 'ready'` so
+/// it always runs against the final, playable bytes.
+#[derive(Debug, PartialEq)]
+pub enum MediaWork {
+    /// Web-playability not yet determined — run ffprobe (ADR 0005).
+    Probe(i64, String),
+    /// Web-incompatible — transcode in place (ADR 0005).
+    Transcode(i64, String),
+    /// Playable but not yet segmented — extract audio and segment (ADR 0002).
+    Segment(i64, String),
+}
+
+/// The next unit of background media work, lowest id first within each phase, or
+/// `None` when every recording is both playable and segmented (or has failed).
+pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>> {
+    // Phase 1: anything not yet probed.
+    let probe = conn
+        .query_row(
+            "SELECT id, path FROM recordings
+             WHERE transcode_state = 'unknown' ORDER BY id LIMIT 1",
+            [],
+            |row| Ok(MediaWork::Probe(row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if probe.is_some() {
+        return Ok(probe);
+    }
+    // Phase 2: anything probed as web-incompatible, awaiting transcode.
+    let transcode = conn
+        .query_row(
+            "SELECT id, path FROM recordings
+             WHERE transcode_state = 'pending' ORDER BY id LIMIT 1",
+            [],
+            |row| Ok(MediaWork::Transcode(row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if transcode.is_some() {
+        return Ok(transcode);
+    }
+    // Phase 3: anything playable but not yet segmented.
     conn.query_row(
-        "SELECT id, path, transcode_state
-         FROM recordings
-         WHERE transcode_state IN ('unknown', 'pending')
+        "SELECT id, path FROM recordings
+         WHERE transcode_state = 'ready' AND segment_state = 'unknown'
          ORDER BY id LIMIT 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok(MediaWork::Segment(row.get(0)?, row.get(1)?)),
     )
     .optional()
 }
@@ -267,4 +334,118 @@ pub fn recording_transcode_state(
         |row| row.get(0),
     )
     .optional()
+}
+
+/// Reset a recording's draft timeline so the media worker re-segments it on its
+/// next pass: drop its rallies and return it to `unknown`. Backs the Re-analyze
+/// action used while tuning the segmenter (ADR 0002) — it re-runs segmentation
+/// without paying for another transcode. A no-op when `path` is not registered.
+pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM rallies WHERE recording_id = (SELECT id FROM recordings WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "UPDATE recordings SET segment_state = 'unknown', duration_ms = NULL WHERE path = ?1",
+        [path],
+    )?;
+    Ok(())
+}
+
+/// Advance a recording's segmentation lifecycle state (ADR 0002).
+pub fn set_segment_state(conn: &Connection, id: i64, state: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recordings SET segment_state = ?1 WHERE id = ?2",
+        rusqlite::params![state, id],
+    )?;
+    Ok(())
+}
+
+/// Persist a recording's draft timeline: replace any prior rallies, store the
+/// learned duration, and mark it segmented — all in one transaction so a
+/// re-segment is atomic and never leaves a half-written timeline. Replacing
+/// rather than appending keeps re-runs idempotent (matching the scan's contract).
+pub fn save_rallies(
+    conn: &mut Connection,
+    recording_id: i64,
+    duration_ms: i64,
+    rallies: &[crate::segment::Rally],
+) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM rallies WHERE recording_id = ?1",
+        [recording_id],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for r in rallies {
+            stmt.execute(rusqlite::params![
+                recording_id,
+                r.start_ms,
+                r.end_ms,
+                r.confidence
+            ])?;
+        }
+    }
+    tx.execute(
+        "UPDATE recordings SET segment_state = 'ready', duration_ms = ?1 WHERE id = ?2",
+        rusqlite::params![duration_ms, recording_id],
+    )?;
+    tx.commit()
+}
+
+/// A recording's draft timeline as the player needs it: where the recording is
+/// in its segmentation lifecycle, its duration, and the rally intervals.
+#[derive(Debug, Serialize)]
+pub struct Timeline {
+    /// Segmentation state (ADR 0002): `unknown` (still queued/processing),
+    /// `ready` (rallies below are the draft), or `failed`.
+    pub segment_state: String,
+    /// Recording duration in ms (`None` until segmented), so the player can lay
+    /// rallies out over the full span.
+    pub duration_ms: Option<i64>,
+    pub rallies: Vec<crate::segment::Rally>,
+}
+
+/// The draft timeline for the recording at `path`, for the player. `None` when
+/// the path is not a registered recording (e.g. opened straight from a dialog).
+pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Option<Timeline>> {
+    let row = conn
+        .query_row(
+            "SELECT id, segment_state, duration_ms FROM recordings WHERE path = ?1",
+            [path],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let state: String = row.get(1)?;
+                let duration: Option<i64> = row.get(2)?;
+                Ok((id, state, duration))
+            },
+        )
+        .optional()?;
+    let Some((id, segment_state, duration_ms)) = row else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT start_ms, end_ms, confidence FROM rallies
+         WHERE recording_id = ?1 ORDER BY start_ms",
+    )?;
+    let rallies = stmt
+        .query_map([id], |row| {
+            Ok(crate::segment::Rally {
+                start_ms: row.get(0)?,
+                end_ms: row.get(1)?,
+                confidence: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(Some(Timeline {
+        segment_state,
+        duration_ms,
+        rallies,
+    }))
 }

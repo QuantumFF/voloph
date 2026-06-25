@@ -1,5 +1,6 @@
 mod db;
 mod media;
+mod segment;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,11 +16,11 @@ use tauri_plugin_opener::OpenerExt;
 /// worker can share it with the Tauri commands.
 struct Db(Arc<Mutex<Connection>>);
 
-/// Guard so at most one background transcode worker runs at a time. A worker
-/// drains every `unknown`/`pending` recording before exiting, so anything
-/// registered while it runs is picked up on the same pass; a scan that arrives
-/// after it exits simply starts a fresh worker.
-struct TranscodeWorker(Arc<AtomicBool>);
+/// Guard so at most one background media worker runs at a time. A worker drains
+/// every pending unit of media work — probe, transcode (ADR 0005), then segment
+/// (ADR 0002) — before exiting, so anything registered while it runs is picked
+/// up on the same pass; a scan that arrives after it exits starts a fresh worker.
+struct MediaWorker(Arc<AtomicBool>);
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -29,14 +30,14 @@ fn greet(name: &str) -> String {
 
 /// Register the video files under `folder` as recordings, grouped into
 /// sessions by capture day. Idempotent across re-scans. Kicks off background
-/// transcoding for any newly registered web-incompatible recordings.
+/// media work (transcode then segment) for any newly registered recordings.
 #[tauri::command]
 fn scan_folder(app: AppHandle, db: State<'_, Db>, folder: String) -> Result<db::ScanResult, String> {
     let result = {
         let mut conn = db.0.lock().map_err(|e| e.to_string())?;
         db::scan_folder(&mut conn, std::path::Path::new(&folder)).map_err(|e| e.to_string())?
     };
-    spawn_transcode_worker(&app);
+    spawn_media_worker(&app);
     Ok(result)
 }
 
@@ -84,12 +85,41 @@ fn resolve_playback(db: State<'_, Db>, path: String) -> Result<PlaybackSource, S
     })
 }
 
-/// Start the background transcode worker unless one is already running. Probes
-/// each `unknown` recording (marking it `ready` when already web-playable, else
-/// `pending`) and transcodes each `pending` one in place (marking it `ready` or
-/// `failed`), without holding the DB lock across the slow ffmpeg work.
-fn spawn_transcode_worker(app: &AppHandle) {
-    let running = app.state::<TranscodeWorker>().0.clone();
+/// Resolve the draft timeline (rallies + per-region confidence) for the
+/// recording at `path` (ADR 0002). While segmentation is still running the
+/// `segment_state` is `unknown` and `rallies` is empty; the player polls until
+/// it turns `ready`. An unregistered path reports `unknown` with no rallies.
+#[tauri::command]
+fn recording_timeline(db: State<'_, Db>, path: String) -> Result<db::Timeline, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let timeline = db::recording_timeline(&conn, &path).map_err(|e| e.to_string())?;
+    Ok(timeline.unwrap_or_else(|| db::Timeline {
+        segment_state: "unknown".to_string(),
+        duration_ms: None,
+        rallies: Vec::new(),
+    }))
+}
+
+/// Re-run segmentation for the recording at `path`: discard its draft timeline,
+/// return it to the queue, and wake the media worker (ADR 0002). Backs the
+/// Re-analyze action for the human tuning step — re-segment without re-transcoding.
+#[tauri::command]
+fn reanalyze_recording(app: AppHandle, db: State<'_, Db>, path: String) -> Result<(), String> {
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::reset_segmentation(&conn, &path).map_err(|e| e.to_string())?;
+    }
+    spawn_media_worker(&app);
+    Ok(())
+}
+
+/// Start the background media worker unless one is already running. It drains
+/// every pending unit of work — probe each `unknown` recording, transcode each
+/// `pending` one in place (ADR 0005), then segment each playable-but-unsegmented
+/// one (ADR 0002) — without holding the DB lock across the slow ffmpeg/segment
+/// work, so playback and timeline queries stay responsive.
+fn spawn_media_worker(app: &AppHandle) {
+    let running = app.state::<MediaWorker>().0.clone();
     if running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -99,72 +129,118 @@ fn spawn_transcode_worker(app: &AppHandle) {
 
     let conn = app.state::<Db>().0.clone();
     std::thread::spawn(move || {
-        run_transcode_worker(&conn);
+        run_media_worker(&conn);
         running.store(false, Ordering::SeqCst);
     });
 }
 
-/// Drain the transcode queue: probe `unknown` recordings, transcode `pending`
-/// ones in place, until none remain. Each DB touch takes the lock only briefly;
-/// the ffmpeg probe/transcode runs unlocked so playback queries stay responsive.
-fn run_transcode_worker(conn: &Mutex<Connection>) {
+/// Drain the media-work queue (see [`db::next_media_work`]) until none remains.
+/// Each DB touch takes the lock only briefly; the ffmpeg probe/transcode and the
+/// audio extraction + segmentation run unlocked.
+fn run_media_worker(conn: &Mutex<Connection>) {
     loop {
         let work = match conn.lock() {
-            Ok(c) => db::next_transcode_work(&c),
+            Ok(c) => db::next_media_work(&c),
             Err(e) => {
-                log::error!("transcode worker: db lock poisoned: {e}");
+                log::error!("media worker: db lock poisoned: {e}");
                 return;
             }
         };
-        let Some((id, path, state)) = (match work {
-            Ok(w) => w,
+        let work = match work {
+            Ok(Some(w)) => w,
+            Ok(None) => return, // queue empty
             Err(e) => {
-                log::error!("transcode worker: query failed: {e}");
+                log::error!("media worker: query failed: {e}");
                 return;
             }
-        }) else {
-            return; // queue empty
         };
 
-        match state.as_str() {
-            "unknown" => {
+        match work {
+            db::MediaWork::Probe(id, path) => {
                 let next = match media::probe(&path) {
                     Ok(probe) if probe.passthrough => "ready",
                     Ok(_) => "pending",
                     Err(e) => {
-                        log::warn!("transcode worker: probe failed for {path}: {e}");
+                        log::warn!("media worker: probe failed for {path}: {e}");
                         "failed"
                     }
                 };
-                update_state(conn, id, next, &path);
+                set_transcode_state(conn, id, next, &path);
             }
-            "pending" => match media::transcode_in_place(&path) {
+            db::MediaWork::Transcode(id, path) => match media::transcode_in_place(&path) {
                 Ok(()) => {
-                    log::info!("transcode worker: transcoded {path} in place");
+                    log::info!("media worker: transcoded {path} in place");
                     if let Ok(c) = conn.lock() {
                         if let Err(e) = db::mark_transcoded(&c, id, &path) {
-                            log::error!("transcode worker: could not finalize {path}: {e}");
+                            log::error!("media worker: could not finalize {path}: {e}");
                         }
                     }
                 }
                 Err(e) => {
-                    log::warn!("transcode worker: transcode failed for {path}: {e}");
-                    update_state(conn, id, "failed", &path);
+                    log::warn!("media worker: transcode failed for {path}: {e}");
+                    set_transcode_state(conn, id, "failed", &path);
                 }
             },
-            other => {
-                log::error!("transcode worker: unexpected state {other} for {path}");
-                return;
-            }
+            db::MediaWork::Segment(id, path) => segment_recording(conn, id, &path),
         }
     }
 }
 
+/// Extract the recording's audio and motion tracks and run the hybrid segmenter
+/// (ADR 0006), persisting the draft timeline. The slow extraction + segmentation
+/// happen unlocked; only the final persist (and the failure mark) takes the lock.
+fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
+    let samples = match media::extract_pcm(path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("media worker: audio extraction failed for {path}: {e}");
+            set_segment_state(conn, id, "failed", path);
+            return;
+        }
+    };
+    let motion = match media::extract_motion(path) {
+        Ok(energy) => segment::MotionTrack {
+            fps: f64::from(media::MOTION_FPS),
+            energy,
+        },
+        Err(e) => {
+            log::warn!("media worker: motion extraction failed for {path}: {e}");
+            set_segment_state(conn, id, "failed", path);
+            return;
+        }
+    };
+    let rallies = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
+    let duration_ms =
+        (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
+    log::info!(
+        "media worker: segmented {path} into {} rallies ({duration_ms} ms)",
+        rallies.len()
+    );
+
+    match conn.lock() {
+        Ok(mut c) => {
+            if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies) {
+                log::error!("media worker: could not save timeline for {path}: {e}");
+            }
+        }
+        Err(e) => log::error!("media worker: db lock poisoned saving {path}: {e}"),
+    }
+}
+
 /// Update a recording's transcode state under a brief lock, logging on failure.
-fn update_state(conn: &Mutex<Connection>, id: i64, state: &str, path: &str) {
+fn set_transcode_state(conn: &Mutex<Connection>, id: i64, state: &str, path: &str) {
     if let Ok(c) = conn.lock() {
         if let Err(e) = db::set_transcode_state(&c, id, state) {
-            log::error!("transcode worker: could not update state for {path}: {e}");
+            log::error!("media worker: could not update transcode state for {path}: {e}");
+        }
+    }
+}
+
+/// Update a recording's segmentation state under a brief lock, logging on failure.
+fn set_segment_state(conn: &Mutex<Connection>, id: i64, state: &str, path: &str) {
+    if let Ok(c) = conn.lock() {
+        if let Err(e) = db::set_segment_state(&c, id, state) {
+            log::error!("media worker: could not update segment state for {path}: {e}");
         }
     }
 }
@@ -222,14 +298,15 @@ pub fn run() {
             }
             let conn = db::open(&dir.join("voloph.db"))?;
             app.manage(Db(Arc::new(Mutex::new(conn))));
-            app.manage(TranscodeWorker(Arc::new(AtomicBool::new(false))));
+            app.manage(MediaWorker(Arc::new(AtomicBool::new(false))));
             // Loopback HTTP server the player streams recordings from (ADR 0005).
             let endpoint = media::start()?;
             log::info!("playback server listening at {}", endpoint.origin);
             app.manage(endpoint);
-            // Resume any transcode work left unfinished by a previous run
-            // (recordings still `unknown`/`pending`) so they are ready to review.
-            spawn_transcode_worker(&app.handle());
+            // Resume any media work left unfinished by a previous run (recordings
+            // still needing a probe, transcode, or segmentation) so every
+            // recording becomes playable and gets its draft timeline.
+            spawn_media_worker(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -237,6 +314,8 @@ pub fn run() {
             scan_folder,
             list_sessions,
             resolve_playback,
+            recording_timeline,
+            reanalyze_recording,
             playback_endpoint
         ])
         .on_page_load(|webview, payload| {
