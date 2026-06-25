@@ -12,6 +12,10 @@ _Avoid_: match, day, event
 A single raw video file as it came off the camera, attached to a session. May contain one or several games of play. The app does not model games or matches as entities — they are not navigated by.
 _Avoid_: VOD, video, clip, game, match
 
+**Proxy**:
+A cached, web-playable H.264/AAC transcode of a recording the webview cannot decode natively (e.g. iPhone HEVC), generated once and played in place of the original so seeking and gap-free playback stay smooth. Derived and rebuildable — keyed to its recording, deletable at any time, never the source of truth; the original is untouched. A recording that is already web-playable has no proxy and plays directly.
+_Avoid_: cache, transcode (when you mean the proxy file itself), preview, lower-res copy
+
 **Rally**:
 A continuous segment of play, roughly serve to point decided. The atomic unit of review — you navigate, annotate, and skip at the granularity of rallies.
 _Avoid_: point, clip, segment (when you mean a rally specifically)
