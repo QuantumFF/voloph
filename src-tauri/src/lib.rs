@@ -97,6 +97,7 @@ fn recording_timeline(db: State<'_, Db>, path: String) -> Result<db::Timeline, S
         segment_state: "unknown".to_string(),
         duration_ms: None,
         rallies: Vec::new(),
+        waveform: Vec::new(),
     }))
 }
 
@@ -210,6 +211,9 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
         }
     };
     let rallies = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
+    // The displayed waveform for the timeline strip (issue #6), reduced from the
+    // same samples while we still hold them in memory.
+    let waveform = segment::waveform(&samples);
     let duration_ms =
         (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
     log::info!(
@@ -219,7 +223,7 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
 
     match conn.lock() {
         Ok(mut c) => {
-            if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies) {
+            if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform) {
                 log::error!("media worker: could not save timeline for {path}: {e}");
             }
         }

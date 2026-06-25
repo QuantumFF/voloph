@@ -67,7 +67,8 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             capture_day TEXT NOT NULL,
             transcode_state TEXT NOT NULL DEFAULT 'unknown',
             segment_state   TEXT NOT NULL DEFAULT 'unknown',
-            duration_ms     INTEGER
+            duration_ms     INTEGER,
+            waveform        TEXT
         );
         CREATE TABLE IF NOT EXISTS rallies (
             id           INTEGER PRIMARY KEY,
@@ -90,6 +91,10 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
         [],
     );
     let _ = conn.execute("ALTER TABLE recordings ADD COLUMN duration_ms INTEGER", []);
+    // Downsampled audio waveform peaks for the timeline strip (issue #6), stored
+    // as a JSON array of normalized `[0,1]` floats. Produced alongside the draft
+    // timeline during segmentation; null until a recording is segmented.
+    let _ = conn.execute("ALTER TABLE recordings ADD COLUMN waveform TEXT", []);
     Ok(conn)
 }
 
@@ -346,7 +351,9 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
         [path],
     )?;
     conn.execute(
-        "UPDATE recordings SET segment_state = 'unknown', duration_ms = NULL WHERE path = ?1",
+        "UPDATE recordings
+         SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL
+         WHERE path = ?1",
         [path],
     )?;
     Ok(())
@@ -370,7 +377,19 @@ pub fn save_rallies(
     recording_id: i64,
     duration_ms: i64,
     rallies: &[crate::segment::Rally],
+    waveform: &[f32],
 ) -> rusqlite::Result<()> {
+    // The waveform is a small fixed-length float array (segment::WAVEFORM_BUCKETS),
+    // stored as a compact JSON array of two-decimal peaks — finer precision is
+    // invisible on a strip a few hundred pixels wide and only bloats the row.
+    let waveform_json = format!(
+        "[{}]",
+        waveform
+            .iter()
+            .map(|p| format!("{p:.2}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let tx = conn.transaction()?;
     tx.execute(
         "DELETE FROM rallies WHERE recording_id = ?1",
@@ -391,8 +410,8 @@ pub fn save_rallies(
         }
     }
     tx.execute(
-        "UPDATE recordings SET segment_state = 'ready', duration_ms = ?1 WHERE id = ?2",
-        rusqlite::params![duration_ms, recording_id],
+        "UPDATE recordings SET segment_state = 'ready', duration_ms = ?1, waveform = ?2 WHERE id = ?3",
+        rusqlite::params![duration_ms, waveform_json, recording_id],
     )?;
     tx.commit()
 }
@@ -408,6 +427,10 @@ pub struct Timeline {
     /// rallies out over the full span.
     pub duration_ms: Option<i64>,
     pub rallies: Vec<crate::segment::Rally>,
+    /// Downsampled audio waveform peaks in `[0, 1]` (issue #6) for the timeline
+    /// strip; empty until segmented. Shuttle hits show as spikes, so rally
+    /// boundaries can be eyeballed against the rally blocks laid over them.
+    pub waveform: Vec<f32>,
 }
 
 /// The draft timeline for the recording at `path`, for the player. `None` when
@@ -415,19 +438,21 @@ pub struct Timeline {
 pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Option<Timeline>> {
     let row = conn
         .query_row(
-            "SELECT id, segment_state, duration_ms FROM recordings WHERE path = ?1",
+            "SELECT id, segment_state, duration_ms, waveform FROM recordings WHERE path = ?1",
             [path],
             |row| {
                 let id: i64 = row.get(0)?;
                 let state: String = row.get(1)?;
                 let duration: Option<i64> = row.get(2)?;
-                Ok((id, state, duration))
+                let waveform: Option<String> = row.get(3)?;
+                Ok((id, state, duration, waveform))
             },
         )
         .optional()?;
-    let Some((id, segment_state, duration_ms)) = row else {
+    let Some((id, segment_state, duration_ms, waveform_json)) = row else {
         return Ok(None);
     };
+    let waveform = parse_waveform(waveform_json.as_deref());
 
     let mut stmt = conn.prepare(
         "SELECT start_ms, end_ms, confidence FROM rallies
@@ -447,5 +472,22 @@ pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Opt
         segment_state,
         duration_ms,
         rallies,
+        waveform,
     }))
+}
+
+/// Parse the stored waveform JSON (a bare array of floats written by
+/// `save_rallies`) back into peaks. A null/absent or malformed value yields an
+/// empty waveform — the strip then just omits the waveform, harmless. Hand-parsed
+/// to avoid pulling in a JSON dependency for one trivial array.
+fn parse_waveform(json: Option<&str>) -> Vec<f32> {
+    let Some(json) = json else {
+        return Vec::new();
+    };
+    json.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f32>().ok())
+        .collect()
 }

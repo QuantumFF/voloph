@@ -7,6 +7,7 @@ import {
   ChevronRightIcon,
   Loader2Icon,
   RotateCwIcon,
+  TriangleAlertIcon,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -55,6 +56,12 @@ interface Timeline {
   segment_state: "unknown" | "ready" | "failed"
   duration_ms: number | null
   rallies: Rally[]
+  /**
+   * Downsampled audio waveform peaks in [0, 1], evenly spaced over the
+   * recording's duration. Shuttle hits show as spikes, so rally boundaries can be
+   * eyeballed against the rally blocks laid over them. Empty until segmented.
+   */
+  waveform: number[]
 }
 
 /** How long to wait before re-checking a recording that is still transcoding. */
@@ -330,6 +337,19 @@ export function RecordingPlayer({ recordings, startIndex = 0, onBack }: Recordin
     [rallies, seekTo, atFirstRecording, atLastRecording, goToRecording, index],
   )
 
+  // Jump to the next uncertain region — the spans the segmenter flagged as
+  // low-confidence (ADR 0002), surfaced so correction becomes "visit the few
+  // spots the machine doubts." Seeks to the first uncertain rally starting after
+  // the playhead, wrapping to the first when none is left ahead, so repeated
+  // presses cycle through every doubt in the current recording.
+  const goToUncertain = useCallback(() => {
+    const uncertain = rallies.filter((r) => r.confidence < UNCERTAIN_CONFIDENCE)
+    if (uncertain.length === 0) return
+    const ms = (videoRef.current?.currentTime ?? 0) * 1000
+    const target = uncertain.find((r) => r.start_ms > ms + 1) ?? uncertain[0]
+    seekTo(target.start_ms)
+  }, [rallies, seekTo])
+
   // When the current recording ends naturally (no later rally triggered a skip,
   // e.g. its trailing gap was short), advance into the next recording so the
   // playlist keeps flowing across the boundary.
@@ -419,6 +439,7 @@ export function RecordingPlayer({ recordings, startIndex = 0, onBack }: Recordin
             onSeek={seekTo}
             onPrevRally={() => goToRally("prev")}
             onNextRally={() => goToRally("next")}
+            onNextUncertain={goToUncertain}
             onReanalyze={handleReanalyze}
             reanalyzing={reanalyzing}
             canPrev={!atFirstRecording}
@@ -433,15 +454,17 @@ export function RecordingPlayer({ recordings, startIndex = 0, onBack }: Recordin
 }
 
 /**
- * The draft timeline strip beneath the player: each detected rally is a block
- * laid out over the current recording's full duration, gaps are the empty space
- * between them (ADR 0001), and low-confidence rallies are styled as uncertain
- * regions to "check this" (ADR 0002). Clicking a rally seeks the player to its
- * start, and a playhead marker tracks the current position. Prev/Next rally
- * cross recording boundaries, so they stay enabled at a recording's edges when
- * another recording remains in the session playlist. The Re-analyze button
- * re-runs segmentation in place — the loop for tuning the heuristic (see
- * `docs/tuning-segmentation.md`).
+ * The draft timeline strip beneath the player (issue #6): the recording's audio
+ * waveform fills it — shuttle hits show as spikes, so rally boundaries can be
+ * eyeballed — with each detected rally drawn as a block over it, gaps the empty
+ * space between them (ADR 0001), and low-confidence rallies styled as uncertain
+ * regions to "check this" (ADR 0002). Clicking anywhere on the strip seeks the
+ * player to that point (a rally block seeks to its start); a playhead marker
+ * tracks the current position. Prev/Next rally cross recording boundaries, so
+ * they stay enabled at a recording's edges when another recording remains in the
+ * session playlist; Next uncertain cycles through the spans the segmenter
+ * doubts. The Re-analyze button re-runs segmentation in place — the loop for
+ * tuning the heuristic (see `docs/tuning-segmentation.md`).
  */
 function RallyTimeline({
   timeline,
@@ -449,6 +472,7 @@ function RallyTimeline({
   onSeek,
   onPrevRally,
   onNextRally,
+  onNextUncertain,
   onReanalyze,
   reanalyzing,
   canPrev,
@@ -459,6 +483,7 @@ function RallyTimeline({
   onSeek: (ms: number) => void
   onPrevRally: () => void
   onNextRally: () => void
+  onNextUncertain: () => void
   onReanalyze: () => void
   reanalyzing: boolean
   canPrev: boolean
@@ -536,6 +561,16 @@ function RallyTimeline({
           <Button
             variant="outline"
             size="sm"
+            onClick={onNextUncertain}
+            disabled={uncertainCount === 0}
+            title="Jump to the next uncertain region — a span the segmenter doubts, worth checking."
+          >
+            <TriangleAlertIcon className="size-4" />
+            Next uncertain
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
             onClick={onReanalyze}
             disabled={analyzing}
             title="Re-run rally detection in place (for tuning the segmenter)."
@@ -546,7 +581,18 @@ function RallyTimeline({
         </div>
       </div>
       {hasRallies ? (
-        <div className="relative h-8 w-full overflow-hidden rounded-md bg-muted">
+        <div
+          className="relative h-12 w-full cursor-pointer overflow-hidden rounded-md bg-muted"
+          onClick={(e) => {
+            // Clicking the strip seeks playback to that point (issue #6): map the
+            // click's x within the strip to a fraction of the recording. Rally
+            // blocks stop propagation and seek to their own start instead.
+            const rect = e.currentTarget.getBoundingClientRect()
+            const frac = (e.clientX - rect.left) / rect.width
+            onSeek(Math.min(Math.max(frac, 0), 1) * duration)
+          }}
+        >
+          <Waveform peaks={timeline.waveform} />
           {timeline.rallies.map((rally, i) => {
             const left = (rally.start_ms / duration) * 100
             const width = ((rally.end_ms - rally.start_ms) / duration) * 100
@@ -555,7 +601,10 @@ function RallyTimeline({
               <button
                 key={i}
                 type="button"
-                onClick={() => onSeek(rally.start_ms)}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onSeek(rally.start_ms)
+                }}
                 className={
                   uncertain
                     ? "absolute inset-y-0 rounded-sm border border-amber-500/70 bg-amber-500/40 transition-opacity hover:opacity-80"
@@ -579,5 +628,39 @@ function RallyTimeline({
         </div>
       ) : null}
     </div>
+  )
+}
+
+/**
+ * The audio waveform under the rally blocks (issue #6): each downsampled peak
+ * is a vertical bar centred on the strip, so shuttle hits read as spikes and
+ * rally boundaries can be eyeballed where the blocks overlay them. Drawn behind
+ * the blocks at low contrast (pointer-events disabled so strip clicks seek) and
+ * stretched to fill the strip via a viewBox in normalized peak coordinates.
+ */
+function Waveform({ peaks }: { peaks: number[] }) {
+  if (peaks.length === 0) return null
+  return (
+    <svg
+      className="pointer-events-none absolute inset-0 size-full text-muted-foreground/50"
+      viewBox={`0 0 ${peaks.length} 1`}
+      preserveAspectRatio="none"
+      aria-hidden
+    >
+      {peaks.map((peak, i) => {
+        // A floor keeps near-silent buckets faintly visible rather than blank.
+        const h = Math.max(peak, 0.02)
+        return (
+          <rect
+            key={i}
+            x={i + 0.1}
+            y={(1 - h) / 2}
+            width={0.8}
+            height={h}
+            fill="currentColor"
+          />
+        )
+      })}
+    </svg>
   )
 }
