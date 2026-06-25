@@ -1,7 +1,13 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
-import { ArrowLeftIcon, Loader2Icon, RotateCwIcon } from "lucide-react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  ArrowLeftIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  Loader2Icon,
+  RotateCwIcon,
+} from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { trackedInvoke } from "@/lib/tauri"
@@ -198,6 +204,49 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
     void media.play()
   }, [])
 
+  // Rallies for this recording, ascending by start (sorted by construction in
+  // segment.rs). The empty list when there's no timeline means playback is plain.
+  const rallies = useMemo(() => timeline?.rallies ?? [], [timeline])
+
+  // Gap-free playback (the North Star): as the playhead crosses out of a rally
+  // into a gap, jump straight to the next rally's start so only play is watched
+  // (ADR 0001). Reads the current saved timeline, so later corrections take
+  // effect. With no rallies, this is inert and the recording plays normally.
+  const skipGaps = useCallback(
+    (ms: number) => {
+      if (rallies.length === 0) return
+      // Inside a rally → nothing to skip.
+      if (rallies.some((r) => ms >= r.start_ms && ms < r.end_ms)) return
+      const next = rallies.find((r) => r.start_ms > ms)
+      if (next) {
+        // In a gap before a later rally (including the head gap) → jump ahead.
+        seekTo(next.start_ms)
+      } else {
+        // Past the final rally → no more play left; stop at the session's end.
+        videoRef.current?.pause()
+      }
+    },
+    [rallies, seekTo],
+  )
+
+  // Manual rally-to-rally navigation. Next jumps to the first rally starting
+  // after the playhead; previous to the last rally starting before it (with a
+  // small slack so the button rewinds past the rally you're currently in).
+  const goToRally = useCallback(
+    (direction: "next" | "prev") => {
+      if (rallies.length === 0) return
+      const ms = (videoRef.current?.currentTime ?? 0) * 1000
+      if (direction === "next") {
+        const target = rallies.find((r) => r.start_ms > ms + 1)
+        if (target) seekTo(target.start_ms)
+      } else {
+        const target = [...rallies].reverse().find((r) => r.start_ms < ms - 1000)
+        seekTo(target ? target.start_ms : rallies[0].start_ms)
+      }
+    },
+    [rallies, seekTo],
+  )
+
   // Re-run segmentation for this recording, then re-fetch its timeline. Lets a
   // human iterate on the segmenter's tuning without re-importing (ADR 0002).
   const handleReanalyze = useCallback(() => {
@@ -261,12 +310,18 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
             controls
             autoPlay
             onError={handleError}
-            onTimeUpdate={(e) => setCurrentMs(e.currentTarget.currentTime * 1000)}
+            onTimeUpdate={(e) => {
+              const ms = e.currentTarget.currentTime * 1000
+              setCurrentMs(ms)
+              skipGaps(ms)
+            }}
           />
           <RallyTimeline
             timeline={timeline}
             currentMs={currentMs}
             onSeek={seekTo}
+            onPrevRally={() => goToRally("prev")}
+            onNextRally={() => goToRally("next")}
             onReanalyze={handleReanalyze}
             reanalyzing={reanalyzing}
           />
@@ -291,12 +346,16 @@ function RallyTimeline({
   timeline,
   currentMs,
   onSeek,
+  onPrevRally,
+  onNextRally,
   onReanalyze,
   reanalyzing,
 }: {
   timeline: Timeline | null
   currentMs: number
   onSeek: (ms: number) => void
+  onPrevRally: () => void
+  onNextRally: () => void
   onReanalyze: () => void
   reanalyzing: boolean
 }) {
@@ -348,16 +407,38 @@ function RallyTimeline({
     <div className="space-y-2">
       <div className="flex items-center justify-between text-sm text-muted-foreground">
         {summary}
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onReanalyze}
-          disabled={analyzing}
-          title="Re-run rally detection in place (for tuning the segmenter)."
-        >
-          <RotateCwIcon className={`size-4 ${reanalyzing ? "animate-spin" : ""}`} />
-          Re-analyze
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onPrevRally}
+            disabled={!hasRallies}
+            title="Jump to the previous rally."
+          >
+            <ChevronLeftIcon className="size-4" />
+            Prev rally
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onNextRally}
+            disabled={!hasRallies}
+            title="Jump to the next rally."
+          >
+            Next rally
+            <ChevronRightIcon className="size-4" />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onReanalyze}
+            disabled={analyzing}
+            title="Re-run rally detection in place (for tuning the segmenter)."
+          >
+            <RotateCwIcon className={`size-4 ${reanalyzing ? "animate-spin" : ""}`} />
+            Re-analyze
+          </Button>
+        </div>
       </div>
       {hasRallies ? (
         <div className="relative h-8 w-full overflow-hidden rounded-md bg-muted">
