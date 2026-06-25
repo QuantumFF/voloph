@@ -2,8 +2,9 @@
 
 The in-app player uses these binaries to probe codecs and to transcode
 web-incompatible recordings (e.g. iPhone HEVC) to H.264/AAC on the fly. They are
-declared in `../tauri.conf.json` under `bundle.externalBin` and invoked from
-`../src/media.rs` via the Tauri shell plugin's sidecar API.
+declared in `../tauri.conf.json` under `bundle.externalBin` so Tauri bundles
+them beside the app executable, and `../src/media.rs` resolves them there and
+runs them directly (probe via `ffprobe`, streaming transcode via `ffmpeg`).
 
 ## Naming
 

@@ -1,10 +1,10 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { convertFileSrc } from "@tauri-apps/api/core"
 import { ArrowLeftIcon } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { trackedInvoke } from "@/lib/tauri"
 
 interface RecordingPlayerProps {
   /** Absolute on-disk path of the recording to play. */
@@ -13,23 +13,27 @@ interface RecordingPlayerProps {
   onBack: () => void
 }
 
+/** Loopback origin + token of the playback server (see `src-tauri/src/media.rs`). */
+interface PlaybackEndpoint {
+  origin: string
+  token: string
+}
+
 function fileName(path: string): string {
   const parts = path.split(/[\\/]/)
   return parts[parts.length - 1] || path
 }
 
 /**
- * Build a `stream://` URL the webview can load. The recording path and an
- * optional seek offset travel as query parameters so absolute paths survive
- * intact. `convertFileSrc("", "stream")` yields the correct per-platform
- * origin (e.g. `http://stream.localhost/` on Linux/WebKitGTK), onto which we
- * append our own query.
+ * Build a playback URL the webview's `<video>` element can load. The recording
+ * path, an optional seek offset, and the per-launch token travel as query
+ * parameters so absolute paths survive intact. The origin is the loopback
+ * playback server (e.g. `http://127.0.0.1:54321`).
  */
-function streamUrl(path: string, startSeconds: number): string {
-  const base = convertFileSrc("", "stream")
-  const url = new URL(base)
-  url.search = ""
+function streamUrl(endpoint: PlaybackEndpoint, path: string, startSeconds: number): string {
+  const url = new URL(`${endpoint.origin}/play`)
   url.searchParams.set("path", path)
+  url.searchParams.set("token", endpoint.token)
   if (startSeconds > 0) {
     url.searchParams.set("t", String(startSeconds))
   }
@@ -59,8 +63,25 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
   // real recording position.
   const [startOffset, setStartOffset] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  // The loopback playback server endpoint, fetched once from the backend.
+  const [endpoint, setEndpoint] = useState<PlaybackEndpoint | null>(null)
   // Guard so the seek handler does not re-trigger itself after we reload.
   const restartingRef = useRef(false)
+
+  // Fetch the playback server endpoint once on mount.
+  useEffect(() => {
+    let cancelled = false
+    trackedInvoke<PlaybackEndpoint>("playback_endpoint")
+      .then((result) => {
+        if (!cancelled) setEndpoint(result)
+      })
+      .catch(() => {
+        if (!cancelled) setError("Playback is unavailable: the media server did not start.")
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // Reset offset and error when the recording changes.
   useEffect(() => {
@@ -122,20 +143,22 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
         <div className="flex aspect-video w-full items-center justify-center rounded-lg bg-black p-6 text-center text-sm text-destructive-foreground">
           {error}
         </div>
-      ) : (
+      ) : endpoint ? (
         <video
           ref={videoRef}
           // Re-mount when the path or seek offset changes so the source reloads
           // and the ffmpeg pipeline restarts at the new timestamp.
           key={`${path}#${startOffset}`}
           className="w-full rounded-lg bg-black"
-          src={streamUrl(path, startOffset)}
+          src={streamUrl(endpoint, path, startOffset)}
           controls
           autoPlay
           onSeeking={handleSeeking}
           onLoadedMetadata={handleLoadedMetadata}
           onError={handleError}
         />
+      ) : (
+        <div className="flex aspect-video w-full items-center justify-center rounded-lg bg-black" />
       )}
     </div>
   )

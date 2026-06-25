@@ -32,6 +32,13 @@ fn list_sessions(db: State<'_, Db>) -> Result<Vec<db::Session>, String> {
     db::list_sessions(&conn).map_err(|e| e.to_string())
 }
 
+/// The loopback origin + token the player points its `<video>` element at. The
+/// frontend builds `${origin}/play?path=…&t=…&token=…` URLs from this.
+#[tauri::command]
+fn playback_endpoint(endpoint: State<'_, media::PlaybackEndpoint>) -> media::PlaybackEndpoint {
+    endpoint.inner().clone()
+}
+
 fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::<R>::new("external-navigation")
         .on_navigation(|webview, url| {
@@ -73,20 +80,26 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(external_navigation_plugin())
-        // Player playback source: probe + passthrough-or-transcode via ffmpeg.
-        .register_asynchronous_uri_scheme_protocol(media::SCHEME, |ctx, request, responder| {
-            media::handle(ctx.app_handle().clone(), request, responder);
-        })
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             let conn = db::open(&dir.join("voloph.db"))?;
             app.manage(Db(Mutex::new(conn)));
+            // Player playback source: a loopback HTTP server that probes each
+            // recording and either passes it through or live-transcodes it via
+            // the ffmpeg sidecar, streaming the result to the webview.
+            let endpoint = media::start()?;
+            log::info!("playback server listening at {}", endpoint.origin);
+            app.manage(endpoint);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, scan_folder, list_sessions])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            scan_folder,
+            list_sessions,
+            playback_endpoint
+        ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {
                 log::info!("main webview finished loading");
