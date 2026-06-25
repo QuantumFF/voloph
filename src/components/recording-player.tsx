@@ -12,9 +12,20 @@ import {
 import { Button } from "@/components/ui/button"
 import { trackedInvoke } from "@/lib/tauri"
 
-interface RecordingPlayerProps {
-  /** Absolute on-disk path of the recording to play. */
+/** One recording in the session playlist, in capture-time order. */
+export interface PlaylistRecording {
+  /** Absolute on-disk path of the recording. */
   path: string
+}
+
+interface RecordingPlayerProps {
+  /**
+   * The session's recordings, ordered by capture time. Their rallies are
+   * flattened into one continuous playlist played back-to-back (the North Star).
+   */
+  recordings: PlaylistRecording[]
+  /** Index of the recording to open first (defaults to the session's start). */
+  startIndex?: number
   /** Return to the session list. */
   onBack: () => void
 }
@@ -79,9 +90,16 @@ function playUrl(endpoint: PlaybackEndpoint, path: string): string {
 }
 
 /**
- * Plays a single recording in the in-app player.
+ * Plays a whole **session** as one continuous playlist (the North Star): the
+ * rallies of every recording, in capture-time order, played back-to-back with
+ * gaps skipped. A single `<video>` element plays one recording at a time; when
+ * the playhead runs past the last rally of the current recording the player
+ * advances to the next recording and resumes from its first rally, so file
+ * boundaries are invisible. Rally-to-rally navigation likewise crosses
+ * boundaries: Next from the final rally steps into the next recording, Prev from
+ * the first rally steps back into the previous one.
  *
- * The source is served by a loopback HTTP server (see `src-tauri/src/media.rs`),
+ * Each recording is served by a loopback HTTP server (see `src-tauri/src/media.rs`),
  * not the asset protocol or a custom scheme: WebKitGTK plays HTML5 media through
  * GStreamer, which only loads real `http://` sources, so a `<video>` pointed at
  * `asset://`/`stream://` fails with `MediaError` code 4. The server declares
@@ -89,11 +107,14 @@ function playUrl(endpoint: PlaybackEndpoint, path: string): string {
  * works. Web-incompatible recordings are transcoded to H.264/AAC in place at
  * import (ADR 0005); the bytes streamed here are always already playable.
  *
- * Because that transcode runs in the background, a freshly imported recording
- * may still be converting when first opened. Rather than point the player at a
- * still-undecodable file, we surface a "preparing" state and poll until ready.
+ * Because that transcode and the segmentation run in the background, a recording
+ * the playlist crosses into may still be converting or have no draft timeline
+ * yet (a session is partly processed). The player surfaces a "preparing" state
+ * and polls until the source is ready, and plays a not-yet-segmented recording
+ * straight through until its rallies arrive — the playlist never stalls on a
+ * file it cannot yet skip through.
  */
-export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
+export function RecordingPlayer({ recordings, startIndex = 0, onBack }: RecordingPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [endpoint, setEndpoint] = useState<PlaybackEndpoint | null>(null)
   const [src, setSrc] = useState<string | null>(null)
@@ -102,7 +123,7 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
   // Exact MediaError detail surfaced on failure, so a playback problem reports
   // its cause (decode vs. fetch vs. unsupported source) instead of a black box.
   const [errorDetail, setErrorDetail] = useState<string | null>(null)
-  // The draft timeline (rallies + per-region confidence) for this recording.
+  // The draft timeline (rallies + per-region confidence) for the current recording.
   const [timeline, setTimeline] = useState<Timeline | null>(null)
   // Current playhead position (ms), tracked so the timeline strip can show it.
   const [currentMs, setCurrentMs] = useState(0)
@@ -110,6 +131,18 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
   // re-segments (the tuning loop, ADR 0002); `reanalyzing` guards the button.
   const [reanalyzeNonce, setReanalyzeNonce] = useState(0)
   const [reanalyzing, setReanalyzing] = useState(false)
+
+  // Which recording in the playlist is loaded, and where to resume once its
+  // timeline arrives after a boundary crossing: "start" plays from the first
+  // rally (advancing forward), "end" from the last (stepping backward via Prev).
+  const [index, setIndex] = useState(() =>
+    Math.min(Math.max(startIndex, 0), Math.max(recordings.length - 1, 0)),
+  )
+  const [pendingSeek, setPendingSeek] = useState<"start" | "end" | null>(null)
+  const path = recordings[index]?.path ?? null
+
+  const atFirstRecording = index <= 0
+  const atLastRecording = index >= recordings.length - 1
 
   // Fetch the playback server endpoint once on mount.
   useEffect(() => {
@@ -130,7 +163,7 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
   }, [])
 
   useEffect(() => {
-    if (!endpoint) return
+    if (!endpoint || !path) return
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
     // Reset to a clean loading state when the recording changes before it
@@ -167,9 +200,11 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
     }
   }, [path, endpoint])
 
-  // Fetch the draft timeline for this recording, polling while segmentation is
-  // still running so the rallies appear as soon as the worker finishes (ADR 0002).
+  // Fetch the draft timeline for the current recording, polling while
+  // segmentation is still running so the rallies appear as soon as the worker
+  // finishes (ADR 0002).
   useEffect(() => {
+    if (!path) return
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -196,7 +231,7 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
     }
   }, [path, reanalyzeNonce])
 
-  // Seek the player to a rally's start and resume playback.
+  // Seek the player to a position (ms) and resume playback.
   const seekTo = useCallback((ms: number) => {
     const media = videoRef.current
     if (!media) return
@@ -204,14 +239,47 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
     void media.play()
   }, [])
 
-  // Rallies for this recording, ascending by start (sorted by construction in
-  // segment.rs). The empty list when there's no timeline means playback is plain.
+  // Rallies for the current recording, ascending by start (sorted by
+  // construction in segment.rs). The empty list when there's no timeline means
+  // playback is plain — the recording plays straight through.
   const rallies = useMemo(() => timeline?.rallies ?? [], [timeline])
+
+  // Move the playlist to another recording, remembering where to resume once it
+  // loads. Forward crossings resume from the first rally, backward from the last.
+  const goToRecording = useCallback(
+    (next: number, resume: "start" | "end") => {
+      setIndex(next)
+      setPendingSeek(resume)
+    },
+    [],
+  )
+
+  // After a boundary crossing, once the new recording's timeline is ready, seek
+  // to the requested edge (first/last rally) and play. With no rallies yet there
+  // is nothing to seek to, so the recording plays from the top until its draft
+  // timeline arrives and a later pass re-applies the resume.
+  useEffect(() => {
+    if (status !== "ready" || !pendingSeek) return
+    if (rallies.length === 0) {
+      // Forward into a not-yet-segmented recording: play from the start anyway
+      // so the playlist never stalls. Backward we already sit at the start.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setPendingSeek(null)
+      void videoRef.current?.play()
+      return
+    }
+    const target = pendingSeek === "start" ? rallies[0] : rallies[rallies.length - 1]
+    seekTo(target.start_ms)
+    setPendingSeek(null)
+  }, [status, pendingSeek, rallies, seekTo])
 
   // Gap-free playback (the North Star): as the playhead crosses out of a rally
   // into a gap, jump straight to the next rally's start so only play is watched
   // (ADR 0001). Reads the current saved timeline, so later corrections take
-  // effect. With no rallies, this is inert and the recording plays normally.
+  // effect. Past the final rally of this recording, advance into the next
+  // recording (gaps between files are skipped too); only the session's very last
+  // rally ends playback. With no rallies, this is inert and the recording plays
+  // normally until its timeline arrives.
   const skipGaps = useCallback(
     (ms: number) => {
       if (rallies.length === 0) return
@@ -221,35 +289,58 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
       if (next) {
         // In a gap before a later rally (including the head gap) → jump ahead.
         seekTo(next.start_ms)
+      } else if (!atLastRecording) {
+        // Past this recording's last rally → cross into the next recording.
+        goToRecording(index + 1, "start")
       } else {
-        // Past the final rally → no more play left; stop at the session's end.
+        // Past the session's final rally → no more play left; stop.
         videoRef.current?.pause()
       }
     },
-    [rallies, seekTo],
+    [rallies, seekTo, atLastRecording, goToRecording, index],
   )
 
-  // Manual rally-to-rally navigation. Next jumps to the first rally starting
-  // after the playhead; previous to the last rally starting before it (with a
-  // small slack so the button rewinds past the rally you're currently in).
+  // Manual rally-to-rally navigation, across recording boundaries. Next jumps to
+  // the first rally starting after the playhead, or into the next recording's
+  // first rally when none is left. Previous jumps to the last rally starting
+  // before the playhead (with a small slack so it rewinds past the rally you're
+  // in), or back into the previous recording's last rally when at the first.
   const goToRally = useCallback(
     (direction: "next" | "prev") => {
-      if (rallies.length === 0) return
       const ms = (videoRef.current?.currentTime ?? 0) * 1000
       if (direction === "next") {
         const target = rallies.find((r) => r.start_ms > ms + 1)
-        if (target) seekTo(target.start_ms)
+        if (target) {
+          seekTo(target.start_ms)
+        } else if (!atLastRecording) {
+          goToRecording(index + 1, "start")
+        }
       } else {
         const target = [...rallies].reverse().find((r) => r.start_ms < ms - 1000)
-        seekTo(target ? target.start_ms : rallies[0].start_ms)
+        if (target) {
+          seekTo(target.start_ms)
+        } else if (!atFirstRecording) {
+          goToRecording(index - 1, "end")
+        } else if (rallies.length > 0) {
+          // First recording, before its first rally → snap to its start.
+          seekTo(rallies[0].start_ms)
+        }
       }
     },
-    [rallies, seekTo],
+    [rallies, seekTo, atFirstRecording, atLastRecording, goToRecording, index],
   )
 
-  // Re-run segmentation for this recording, then re-fetch its timeline. Lets a
-  // human iterate on the segmenter's tuning without re-importing (ADR 0002).
+  // When the current recording ends naturally (no later rally triggered a skip,
+  // e.g. its trailing gap was short), advance into the next recording so the
+  // playlist keeps flowing across the boundary.
+  const handleEnded = useCallback(() => {
+    if (!atLastRecording) goToRecording(index + 1, "start")
+  }, [atLastRecording, goToRecording, index])
+
+  // Re-run segmentation for the current recording, then re-fetch its timeline.
+  // Lets a human iterate on the segmenter's tuning without re-importing (ADR 0002).
   const handleReanalyze = useCallback(() => {
+    if (!path) return
     setReanalyzing(true)
     trackedInvoke("reanalyze_recording", { path })
       .then(() => setReanalyzeNonce((n) => n + 1))
@@ -281,9 +372,14 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
           <ArrowLeftIcon className="size-4" />
           Sessions
         </Button>
-        <span className="truncate font-medium" title={path}>
-          {fileName(path)}
+        <span className="truncate font-medium" title={path ?? undefined}>
+          {path ? fileName(path) : "No recordings"}
         </span>
+        {recordings.length > 1 ? (
+          <span className="shrink-0 text-sm text-muted-foreground tabular-nums">
+            Recording {index + 1} of {recordings.length}
+          </span>
+        ) : null}
       </div>
       {status === "error" ? (
         <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-lg bg-black p-6 text-center text-sm text-destructive-foreground">
@@ -310,6 +406,7 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
             controls
             autoPlay
             onError={handleError}
+            onEnded={handleEnded}
             onTimeUpdate={(e) => {
               const ms = e.currentTarget.currentTime * 1000
               setCurrentMs(ms)
@@ -324,6 +421,8 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
             onNextRally={() => goToRally("next")}
             onReanalyze={handleReanalyze}
             reanalyzing={reanalyzing}
+            canPrev={!atFirstRecording}
+            canNext={!atLastRecording}
           />
         </>
       ) : (
@@ -335,11 +434,13 @@ export function RecordingPlayer({ path, onBack }: RecordingPlayerProps) {
 
 /**
  * The draft timeline strip beneath the player: each detected rally is a block
- * laid out over the recording's full duration, gaps are the empty space between
- * them (ADR 0001), and low-confidence rallies are styled as uncertain regions to
- * "check this" (ADR 0002). Clicking a rally seeks the player to its start, and a
- * playhead marker tracks the current position. The Re-analyze button re-runs
- * segmentation in place — the loop for tuning the heuristic (see
+ * laid out over the current recording's full duration, gaps are the empty space
+ * between them (ADR 0001), and low-confidence rallies are styled as uncertain
+ * regions to "check this" (ADR 0002). Clicking a rally seeks the player to its
+ * start, and a playhead marker tracks the current position. Prev/Next rally
+ * cross recording boundaries, so they stay enabled at a recording's edges when
+ * another recording remains in the session playlist. The Re-analyze button
+ * re-runs segmentation in place — the loop for tuning the heuristic (see
  * `docs/tuning-segmentation.md`).
  */
 function RallyTimeline({
@@ -350,6 +451,8 @@ function RallyTimeline({
   onNextRally,
   onReanalyze,
   reanalyzing,
+  canPrev,
+  canNext,
 }: {
   timeline: Timeline | null
   currentMs: number
@@ -358,6 +461,8 @@ function RallyTimeline({
   onNextRally: () => void
   onReanalyze: () => void
   reanalyzing: boolean
+  canPrev: boolean
+  canNext: boolean
 }) {
   if (!timeline) return null
 
@@ -412,7 +517,7 @@ function RallyTimeline({
             variant="outline"
             size="sm"
             onClick={onPrevRally}
-            disabled={!hasRallies}
+            disabled={!hasRallies && !canPrev}
             title="Jump to the previous rally."
           >
             <ChevronLeftIcon className="size-4" />
@@ -422,7 +527,7 @@ function RallyTimeline({
             variant="outline"
             size="sm"
             onClick={onNextRally}
-            disabled={!hasRallies}
+            disabled={!hasRallies && !canNext}
             title="Jump to the next rally."
           >
             Next rally

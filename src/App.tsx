@@ -1,6 +1,6 @@
 import { useState, type CSSProperties } from "react"
 import { AppSidebar } from "@/components/app-sidebar"
-import { RecordingPlayer } from "@/components/recording-player"
+import { RecordingPlayer, type PlaylistRecording } from "@/components/recording-player"
 import { SessionList } from "@/components/session-list"
 import { SiteHeader } from "@/components/site-header"
 import {
@@ -9,8 +9,14 @@ import {
 } from "@/components/ui/sidebar"
 import { TooltipProvider } from "@/components/ui/tooltip"
 
+/** The session playlist currently open in the player, and where to start. */
+interface Playing {
+  recordings: PlaylistRecording[]
+  startIndex: number
+}
+
 export default function App() {
-  const [playingPath, setPlayingPath] = useState<string | null>(null)
+  const [playing, setPlaying] = useState<Playing | null>(null)
 
   return (
     <TooltipProvider>
@@ -29,13 +35,18 @@ export default function App() {
             <div className="@container/main flex flex-1 flex-col gap-2">
               <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6">
                 <div className="px-4 lg:px-6">
-                  {playingPath ? (
+                  {playing ? (
                     <RecordingPlayer
-                      path={playingPath}
-                      onBack={() => setPlayingPath(null)}
+                      recordings={playing.recordings}
+                      startIndex={playing.startIndex}
+                      onBack={() => setPlaying(null)}
                     />
                   ) : (
-                    <SessionList onPlay={setPlayingPath} />
+                    <SessionList
+                      onPlay={(recordings, startIndex) =>
+                        setPlaying({ recordings, startIndex })
+                      }
+                    />
                   )}
                 </div>
               </div>

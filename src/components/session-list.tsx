@@ -75,8 +75,12 @@ function fileName(path: string): string {
 }
 
 interface SessionListProps {
-  /** Open a recording in the player by its on-disk path. */
-  onPlay: (path: string) => void
+  /**
+   * Open a session in the player as one continuous playlist. `recordings` is the
+   * session's recordings in capture-time order; `startIndex` is the one to open
+   * first (which recording the user clicked).
+   */
+  onPlay: (recordings: { path: string }[], startIndex: number) => void
 }
 
 export function SessionList({ onPlay }: SessionListProps) {
@@ -158,17 +162,27 @@ export function SessionList({ onPlay }: SessionListProps) {
                 <h3 className="font-medium tabular-nums">
                   {session.capture_day}
                 </h3>
-                <span className="text-sm text-muted-foreground">
-                  {session.recordings.length} recording
-                  {session.recordings.length === 1 ? "" : "s"}
-                </span>
+                <div className="flex items-center gap-3">
+                  <span className="text-sm text-muted-foreground">
+                    {session.recordings.length} recording
+                    {session.recordings.length === 1 ? "" : "s"}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => onPlay(session.recordings, 0)}
+                    title="Play the whole session — every rally, back-to-back."
+                  >
+                    Play session
+                  </Button>
+                </div>
               </div>
               <ul className="divide-y">
-                {session.recordings.map((recording) => (
+                {session.recordings.map((recording, recordingIndex) => (
                   <li key={recording.id}>
                     <button
                       type="button"
-                      onClick={() => onPlay(recording.path)}
+                      onClick={() => onPlay(session.recordings, recordingIndex)}
                       className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-accent"
                     >
                       <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
