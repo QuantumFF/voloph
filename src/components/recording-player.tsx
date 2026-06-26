@@ -5,13 +5,22 @@ import {
   ArrowLeftIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  KeyboardIcon,
   Loader2Icon,
+  PauseIcon,
   PencilIcon,
+  PlayIcon,
   PlusIcon,
+  RepeatIcon,
   RotateCwIcon,
   ScissorsIcon,
+  StepBackIcon,
+  StepForwardIcon,
   Trash2Icon,
   TriangleAlertIcon,
+  Volume2Icon,
+  VolumeXIcon,
+  XIcon,
   ZoomInIcon,
   ZoomOutIcon,
 } from "lucide-react"
@@ -41,6 +50,8 @@ interface RecordingPlayerProps {
 interface PlaybackSource {
   path: string
   state: "ready" | "unknown" | "pending" | "failed"
+  /** Probed frame rate (issue #19), for exact frame-step; null when unknown. */
+  fps: number | null
 }
 
 /** Loopback origin + token of the playback server (see `src-tauri/src/media.rs`). */
@@ -148,6 +159,29 @@ const SESSION_PX_PER_SEC_MIN = 1
 const SESSION_PX_PER_SEC_MAX = 240
 const SESSION_ZOOM_FACTOR = 1.5
 
+/**
+ * Frame rate to assume when a recording's real fps hasn't been probed yet
+ * (issue #19): the backend defaults to this too, so frame-step still works.
+ */
+const DEFAULT_FPS = 30
+
+/**
+ * Fixed playback-speed ladder (issue #19). `Ctrl+-`/`Ctrl+=` step along it and
+ * `Ctrl+0` resets to `1×`. A ladder (not free scrubbing) keeps speed changes
+ * predictable and the indicator readable.
+ */
+const SPEED_LADDER = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2] as const
+/** Index of `1×` on the ladder — the default and the `Ctrl+0` reset target. */
+const DEFAULT_SPEED_INDEX = SPEED_LADDER.indexOf(1)
+
+/** Arrow-seek step sizes in ms (session-global), by modifier (issue #19). */
+const SEEK_FINE_MS = 2500 // Ctrl+←/→
+const SEEK_DEFAULT_MS = 5000 // ←/→
+const SEEK_COARSE_MS = 10000 // Shift+←/→
+
+/** How much each Alt+scroll notch over the timeline zooms (issue #19). */
+const ALT_SCROLL_ZOOM_FACTOR = 1.15
+
 function clamp(value: number, lo: number, hi: number): number {
   return Math.min(Math.max(value, lo), hi)
 }
@@ -156,6 +190,22 @@ function formatClock(ms: number): string {
   const total = Math.round(ms / 1000)
   const m = Math.floor(total / 60)
   const s = total % 60
+  return `${m}:${s.toString().padStart(2, "0")}`
+}
+
+/**
+ * Session-global timecode for the transport bar (issue #19): `mm:ss` under an
+ * hour, `h:mm:ss` past it, so the position display reads naturally for both a
+ * short clip and a long session.
+ */
+function formatTimecode(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`
+  }
   return `${m}:${s.toString().padStart(2, "0")}`
 }
 
@@ -179,6 +229,19 @@ function playUrl(endpoint: PlaybackEndpoint, path: string): string {
  * in another recording).
  */
 type Resume = "start" | "end" | { atMs: number }
+
+/**
+ * One entry in the single keymap definition (issue #19): its display form
+ * (`keys`/`label` for the cheat-sheet), the predicate that decides whether a
+ * keydown matches it, and the action to run. One array backs both the live key
+ * handler and the `?` cheat-sheet, so they cannot drift.
+ */
+interface Keybinding {
+  keys: string[]
+  label: string
+  match: (e: KeyboardEvent) => boolean
+  run: (e: KeyboardEvent) => void
+}
 
 /**
  * Plays a whole **session** as one continuous playlist (the North Star): the
@@ -256,6 +319,19 @@ export function RecordingPlayer({
   // edits (adjust, split, merge, add, delete) are exposed only while editing, so
   // ordinary review stays a click-to-seek strip.
   const [editing, setEditing] = useState(false)
+  // Transport state (issue #19), now that the native `<video controls>` is gone:
+  // the custom bar and the keymap own play/pause, mute, speed, loop, and the
+  // cheat-sheet overlay. `fps` is the probed frame rate (for exact frame-step),
+  // defaulting to DEFAULT_FPS until resolve_playback supplies it.
+  const [fps, setFps] = useState(DEFAULT_FPS)
+  const [paused, setPaused] = useState(true)
+  const [muted, setMuted] = useState(false)
+  const [speedIndex, setSpeedIndex] = useState(DEFAULT_SPEED_INDEX)
+  const [looping, setLooping] = useState(false)
+  const [showCheatSheet, setShowCheatSheet] = useState(false)
+  // Focus host: the container holds focus so the (untabbable) video never gets
+  // keystrokes — the old native-control key behavior can't double-fire (issue #19).
+  const containerRef = useRef<HTMLDivElement>(null)
 
   // Which recording in the playlist is loaded, and where to resume once its
   // timeline arrives after a boundary crossing.
@@ -268,6 +344,11 @@ export function RecordingPlayer({
 
   const atFirstRecording = index <= 0
   const atLastRecording = index >= recordings.length - 1
+
+  // Take focus on mount so the keymap acts immediately, without a click first.
+  useEffect(() => {
+    containerRef.current?.focus()
+  }, [])
 
   // Fetch the playback server endpoint once on mount.
   useEffect(() => {
@@ -304,6 +385,7 @@ export function RecordingPlayer({
           if (cancelled) return
           if (source.state === "ready") {
             setSrc(playUrl(endpoint, source.path))
+            setFps(source.fps && source.fps > 0 ? source.fps : DEFAULT_FPS)
             setStatus("ready")
           } else if (source.state === "failed") {
             setStatus("error")
@@ -556,9 +638,7 @@ export function RecordingPlayer({
       } else {
         // The rally we're in or just past: the latest one starting at or before
         // the playhead.
-        const current = [...rallies]
-          .reverse()
-          .find((r) => r.start_ms <= ms)
+        const current = [...rallies].reverse().find((r) => r.start_ms <= ms)
         // Played meaningfully into it → restart it (first press).
         if (current && ms > current.start_ms + PREV_RESTART_SLACK_MS) {
           seekTo(current.start_ms)
@@ -566,9 +646,7 @@ export function RecordingPlayer({
         }
         // At/near its start (or ahead of every rally) → step to the previous one.
         const boundary = current ? current.start_ms : ms
-        const target = [...rallies]
-          .reverse()
-          .find((r) => r.start_ms < boundary)
+        const target = [...rallies].reverse().find((r) => r.start_ms < boundary)
         if (target) {
           seekTo(target.start_ms)
         } else if (!atFirstRecording) {
@@ -606,6 +684,66 @@ export function RecordingPlayer({
       uncertain.find((r) => r.globalStart > here + 1) ?? uncertain[0]
     seekSession(target.globalStart)
   }, [session, globalPlayheadMs, seekSession])
+
+  // Keep the video element's playback rate and mute in sync with transport state
+  // (issue #19), re-applying after a source re-mount (the element is keyed on
+  // `src`, so a boundary crossing makes a fresh element that must inherit these).
+  useEffect(() => {
+    const media = videoRef.current
+    if (!media) return
+    media.playbackRate = SPEED_LADDER[speedIndex]
+    media.muted = muted
+  }, [speedIndex, muted, src, status])
+
+  // --- Transport (issue #19): the custom bar and keymap drive these. ---
+
+  const togglePlay = useCallback(() => {
+    const media = videoRef.current
+    if (!media) return
+    if (media.paused) void media.play()
+    else media.pause()
+  }, [])
+
+  const toggleMute = useCallback(() => setMuted((m) => !m), [])
+
+  const toggleLoop = useCallback(() => setLooping((l) => !l), [])
+
+  // Step the playback speed along the fixed ladder, clamped at its ends.
+  const stepSpeed = useCallback((dir: -1 | 1) => {
+    setSpeedIndex((i) => clamp(i + dir, 0, SPEED_LADDER.length - 1))
+  }, [])
+
+  const resetSpeed = useCallback(() => setSpeedIndex(DEFAULT_SPEED_INDEX), [])
+
+  // Seek the session by a signed offset in ms, in session-global time so it
+  // crosses recording boundaries (reusing the session-seek path). A relative
+  // seek is a manual move, so it opts out of gap-free playback like a scrubber
+  // drag would. Inert until the current recording is placed on the axis.
+  const seekRelative = useCallback(
+    (deltaMs: number) => {
+      if (globalPlayheadMs == null) return
+      seekSession(globalPlayheadMs + deltaMs)
+    },
+    [globalPlayheadMs, seekSession]
+  )
+
+  // Exact frame-step (issue #19): pause, then nudge the recording-local time by
+  // one frame using the probed fps. Frame-step stays within the current
+  // recording (a frame is a recording-local notion); seeks that cross boundaries
+  // are the arrow-key job. Marked programmatic so it doesn't toggle free play.
+  const frameStep = useCallback(
+    (dir: -1 | 1) => {
+      const media = videoRef.current
+      if (!media) return
+      media.pause()
+      const frame = 1 / (fps > 0 ? fps : DEFAULT_FPS)
+      programmaticSeekRef.current = true
+      const next = Math.max(0, media.currentTime + dir * frame)
+      media.currentTime = next
+      setCurrentMs(next * 1000)
+    },
+    [fps]
+  )
 
   // When the current recording ends naturally (no later rally triggered a skip,
   // e.g. its trailing gap was short), advance into the next recording so the
@@ -751,6 +889,153 @@ export function RecordingPlayer({
     [refreshTimeline]
   )
 
+  // The single keymap definition (issue #19): the one source of truth behind both
+  // the global key handler and the `?` cheat-sheet, so the two can never drift.
+  // Each binding declares how it's displayed (`keys`/`label`), whether an event
+  // matches it (`match`), and what it does (`run`). Order is the cheat-sheet's
+  // listing order. Ctrl-combos that collide with WebKitGTK page-zoom
+  // (`Ctrl+-`/`Ctrl+=`/`Ctrl+0`) are matched here so the handler can
+  // `preventDefault` them — page-zoom is out of scope.
+  const keymap = useMemo<Keybinding[]>(() => {
+    const plain = (e: KeyboardEvent) =>
+      !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey
+    return [
+      {
+        keys: ["Space", "K"],
+        label: "Play / pause",
+        match: (e) =>
+          plain(e) && (e.code === "Space" || e.key.toLowerCase() === "k"),
+        run: togglePlay,
+      },
+      {
+        keys: ["Ctrl+←", "Ctrl+→"],
+        label: "Seek ∓ 2.5s",
+        match: (e) =>
+          (e.ctrlKey || e.metaKey) &&
+          !e.shiftKey &&
+          !e.altKey &&
+          (e.key === "ArrowLeft" || e.key === "ArrowRight"),
+        run: (e) =>
+          seekRelative(e.key === "ArrowLeft" ? -SEEK_FINE_MS : SEEK_FINE_MS),
+      },
+      {
+        keys: ["←", "→"],
+        label: "Seek ∓ 5s",
+        match: (e) =>
+          plain(e) && (e.key === "ArrowLeft" || e.key === "ArrowRight"),
+        run: (e) =>
+          seekRelative(
+            e.key === "ArrowLeft" ? -SEEK_DEFAULT_MS : SEEK_DEFAULT_MS
+          ),
+      },
+      {
+        keys: ["Shift+←", "Shift+→"],
+        label: "Seek ∓ 10s",
+        match: (e) =>
+          e.shiftKey &&
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !e.altKey &&
+          (e.key === "ArrowLeft" || e.key === "ArrowRight"),
+        run: (e) =>
+          seekRelative(
+            e.key === "ArrowLeft" ? -SEEK_COARSE_MS : SEEK_COARSE_MS
+          ),
+      },
+      {
+        keys: [",", "."],
+        label: "Frame step back / forward",
+        match: (e) => plain(e) && (e.key === "," || e.key === "."),
+        run: (e) => frameStep(e.key === "," ? -1 : 1),
+      },
+      {
+        keys: ["[", "]"],
+        label: "Prev / Next rally",
+        match: (e) => plain(e) && (e.key === "[" || e.key === "]"),
+        run: (e) => goToRally(e.key === "[" ? "prev" : "next"),
+      },
+      {
+        keys: ["U"],
+        label: "Next uncertain region",
+        match: (e) => plain(e) && e.key.toLowerCase() === "u",
+        run: goToUncertain,
+      },
+      {
+        keys: ["M"],
+        label: "Mute",
+        match: (e) => plain(e) && e.key.toLowerCase() === "m",
+        run: toggleMute,
+      },
+      {
+        keys: ["Ctrl+-", "Ctrl+="],
+        label: "Playback speed down / up",
+        // `=`/`-` carry shift on some layouts; accept regardless of shift.
+        match: (e) =>
+          (e.ctrlKey || e.metaKey) &&
+          !e.altKey &&
+          (e.key === "-" || e.key === "=" || e.key === "+" || e.key === "_"),
+        run: (e) => stepSpeed(e.key === "-" || e.key === "_" ? -1 : 1),
+      },
+      {
+        keys: ["Ctrl+0"],
+        label: "Reset speed to 1×",
+        match: (e) => (e.ctrlKey || e.metaKey) && !e.altKey && e.key === "0",
+        run: resetSpeed,
+      },
+      {
+        keys: ["?"],
+        label: "Toggle this cheat-sheet",
+        match: (e) => e.key === "?",
+        run: () => setShowCheatSheet((s) => !s),
+      },
+      {
+        keys: ["Alt + scroll over timeline"],
+        label: "Zoom timeline at the cursor",
+        // Handled on the timeline's wheel listener, not here; listed so the
+        // cheat-sheet stays the complete reference.
+        match: () => false,
+        run: () => {},
+      },
+    ]
+  }, [
+    togglePlay,
+    seekRelative,
+    frameStep,
+    goToRally,
+    goToUncertain,
+    toggleMute,
+    stepSpeed,
+    resetSpeed,
+  ])
+
+  // The one global key handler, at window capture so it runs before any
+  // native-control default and can `preventDefault` page-zoom (issue #19).
+  // Ignores keystrokes while typing in an input/textarea so future text fields
+  // aren't hijacked. The video is not a tab stop and the container holds focus,
+  // so the old `<video>` key behavior never double-fires.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null
+      if (
+        target &&
+        (target.isContentEditable ||
+          target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT")
+      ) {
+        return
+      }
+      const binding = keymap.find((b) => b.match(e))
+      if (!binding) return
+      e.preventDefault()
+      e.stopPropagation()
+      binding.run(e)
+    }
+    window.addEventListener("keydown", onKeyDown, { capture: true })
+    return () =>
+      window.removeEventListener("keydown", onKeyDown, { capture: true })
+  }, [keymap])
+
   const handleError = useCallback(() => {
     const media = videoRef.current
     const err = media?.error
@@ -769,7 +1054,14 @@ export function RecordingPlayer({
   }, [])
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4">
+    <div
+      ref={containerRef}
+      // Hold focus on the container so the keymap's window handler is the only
+      // thing acting on keystrokes; `outline-none` since this focus is just for
+      // key routing, not a visible affordance (issue #19).
+      tabIndex={-1}
+      className="flex h-full min-h-0 flex-col gap-4 outline-none"
+    >
       <div className="flex shrink-0 items-center gap-3">
         <Button variant="outline" size="sm" onClick={onBack}>
           <ArrowLeftIcon className="size-4" />
@@ -809,16 +1101,37 @@ export function RecordingPlayer({
             // letterboxing the frame so the timeline below stays in view.
             className="min-h-0 w-full flex-1 rounded-lg bg-black object-contain"
             src={src}
-            controls
+            // No native `controls` (issue #19): the custom transport bar below
+            // is the only transport, and the element is not a tab stop so its
+            // built-in key handling can never double-fire with the keymap.
+            tabIndex={-1}
             autoPlay
             onError={handleError}
             onEnded={handleEnded}
             onSeeked={handleSeeked}
+            onPlay={() => setPaused(false)}
+            onPause={() => setPaused(true)}
+            onClick={togglePlay}
             onTimeUpdate={(e) => {
               const ms = e.currentTarget.currentTime * 1000
               setCurrentMs(ms)
               skipGaps(ms)
             }}
+          />
+          <TransportBar
+            paused={paused}
+            muted={muted}
+            looping={looping}
+            speed={SPEED_LADDER[speedIndex]}
+            positionMs={globalPlayheadMs ?? 0}
+            durationMs={session.totalMs}
+            onTogglePlay={togglePlay}
+            onFrameStep={frameStep}
+            onToggleMute={toggleMute}
+            onToggleLoop={toggleLoop}
+            onStepSpeed={stepSpeed}
+            onResetSpeed={resetSpeed}
+            onShowKeys={() => setShowCheatSheet(true)}
           />
           <SessionTimeline
             session={session}
@@ -844,6 +1157,201 @@ export function RecordingPlayer({
       ) : (
         <div className="flex min-h-0 w-full flex-1 items-center justify-center rounded-lg bg-black" />
       )}
+      {showCheatSheet ? (
+        <CheatSheet keymap={keymap} onClose={() => setShowCheatSheet(false)} />
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * The transport-only control bar beneath the player (issue #19): media transport
+ * only — play/pause, exact frame-step, a session-global timecode mirroring the
+ * session playhead and total duration, a playback-speed indicator, a loop toggle
+ * (its behavior wired up by the rally-loop slice), and mute. It deliberately has
+ * **no scrubber**: the session timeline strip below remains the single
+ * scrub/seek surface, and fullscreen is out of scope. The `?` button opens the
+ * cheat-sheet listing every key, which the same keymap drives.
+ */
+function TransportBar({
+  paused,
+  muted,
+  looping,
+  speed,
+  positionMs,
+  durationMs,
+  onTogglePlay,
+  onFrameStep,
+  onToggleMute,
+  onToggleLoop,
+  onStepSpeed,
+  onResetSpeed,
+  onShowKeys,
+}: {
+  paused: boolean
+  muted: boolean
+  looping: boolean
+  speed: number
+  positionMs: number
+  durationMs: number
+  onTogglePlay: () => void
+  onFrameStep: (dir: -1 | 1) => void
+  onToggleMute: () => void
+  onToggleLoop: () => void
+  onStepSpeed: (dir: -1 | 1) => void
+  onResetSpeed: () => void
+  onShowKeys: () => void
+}) {
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-2">
+      <Button
+        variant="outline"
+        size="icon"
+        onClick={onTogglePlay}
+        title={paused ? "Play (Space)" : "Pause (Space)"}
+      >
+        {paused ? (
+          <PlayIcon className="size-4" />
+        ) : (
+          <PauseIcon className="size-4" />
+        )}
+      </Button>
+      <Button
+        variant="outline"
+        size="icon"
+        onClick={() => onFrameStep(-1)}
+        title="Step back one frame (,)"
+      >
+        <StepBackIcon className="size-4" />
+      </Button>
+      <Button
+        variant="outline"
+        size="icon"
+        onClick={() => onFrameStep(1)}
+        title="Step forward one frame (.)"
+      >
+        <StepForwardIcon className="size-4" />
+      </Button>
+      <span className="ml-1 font-mono text-sm text-muted-foreground tabular-nums">
+        {formatTimecode(positionMs)} / {formatTimecode(durationMs)}
+      </span>
+      <div className="ml-auto flex items-center gap-2">
+        <div
+          className="flex items-center"
+          title="Playback speed (Ctrl+- / Ctrl+= , Ctrl+0 to reset)"
+        >
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => onStepSpeed(-1)}
+            title="Slower (Ctrl+-)"
+          >
+            <span className="text-sm">−</span>
+          </Button>
+          <button
+            type="button"
+            onClick={onResetSpeed}
+            title="Reset speed to 1× (Ctrl+0)"
+            className="min-w-12 px-1 text-center font-mono text-sm text-muted-foreground tabular-nums hover:text-foreground"
+          >
+            {speed}×
+          </button>
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => onStepSpeed(1)}
+            title="Faster (Ctrl+=)"
+          >
+            <span className="text-sm">+</span>
+          </Button>
+        </div>
+        <Button
+          variant={looping ? "default" : "outline"}
+          size="icon"
+          onClick={onToggleLoop}
+          title="Loop the current rally"
+        >
+          <RepeatIcon className="size-4" />
+        </Button>
+        <Button
+          variant="outline"
+          size="icon"
+          onClick={onToggleMute}
+          title={muted ? "Unmute (M)" : "Mute (M)"}
+        >
+          {muted ? (
+            <VolumeXIcon className="size-4" />
+          ) : (
+            <Volume2Icon className="size-4" />
+          )}
+        </Button>
+        <Button
+          variant="outline"
+          size="icon"
+          onClick={onShowKeys}
+          title="Keyboard shortcuts (?)"
+        >
+          <KeyboardIcon className="size-4" />
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The `?` cheat-sheet overlay (issue #19): a modal listing every keybinding,
+ * rendered straight from the single keymap definition so it can never drift from
+ * what the keys actually do. Click the backdrop or the close button to dismiss
+ * (the `?` key toggles it too).
+ */
+function CheatSheet({
+  keymap,
+  onClose,
+}: {
+  keymap: Keybinding[]
+  onClose: () => void
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-full w-full max-w-md overflow-y-auto rounded-lg border bg-background p-5 shadow-lg"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="font-medium">Keyboard shortcuts</h2>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            title="Close (?)"
+          >
+            <XIcon className="size-4" />
+          </Button>
+        </div>
+        <dl className="space-y-1.5 text-sm">
+          {keymap.map((b) => (
+            <div
+              key={b.label}
+              className="flex items-center justify-between gap-4"
+            >
+              <dt className="text-muted-foreground">{b.label}</dt>
+              <dd className="flex flex-wrap justify-end gap-1">
+                {b.keys.map((k) => (
+                  <kbd
+                    key={k}
+                    className="rounded border bg-muted px-1.5 py-0.5 font-mono text-xs"
+                  >
+                    {k}
+                  </kbd>
+                ))}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </div>
     </div>
   )
 }
@@ -987,6 +1495,39 @@ function SessionTimeline({
       window.removeEventListener("pointerup", up)
     }
   }, [drag, session, xToMs, onAdjustRally])
+
+  // Alt+scroll over the strip zooms centered on the cursor (issue #19): the
+  // session time under the pointer stays fixed while the scale changes, distinct
+  // from the zoom buttons' playhead-centering. A non-passive wheel listener is
+  // needed so the zoom can `preventDefault` the would-be scroll. Plain scroll
+  // (no Alt) is left to the browser as ordinary horizontal scrolling.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      if (!e.altKey) return
+      e.preventDefault()
+      const factor =
+        e.deltaY < 0 ? ALT_SCROLL_ZOOM_FACTOR : 1 / ALT_SCROLL_ZOOM_FACTOR
+      const rect = el.getBoundingClientRect()
+      // Session time (px) under the cursor before the zoom.
+      const cursorContentPx = e.clientX - rect.left + el.scrollLeft
+      setPxPerSec((p) => {
+        const nextPx = clamp(
+          p * factor,
+          SESSION_PX_PER_SEC_MIN,
+          SESSION_PX_PER_SEC_MAX
+        )
+        const scale = nextPx / p
+        // Keep the time under the cursor pinned: new scrollLeft so the same
+        // content point lands back under the pointer at the new scale.
+        el.scrollLeft = cursorContentPx * scale - (e.clientX - rect.left)
+        return nextPx
+      })
+    }
+    el.addEventListener("wheel", onWheel, { passive: false })
+    return () => el.removeEventListener("wheel", onWheel)
+  }, [])
 
   // Keep the playhead in view as playback advances, crosses recordings, or the
   // zoom changes (re-centres after a zoom step, since `pxPerSec` is a dep).

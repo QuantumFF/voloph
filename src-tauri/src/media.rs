@@ -308,6 +308,12 @@ pub struct Probe {
     /// True when the container + codecs are web-playable (H.264/AAC in mp4/mov)
     /// and so need no transcode.
     pub passthrough: bool,
+    /// Frames per second of the video stream, parsed from ffprobe's
+    /// `avg_frame_rate` rational (issue #19), so the player can frame-step
+    /// exactly. `None` when ffprobe reports no usable rate; the player then
+    /// defaults to 30 fps. The in-place transcode does not resample, so this
+    /// stays valid afterward.
+    pub fps: Option<f64>,
 }
 
 /// Resolve a bundled sidecar binary. Tauri places `externalBin` next to the
@@ -334,7 +340,7 @@ pub fn probe(path: &str) -> Result<Probe, String> {
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,codec_name:format=format_name",
+            "stream=codec_type,codec_name,avg_frame_rate:format=format_name",
             "-of",
             "default=noprint_wrappers=1:nokey=0",
             path,
@@ -350,7 +356,30 @@ pub fn probe(path: &str) -> Result<Probe, String> {
     let report = String::from_utf8_lossy(&output.stdout);
     Ok(Probe {
         passthrough: is_web_playable(&report),
+        fps: parse_fps(&report),
     })
+}
+
+/// Parse the video stream's frame rate from an ffprobe report (issue #19).
+/// ffprobe emits `avg_frame_rate` as a rational such as `30000/1001` (29.97) or
+/// `0/0` for a stream with no usable rate (e.g. an audio-only stream's line).
+/// Returns the first positive rate found, or `None` when no video stream
+/// reports one — the player then defaults to 30 fps.
+fn parse_fps(report: &str) -> Option<f64> {
+    for line in report.lines() {
+        let Some(("avg_frame_rate", value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let (num, den) = value.split_once('/').unwrap_or((value, "1"));
+        let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>()) else {
+            continue;
+        };
+        if num > 0.0 && den > 0.0 {
+            return Some(num / den);
+        }
+    }
+    None
 }
 
 /// Decide whether an ffprobe report describes a source the webview can play
@@ -492,7 +521,7 @@ fn percent_decode(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_web_playable, percent_decode, start};
+    use super::{is_web_playable, parse_fps, percent_decode, start};
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -545,6 +574,28 @@ codec_name=ac3
 codec_type=audio
 format_name=mov,mp4,m4a,3gp,3g2,mj2";
         assert!(!is_web_playable(report));
+    }
+
+    #[test]
+    fn parses_rational_frame_rate() {
+        let report = "\
+codec_name=h264
+codec_type=video
+avg_frame_rate=30000/1001
+codec_name=aac
+codec_type=audio
+avg_frame_rate=0/0";
+        let fps = parse_fps(report).unwrap();
+        assert!((fps - 29.97).abs() < 0.01, "fps was {fps}");
+    }
+
+    #[test]
+    fn missing_frame_rate_is_none() {
+        let report = "\
+codec_name=h264
+codec_type=video
+avg_frame_rate=0/0";
+        assert!(parse_fps(report).is_none());
     }
 
     #[test]
