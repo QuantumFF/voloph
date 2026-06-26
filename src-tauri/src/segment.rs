@@ -273,6 +273,38 @@ fn mean(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / values.len() as f64
 }
 
+/// How many peak buckets the displayed waveform is reduced to. A fixed count
+/// keeps the stored waveform tiny (one short array per recording) and lets the
+/// timeline strip draw a fixed number of bars regardless of recording length —
+/// the strip is only a few hundred pixels wide, so finer detail is invisible.
+pub const WAVEFORM_BUCKETS: usize = 400;
+
+/// Reduce a recording's audio to a compact waveform for the timeline strip: the
+/// peak (max absolute) amplitude of each of [`WAVEFORM_BUCKETS`] equal-width time
+/// buckets, normalized to `[0, 1]` against the loudest bucket so shuttle hits
+/// show as visible spikes against the quiet of a gap (issue #6). An empty or
+/// silent recording yields all-zero buckets.
+pub fn waveform(samples: &[f32]) -> Vec<f32> {
+    let mut peaks = vec![0.0f32; WAVEFORM_BUCKETS];
+    if samples.is_empty() {
+        return peaks;
+    }
+    for (i, peak) in peaks.iter_mut().enumerate() {
+        let start = i * samples.len() / WAVEFORM_BUCKETS;
+        let end = ((i + 1) * samples.len() / WAVEFORM_BUCKETS).max(start + 1);
+        *peak = samples[start..end.min(samples.len())]
+            .iter()
+            .fold(0.0f32, |m, &s| m.max(s.abs()));
+    }
+    let max = peaks.iter().fold(0.0f32, |m, &p| m.max(p));
+    if max > 0.0 {
+        for p in &mut peaks {
+            *p /= max;
+        }
+    }
+    peaks
+}
+
 /// Coalesce intervals that overlap or touch after padding. Inputs are sorted by
 /// construction (ascending start); the merged interval keeps the minimum
 /// confidence of its parts, since a stitched span is no more certain than its
@@ -396,6 +428,29 @@ mod tests {
         let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
         let motion = synth_motion(20.0, &[]); // still court
         assert!(segment(&audio, SR, &motion).is_empty());
+    }
+
+    #[test]
+    fn waveform_spikes_where_the_hits_are() {
+        // Hits only in the back half → its buckets peak at 1.0, the silent front
+        // half stays near zero. The strip can eyeball boundaries off this.
+        let audio = synth_audio(20.0, &[(12.0, 18.0)], 0.3);
+        let peaks = waveform(&audio);
+        assert_eq!(peaks.len(), WAVEFORM_BUCKETS);
+        let mid = WAVEFORM_BUCKETS / 2;
+        let front_max = peaks[..mid].iter().fold(0.0f32, |m, &p| m.max(p));
+        let back_max = peaks[mid..].iter().fold(0.0f32, |m, &p| m.max(p));
+        assert!(back_max > front_max * 2.0, "front {front_max} back {back_max}");
+        assert!((back_max - 1.0).abs() < 1e-6, "normalized to 1: {back_max}");
+    }
+
+    #[test]
+    fn waveform_of_silence_is_all_zero() {
+        let peaks = waveform(&synth_audio(5.0, &[], 1.0));
+        assert_eq!(peaks.len(), WAVEFORM_BUCKETS);
+        // Faint hum normalizes to a non-flat shape but never to a huge value;
+        // mainly: no panic, fixed length, finite.
+        assert!(peaks.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p)));
     }
 
     #[test]

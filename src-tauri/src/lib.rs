@@ -97,6 +97,7 @@ fn recording_timeline(db: State<'_, Db>, path: String) -> Result<db::Timeline, S
         segment_state: "unknown".to_string(),
         duration_ms: None,
         rallies: Vec::new(),
+        waveform: Vec::new(),
     }))
 }
 
@@ -111,6 +112,46 @@ fn reanalyze_recording(app: AppHandle, db: State<'_, Db>, path: String) -> Resul
     }
     spawn_media_worker(&app);
     Ok(())
+}
+
+/// Move a rally's boundaries in the draft timeline (issue #7). Backs the
+/// adjust-boundary correction directly, and the split and merge corrections
+/// indirectly (the frontend composes those from update + add/delete). Persists
+/// immediately so gap-free playback reflects the corrected timeline on its next
+/// read, with no reload. Returns whether a rally was actually updated.
+#[tauri::command]
+fn update_rally(
+    db: State<'_, Db>,
+    path: String,
+    rally_id: i64,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::update_rally(&conn, &path, rally_id, start_ms, end_ms).map_err(|e| e.to_string())
+}
+
+/// Create a rally over a span the segmenter missed (issue #7 — the add
+/// correction, and the new half of a split). Persists immediately; returns the
+/// new rally's id, or `None` when `path` is not a registered recording.
+#[tauri::command]
+fn add_rally(
+    db: State<'_, Db>,
+    path: String,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Option<i64>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::add_rally(&conn, &path, start_ms, end_ms).map_err(|e| e.to_string())
+}
+
+/// Remove a rally from the draft timeline (issue #7 — delete a false positive,
+/// whose span then becomes a derived gap; also the discarded half of a merge).
+/// Persists immediately. Returns whether a rally was actually removed.
+#[tauri::command]
+fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::delete_rally(&conn, &path, rally_id).map_err(|e| e.to_string())
 }
 
 /// Start the background media worker unless one is already running. It drains
@@ -210,6 +251,9 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
         }
     };
     let rallies = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
+    // The displayed waveform for the timeline strip (issue #6), reduced from the
+    // same samples while we still hold them in memory.
+    let waveform = segment::waveform(&samples);
     let duration_ms =
         (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
     log::info!(
@@ -219,7 +263,7 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
 
     match conn.lock() {
         Ok(mut c) => {
-            if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies) {
+            if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform) {
                 log::error!("media worker: could not save timeline for {path}: {e}");
             }
         }
@@ -316,6 +360,9 @@ pub fn run() {
             resolve_playback,
             recording_timeline,
             reanalyze_recording,
+            update_rally,
+            add_rally,
+            delete_rally,
             playback_endpoint
         ])
         .on_page_load(|webview, payload| {
