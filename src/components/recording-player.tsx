@@ -127,6 +127,14 @@ const SEGMENT_POLL_MS = 2000
 const UNCERTAIN_CONFIDENCE = 0.5
 
 /**
+ * How far into a rally the playhead must be for Prev to *restart* it rather than
+ * step to the previous one — the music-player rule: one press rewinds to the
+ * current rally's start, a second press (now within this slack of the start)
+ * jumps to the previous rally.
+ */
+const PREV_RESTART_SLACK_MS = 1000
+
+/**
  * Horizontal scale of the session timeline strip in pixels-per-second, so the
  * whole session is one long, horizontally-scrollable strip (rather than the
  * entire session squashed to the viewport width). The playhead auto-scrolls into
@@ -367,6 +375,12 @@ export function RecordingPlayer({
     if (!media) return
     programmaticSeekRef.current = true
     media.currentTime = ms / 1000
+    // Optimistically advance the playhead state to the target. WebKitGTK's
+    // `currentTime` can still report the pre-seek position for a beat after the
+    // write, so rapid rally-to-rally presses (e.g. Prev twice) must compute from
+    // this value, not a stale `currentTime` read — otherwise each press recomputes
+    // from the same old position and never steps past the current rally.
+    setCurrentMs(ms)
     void media.play()
   }, [])
 
@@ -521,14 +535,17 @@ export function RecordingPlayer({
 
   // Manual rally-to-rally navigation, across recording boundaries. Next jumps to
   // the first rally starting after the playhead, or into the next recording's
-  // first rally when none is left. Previous jumps to the last rally starting
-  // before the playhead (with a small slack so it rewinds past the rally you're
-  // in), or back into the previous recording's last rally when at the first.
+  // first rally when none is left. Prev follows the music-player rule: from
+  // inside a rally the first press rewinds to that rally's start, and a second
+  // press (now at the start) steps to the previous rally — crossing back into the
+  // previous recording's last rally when at the first rally of this one. Reads
+  // `currentMs` (kept current by `seekTo`'s optimistic update), so repeated
+  // presses chain reliably instead of recomputing from a stale `currentTime`.
   const goToRally = useCallback(
     (direction: "next" | "prev") => {
       // A rally-targeted jump is an explicit gap-free intent — leave free play.
       freePlayRef.current = false
-      const ms = (videoRef.current?.currentTime ?? 0) * 1000
+      const ms = currentMs
       if (direction === "next") {
         const target = rallies.find((r) => r.start_ms > ms + 1)
         if (target) {
@@ -537,9 +554,21 @@ export function RecordingPlayer({
           goToRecording(index + 1, "start")
         }
       } else {
+        // The rally we're in or just past: the latest one starting at or before
+        // the playhead.
+        const current = [...rallies]
+          .reverse()
+          .find((r) => r.start_ms <= ms)
+        // Played meaningfully into it → restart it (first press).
+        if (current && ms > current.start_ms + PREV_RESTART_SLACK_MS) {
+          seekTo(current.start_ms)
+          return
+        }
+        // At/near its start (or ahead of every rally) → step to the previous one.
+        const boundary = current ? current.start_ms : ms
         const target = [...rallies]
           .reverse()
-          .find((r) => r.start_ms < ms - 1000)
+          .find((r) => r.start_ms < boundary)
         if (target) {
           seekTo(target.start_ms)
         } else if (!atFirstRecording) {
@@ -550,7 +579,15 @@ export function RecordingPlayer({
         }
       }
     },
-    [rallies, seekTo, atFirstRecording, atLastRecording, goToRecording, index]
+    [
+      currentMs,
+      rallies,
+      seekTo,
+      atFirstRecording,
+      atLastRecording,
+      goToRecording,
+      index,
+    ]
   )
 
   // Jump to the next uncertain region across the whole session — the spans the
