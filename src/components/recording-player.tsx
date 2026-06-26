@@ -231,6 +231,18 @@ function playUrl(endpoint: PlaybackEndpoint, path: string): string {
 type Resume = "start" | "end" | { atMs: number }
 
 /**
+ * One loaded stream in the double-buffer (issue #24): a positioned `&t=` URL (or
+ * the whole-file head) with a monotonically increasing id. The id keys the
+ * `<video>` element so React keeps the live element mounted across renders and
+ * only remounts the slot whose load actually changed — re-using one element
+ * across rapid `&t=` swaps renders decode garbage ("TV static").
+ */
+interface Load {
+  id: number
+  src: string
+}
+
+/**
  * One entry in the single keymap definition (issue #19): its display form
  * (`keys`/`label` for the cheat-sheet), the predicate that decides whether a
  * keydown matches it, and the action to run. One array backs both the live key
@@ -282,7 +294,6 @@ export function RecordingPlayer({
   startIndex = 0,
   onBack,
 }: RecordingPlayerProps) {
-  const videoRef = useRef<HTMLVideoElement>(null)
   // Gap-free playback is the default (the North Star), but a manual playhead move
   // opts out: when the user drags the video's own scrubber into a gap, or clicks
   // an empty part of the session strip, `freePlayRef` flips true and gap-skipping
@@ -293,28 +304,40 @@ export function RecordingPlayer({
   // manual `seeked` and the `timeupdate` that immediately follows it must not race
   // a queued React state update (which would let one last skip slip through).
   const freePlayRef = useRef(false)
-  // Seeking is done by reloading the `<video>` at a `&t=` URL, not by writing
-  // `currentTime` (which this WebKitGTK build silently drops — issue #24). The
-  // stream then starts at the seek target, so its `currentTime` is recording-local
-  // time minus this base: recording-local ms = `seekBaseMs + currentTime*1000`.
-  // `seekBaseMs` is state (the video `src` is derived from it); the ref mirrors it
-  // so `timeupdate` can read the latest value synchronously without a re-render.
-  const [seekBaseMs, setSeekBaseMs] = useState(0)
+  // --- Double-buffered playback (issue #24) ---
+  // Seeking reloads the stream at a `&t=` URL rather than writing `currentTime`
+  // (this WebKitGTK build silently drops `currentTime` seeks). A reloading
+  // `<video>` blanks to black, and this build's GStreamer-backed video composites
+  // in a separate layer — so it can't be captured to a canvas either (a canvas
+  // draw comes out black). So we run two `<video>` elements: the `live` one stays
+  // visible and is paused on its last frame (a paused `<video>` natively holds
+  // its frame, composited correctly) while the new stream loads in the
+  // `incoming` one (hidden); when `incoming` starts playing it's promoted to
+  // `live`. The held frame covers the reload — no black flash, and the incoming
+  // element is hidden until it plays so its stretched first frame is never seen.
+  //
+  // recording-local ms = `seekBaseMs + currentTime*1000`, where `seekBaseMs` is
+  // the `t` the live stream opened at; the ref lets `timeupdate` read it
+  // synchronously without a re-render.
   const seekBaseMsRef = useRef(0)
-  // Bumped on every seek so the `<video>` key changes and the element remounts
-  // even when the base is unchanged (e.g. rally-loop re-seeking the same start),
-  // forcing a reload that restarts at the target (issue #24).
-  const [seekNonce, setSeekNonce] = useState(0)
-  // True from a seek until the reloaded element has loaded at the new position, so
-  // `timeupdate` holds the playhead at the optimistic target instead of reacting
-  // to the old element's trailing reports or the new one's initial `0` (issue #24).
+  // True from a seek until the incoming element is promoted, so `timeupdate`
+  // holds the playhead at the optimistic target instead of reacting to a
+  // pre-promotion report (issue #24).
   const seekingRef = useRef(false)
-  // Freeze-frame overlay (issue #24): a seek reloads the stream, which blanks the
-  // `<video>` to black while it loads. We paint the current frame onto this canvas
-  // and show it over the video until the new stream renders, so a seek looks like
-  // a held frame rather than a black flash.
-  const freezeCanvasRef = useRef<HTMLCanvasElement>(null)
-  const [frozen, setFrozen] = useState(false)
+  // The visible (playing/paused) load and the one loading after a seek. `live` is
+  // only ever set by promotion — i.e. to a load that has already started playing
+  // — so it never shows a stretched first frame; the initial load also flows
+  // through `incoming` → promote.
+  const [live, setLive] = useState<Load | null>(null)
+  const [incoming, setIncoming] = useState<Load | null>(null)
+  // Mirrors `live` for synchronous reads in DOM event handlers (timeupdate/promote).
+  const liveRef = useRef<Load | null>(null)
+  const loadIdRef = useRef(0)
+  // The mounted `<video>` elements by load id, so transport actions reach the
+  // live one without a ref that churns as the live load changes.
+  const videoEls = useRef<Map<number, HTMLVideoElement>>(new Map())
+  // True while a (re)load hasn't rendered its first frame yet — drives the spinner.
+  const [loading, setLoading] = useState(false)
   const [endpoint, setEndpoint] = useState<PlaybackEndpoint | null>(null)
   const [src, setSrc] = useState<string | null>(null)
   // loading: resolving; preparing: still transcoding; error: unplayable.
@@ -361,15 +384,50 @@ export function RecordingPlayer({
   const path = recordings[index]?.path ?? null
   const timeline = path ? (timelines[path] ?? null) : null
 
-  // The actual `<video src>`: the resolved whole-file URL at the recording start,
-  // or a `&t=` re-positioned stream once a seek has set a non-zero base (issue
-  // #24). `t == 0` keeps the plain, range-seekable whole-file path.
-  const videoSrc = useMemo(() => {
-    if (!src || seekBaseMs <= 0) return src
-    const url = new URL(src)
-    url.searchParams.set("t", (seekBaseMs / 1000).toString())
+  // Build the positioned stream URL for a recording-local time (ms); `t <= 0` is
+  // the plain whole-file path (range-seekable, opens at the head) — issue #24.
+  const urlAt = useCallback((base: string, ms: number) => {
+    if (ms <= 0) return base
+    const url = new URL(base)
+    url.searchParams.set("t", (ms / 1000).toString())
     return url.toString()
-  }, [src, seekBaseMs])
+  }, [])
+
+  // The visible `<video>` element (the live load), for transport actions.
+  const liveVideo = useCallback(
+    () =>
+      liveRef.current
+        ? (videoEls.current.get(liveRef.current.id) ?? null)
+        : null,
+    []
+  )
+
+  // Promote the just-rendered incoming element to live and drop the old live
+  // (React unmounts it on the next render — no black gap, since the promoted
+  // element is already showing live frames). Issue #24.
+  const promote = useCallback((load: Load) => {
+    liveRef.current = load
+    seekingRef.current = false
+    setLive(load)
+    setIncoming(null)
+    setLoading(false)
+    setPaused(false)
+  }, [])
+
+  // Load a recording's head into the buffer whenever it resolves (or changes):
+  // route it through `incoming` like any seek, so `live` is set only once the
+  // first frame is actually playing (no initial stretch). Issue #24.
+  useEffect(() => {
+    if (!src) return
+    seekBaseMsRef.current = 0
+    seekingRef.current = false
+    liveRef.current = null
+    loadIdRef.current += 1
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLive(null)
+    setIncoming({ id: loadIdRef.current, src })
+    setLoading(true)
+  }, [src])
 
   const atFirstRecording = index <= 0
   const atLastRecording = index >= recordings.length - 1
@@ -407,10 +465,16 @@ export function RecordingPlayer({
     setSrc(null)
     setStatus("loading")
     setErrorDetail(null)
-    // A fresh recording starts at its head, not a carried-over seek base (issue #24).
-    setSeekBaseMs(0)
+    // A fresh recording starts at its head; the buffer is (re)loaded from the new
+    // `src` by the load effect once it resolves. Clear the previous recording's
+    // loads now so the ready branch can't briefly re-show its last frame while
+    // the new source resolves (issue #24).
     seekBaseMsRef.current = 0
     seekingRef.current = false
+    liveRef.current = null
+    setLive(null)
+    setIncoming(null)
+    setLoading(true)
 
     const resolve = () => {
       trackedInvoke<PlaybackSource>("resolve_playback", { path })
@@ -482,34 +546,29 @@ export function RecordingPlayer({
       .catch(() => {})
   }, [])
 
-  // Seek to a recording-local position (ms) by reloading the `<video>` at a `&t=`
-  // stream positioned there, rather than writing `currentTime` — this WebKitGTK
-  // build silently drops `currentTime` seeks (issue #24). Bumping `seekNonce`
-  // remounts the element even when the base is unchanged (rally-loop re-seeks the
-  // same start), so the reload always restarts at the target. `currentMs` is set
-  // optimistically so rally-to-rally math (e.g. Prev twice) chains off the target
-  // immediately; `seekingRef` holds the playhead there until the reload settles.
-  // The reloaded element `autoPlay`s, so a seek resumes playback as before.
-  const seekTo = useCallback((ms: number) => {
-    const target = Math.max(0, Math.round(ms))
-    // Paint the frame the video is showing now onto the freeze canvas, so it can
-    // cover the black blank while the reloaded stream loads (issue #24). Only when
-    // a frame is actually available (videoWidth > 0); otherwise leave any existing
-    // freeze in place (a seek issued mid-load keeps showing the prior frame).
-    const media = videoRef.current
-    const canvas = freezeCanvasRef.current
-    if (media && canvas && media.videoWidth > 0) {
-      canvas.width = media.videoWidth
-      canvas.height = media.videoHeight
-      canvas.getContext("2d")?.drawImage(media, 0, 0)
-      setFrozen(true)
-    }
-    setCurrentMs(target)
-    seekBaseMsRef.current = target
-    seekingRef.current = true
-    setSeekBaseMs(target)
-    setSeekNonce((n) => n + 1)
-  }, [])
+  // Seek to a recording-local position (ms) by loading a `&t=` stream positioned
+  // there into the incoming buffer, rather than writing `currentTime` — this
+  // WebKitGTK build silently drops `currentTime` seeks (issue #24). The live
+  // element is paused so it holds its current frame while the incoming stream
+  // loads (hidden); the incoming element `autoPlay`s and is promoted on its first
+  // `playing`, so a seek resumes playback and never flashes black. `currentMs` is
+  // set optimistically so rally-to-rally math (e.g. Prev twice) chains off the
+  // target immediately; `seekingRef` holds the playhead there until promotion.
+  const seekTo = useCallback(
+    (ms: number) => {
+      if (!src) return
+      const target = Math.max(0, Math.round(ms))
+      // Freeze the visible frame: a paused `<video>` holds its current frame.
+      liveVideo()?.pause()
+      seekBaseMsRef.current = target
+      seekingRef.current = true
+      setCurrentMs(target)
+      setLoading(true)
+      loadIdRef.current += 1
+      setIncoming({ id: loadIdRef.current, src: urlAt(src, target) })
+    },
+    [src, liveVideo, urlAt]
+  )
 
   // Rallies for the current recording, ascending by start (sorted by
   // construction in segment.rs). The empty list when there's no timeline means
@@ -621,7 +680,7 @@ export function RecordingPlayer({
     }
     if (rallies.length === 0) {
       setPendingSeek(null)
-      void videoRef.current?.play()
+      void liveVideo()?.play()
       return
     }
     const target =
@@ -629,7 +688,7 @@ export function RecordingPlayer({
     seekTo(target.start_ms)
     setPendingSeek(null)
     /* eslint-enable react-hooks/set-state-in-effect */
-  }, [status, pendingSeek, rallies, seekTo])
+  }, [status, pendingSeek, rallies, seekTo, liveVideo])
 
   // Gap-free playback (the North Star): as the playhead crosses out of a rally
   // into a gap, jump straight to the next rally's start so only play is watched
@@ -669,10 +728,10 @@ export function RecordingPlayer({
         goToRecording(index + 1, "start")
       } else {
         // Past the session's final rally → no more play left; stop.
-        videoRef.current?.pause()
+        liveVideo()?.pause()
       }
     },
-    [rallies, looping, seekTo, atLastRecording, goToRecording, index]
+    [rallies, looping, seekTo, atLastRecording, goToRecording, index, liveVideo]
   )
 
   // Manual rally-to-rally navigation, across recording boundaries. Next jumps to
@@ -745,24 +804,25 @@ export function RecordingPlayer({
     seekSession(target.globalStart)
   }, [session, globalPlayheadMs, seekSession])
 
-  // Keep the video element's playback rate and mute in sync with transport state
-  // (issue #19), re-applying after a source re-mount (the element is keyed on
-  // `src`, so a boundary crossing makes a fresh element that must inherit these).
+  // Keep the live video element's playback rate and mute in sync with transport
+  // state (issue #19), re-applying whenever the live load changes (a seek
+  // promotes a fresh element, and the incoming element loads muted, so the newly
+  // promoted one must inherit these).
   useEffect(() => {
-    const media = videoRef.current
+    const media = liveVideo()
     if (!media) return
     media.playbackRate = SPEED_LADDER[speedIndex]
     media.muted = muted
-  }, [speedIndex, muted, videoSrc, seekNonce, status])
+  }, [speedIndex, muted, live, status, liveVideo])
 
   // --- Transport (issue #19): the custom bar and keymap drive these. ---
 
   const togglePlay = useCallback(() => {
-    const media = videoRef.current
+    const media = liveVideo()
     if (!media) return
     if (media.paused) void media.play()
     else media.pause()
-  }, [])
+  }, [liveVideo])
 
   const toggleMute = useCallback(() => setMuted((m) => !m), [])
 
@@ -795,7 +855,7 @@ export function RecordingPlayer({
   // playhead adds the base back.
   const frameStep = useCallback(
     (dir: -1 | 1) => {
-      const media = videoRef.current
+      const media = liveVideo()
       if (!media) return
       media.pause()
       const frame = 1 / (fps > 0 ? fps : DEFAULT_FPS)
@@ -803,7 +863,7 @@ export function RecordingPlayer({
       media.currentTime = next
       setCurrentMs(seekBaseMsRef.current + next * 1000)
     },
-    [fps]
+    [fps, liveVideo]
   )
 
   // When the current recording ends naturally (no later rally triggered a skip,
@@ -1089,8 +1149,7 @@ export function RecordingPlayer({
       window.removeEventListener("keydown", onKeyDown, { capture: true })
   }, [keymap])
 
-  const handleError = useCallback(() => {
-    const media = videoRef.current
+  const handleError = useCallback((media: HTMLVideoElement | null) => {
     const err = media?.error
     const codes: Record<number, string> = {
       1: "ABORTED",
@@ -1146,67 +1205,90 @@ export function RecordingPlayer({
         </div>
       ) : status === "ready" && src ? (
         <>
-          {/* Relative wrapper so the freeze-frame canvas can overlay the video
-              (issue #24); the flex sizing lives here so the persistent video
-              element never reflows on a seek. */}
-          <div className="relative min-h-0 w-full flex-1">
-            <video
-              ref={videoRef}
-              // Re-mount per seek (issue #24): a fresh element is a fresh GStreamer
-              // pipeline, so the reloaded stream decodes from its own keyframe
-              // rather than against the previous stream's stale reference frame —
-              // re-using one element across rapid `&t=` swaps renders decode
-              // garbage ("TV static") during fast scrubbing. The `seekNonce`
-              // remounts even when the `&t=` base is unchanged (rally-loop). The
-              // wrapper's fixed size means a fresh `size-full` element never
-              // reflows, and the freeze canvas covers the load until it plays.
-              key={`${videoSrc}#${seekNonce}`}
-              // Letterbox the frame so the timeline below stays in view.
-              className="size-full rounded-lg bg-black object-contain"
-              src={videoSrc ?? undefined}
-              // No native `controls` (issue #19): the custom transport bar below
-              // is the only transport, and the element is not a tab stop so its
-              // built-in key handling can never double-fire with the keymap.
-              tabIndex={-1}
-              autoPlay
-              onError={() => {
-                setFrozen(false)
-                handleError()
-              }}
-              onEnded={handleEnded}
-              onPlay={() => setPaused(false)}
-              onPause={() => setPaused(true)}
-              // The reloaded stream has data at the seek target — stop holding the
-              // playhead and let `timeupdate` track the real position again (#24).
-              onLoadedData={() => {
-                seekingRef.current = false
-              }}
-              // Once the reloaded stream is actually rendering, drop the freeze
-              // overlay — the live frame is now showing (issue #24).
-              onPlaying={() => {
-                setPaused(false)
-                setFrozen(false)
-              }}
-              onClick={togglePlay}
-              onTimeUpdate={(e) => {
-                // While a seek's reload is settling, hold the playhead at the
-                // optimistic target: ignore the old element's trailing reports and
-                // the new one's initial `0` until it has loaded (issue #24).
-                if (seekingRef.current) return
-                // Stream `currentTime` is recording-local time minus the seek base.
-                const ms =
-                  seekBaseMsRef.current + e.currentTarget.currentTime * 1000
-                setCurrentMs(ms)
-                skipGaps(ms)
-              }}
-            />
-            <canvas
-              ref={freezeCanvasRef}
-              aria-hidden
-              className={`pointer-events-none absolute inset-0 size-full rounded-lg object-contain ${
-                frozen ? "" : "hidden"
-              }`}
-            />
+          {/* Relative wrapper holding the two double-buffered video elements
+              (issue #24): the live one (visible, paused-frame held during a seek)
+              and the incoming one (hidden, loading). The fixed flex sizing lives
+              here so neither element reflows on a seek. */}
+          <div className="relative min-h-0 w-full flex-1 rounded-lg bg-black">
+            {[live, incoming].map((load) => {
+              if (!load) return null
+              const isLive = live?.id === load.id
+              return (
+                <video
+                  // Keyed on the load id so React keeps the live element mounted
+                  // and only remounts the slot whose load changed — a fresh
+                  // element is a fresh GStreamer pipeline that decodes from its
+                  // own keyframe (re-using one element across rapid `&t=` swaps
+                  // renders decode garbage, "TV static"). Issue #24.
+                  key={load.id}
+                  ref={(el) => {
+                    if (el) videoEls.current.set(load.id, el)
+                    else videoEls.current.delete(load.id)
+                  }}
+                  // Both elements fill the box and letterbox; only the live one is
+                  // visible. The incoming one stays hidden until it's promoted on
+                  // its first `playing`, so its stretched first frame (before
+                  // `object-contain` applies) is never seen — the live held frame
+                  // covers the reload (issue #24).
+                  className={`absolute inset-0 size-full rounded-lg bg-black object-contain ${
+                    isLive ? "opacity-100" : "opacity-0"
+                  }`}
+                  src={load.src}
+                  // No native `controls` (issue #19): the custom transport bar
+                  // below is the only transport, and the element is not a tab stop
+                  // so its built-in key handling can't double-fire with the keymap.
+                  tabIndex={-1}
+                  autoPlay
+                  playsInline
+                  // The incoming (hidden, loading) element is muted so it can't
+                  // double the live audio; the promoted element inherits the
+                  // user's mute via the rate/mute effect.
+                  muted={muted || !isLive}
+                  onError={(e) => handleError(e.currentTarget)}
+                  onEnded={() => {
+                    if (liveRef.current?.id === load.id) handleEnded()
+                  }}
+                  onPlay={() => {
+                    if (liveRef.current?.id === load.id) setPaused(false)
+                  }}
+                  onPause={() => {
+                    if (liveRef.current?.id === load.id) setPaused(true)
+                  }}
+                  // First frame rendered: if this is the incoming load, promote it
+                  // (reveals it, drops the spinner, unmounts the old live); if it's
+                  // the live load resuming, just clear the loading spinner (#24).
+                  onPlaying={() => {
+                    if (incoming && load.id === incoming.id) {
+                      promote(load)
+                      return
+                    }
+                    setPaused(false)
+                    if (liveRef.current?.id === load.id) setLoading(false)
+                  }}
+                  onClick={togglePlay}
+                  onTimeUpdate={(e) => {
+                    // Only the live element drives the playhead; ignore the
+                    // hidden incoming one's pre-promotion reports.
+                    if (liveRef.current?.id !== load.id) return
+                    // While a seek is settling, hold the playhead at the optimistic
+                    // target until the incoming element is promoted (issue #24).
+                    if (seekingRef.current) return
+                    // Stream `currentTime` is recording-local minus the seek base.
+                    const ms =
+                      seekBaseMsRef.current + e.currentTarget.currentTime * 1000
+                    setCurrentMs(ms)
+                    skipGaps(ms)
+                  }}
+                />
+              )
+            })}
+            {/* Spinner over the held frame while the (re)load hasn't rendered, so
+                a seek reads as "loading the next position", not a frozen app. */}
+            {loading ? (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <Loader2Icon className="size-8 animate-spin text-white/80" />
+              </div>
+            ) : null}
           </div>
           <TransportBar
             paused={paused}
@@ -1245,7 +1327,9 @@ export function RecordingPlayer({
           />
         </>
       ) : (
-        <div className="flex min-h-0 w-full flex-1 items-center justify-center rounded-lg bg-black" />
+        <div className="flex min-h-0 w-full flex-1 items-center justify-center rounded-lg bg-black">
+          <Loader2Icon className="size-8 animate-spin text-white/80" />
+        </div>
       )}
       {showCheatSheet ? (
         <CheatSheet keymap={keymap} onClose={() => setShowCheatSheet(false)} />
