@@ -594,10 +594,24 @@ export function RecordingPlayer({
   // normally until its timeline arrives.
   const skipGaps = useCallback(
     (ms: number) => {
+      if (rallies.length === 0) return
+      // Rally-loop (issue #21): with loop on, reaching the current rally's end
+      // seeks back to that rally's start instead of gap-skipping onward, so a
+      // single point replays on repeat. The "current rally" is the latest one
+      // starting at or before the playhead, so Prev/Next rally moves the loop to
+      // the newly-selected rally for free. In a gap before any rally (no current
+      // rally) the mode is inert until a rally is re-entered. Loop overrides the
+      // gap-skip below but leaves free play (a manual move into a gap) alone.
+      if (looping && !freePlayRef.current) {
+        const current = [...rallies].reverse().find((r) => r.start_ms <= ms)
+        if (current && ms >= current.end_ms) {
+          seekTo(current.start_ms)
+        }
+        return
+      }
       // The user moved the playhead manually into a gap → play it through, don't
       // yank ahead to the next rally.
       if (freePlayRef.current) return
-      if (rallies.length === 0) return
       // Inside a rally → nothing to skip.
       if (rallies.some((r) => ms >= r.start_ms && ms < r.end_ms)) return
       const next = rallies.find((r) => r.start_ms > ms)
@@ -612,7 +626,7 @@ export function RecordingPlayer({
         videoRef.current?.pause()
       }
     },
-    [rallies, seekTo, atLastRecording, goToRecording, index]
+    [rallies, looping, seekTo, atLastRecording, goToRecording, index]
   )
 
   // Manual rally-to-rally navigation, across recording boundaries. Next jumps to
@@ -961,6 +975,12 @@ export function RecordingPlayer({
         run: goToUncertain,
       },
       {
+        keys: ["L"],
+        label: "Loop current rally",
+        match: (e) => plain(e) && e.key.toLowerCase() === "l",
+        run: toggleLoop,
+      },
+      {
         keys: ["M"],
         label: "Mute",
         match: (e) => plain(e) && e.key.toLowerCase() === "m",
@@ -1003,6 +1023,7 @@ export function RecordingPlayer({
     frameStep,
     goToRally,
     goToUncertain,
+    toggleLoop,
     toggleMute,
     stepSpeed,
     resetSpeed,
@@ -1269,7 +1290,7 @@ function TransportBar({
           variant={looping ? "default" : "outline"}
           size="icon"
           onClick={onToggleLoop}
-          title="Loop the current rally"
+          title={looping ? "Stop looping (L)" : "Loop the current rally (L)"}
         >
           <RepeatIcon className="size-4" />
         </Button>
