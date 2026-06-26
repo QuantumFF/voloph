@@ -434,7 +434,8 @@ fn is_web_playable(report: &str) -> bool {
 /// recording half-written. `+faststart` moves the moov atom to the front for
 /// instant playback; the output is a normal (non-fragmented) mp4 with a real
 /// duration. The path (and its extension) are preserved — the playback server
-/// declares `video/mp4` regardless of extension.
+/// declares `video/mp4` regardless of extension. Keyframes are forced ~once per
+/// second so arbitrary scrub seeks land near a keyframe and stay smooth (ADR 0005).
 pub fn transcode_in_place(path: &str) -> Result<(), String> {
     let src = Path::new(path);
     let parent = src
@@ -460,6 +461,13 @@ pub fn transcode_in_place(path: &str) -> Result<(), String> {
             "libx264",
             "-preset",
             "veryfast",
+            // Force a keyframe roughly once per second (fps-independent), so seeking
+            // to an arbitrary scrub point decodes forward from a nearby keyframe
+            // rather than x264's sparse default GOP (~250 frames ≈ 8s). Trades a
+            // modest file-size increase for smooth, frame-accurate scrubbing in the
+            // seek-dominated review loop (ADR 0005).
+            "-force_key_frames",
+            "expr:gte(t,n_forced*1)",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
