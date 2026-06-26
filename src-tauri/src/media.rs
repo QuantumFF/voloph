@@ -86,9 +86,11 @@ fn generate_token() -> String {
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Route one request: validate the token, then serve the file with range
-/// support. By playback time every recording is already web-playable (ADR
-/// 0005), so this only ever passes bytes through — it never transcodes.
+/// Route one request: validate the token, then serve the recording. By playback
+/// time every recording is already web-playable (ADR 0005), so the whole-file
+/// path only passes bytes through. A `&t=` request instead remuxes a fragmented
+/// MP4 starting at that offset (codec-copy, no re-encode) so the webview can
+/// "seek" by reloading rather than via the unreliable GStreamer seek (issue #24).
 fn handle_request(request: Request, token: &str) {
     let url = request.url().to_string();
     let (route, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
@@ -98,6 +100,7 @@ fn handle_request(request: Request, token: &str) {
 
     let mut path = None;
     let mut supplied_token = None;
+    let mut t = None;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
@@ -106,6 +109,7 @@ fn handle_request(request: Request, token: &str) {
         match key {
             "path" => path = Some(decoded),
             "token" => supplied_token = Some(decoded),
+            "t" => t = Some(decoded),
             _ => {}
         }
     }
@@ -117,7 +121,15 @@ fn handle_request(request: Request, token: &str) {
         return respond_error(request, 400, "missing `path` query parameter");
     };
 
-    serve_file(request, &path);
+    // A positive `t` (seconds) means "open already positioned here": GStreamer
+    // seeking is unreliable on this WebKitGTK build (issue #24), so the frontend
+    // reloads the `<video>` at a `&t=` URL instead of writing `currentTime`. We
+    // hand back a fragmented MP4 that begins at the keyframe ≤ `t`, so the webview
+    // never issues a seek. `t == 0` (or absent) is the plain whole-file path.
+    match t.and_then(|s| s.parse::<f64>().ok()).filter(|v| *v > 0.0) {
+        Some(t_secs) => serve_stream_at(request, &path, t_secs),
+        None => serve_file(request, &path),
+    }
 }
 
 fn respond_error(request: Request, code: u16, message: &str) {
@@ -197,6 +209,78 @@ fn serve_file(request: Request, path: &str) {
         }
     };
     let _ = result;
+}
+
+/// Serve a recording as a fragmented MP4 that begins at the keyframe at or before
+/// `t_secs`, so the webview opens already positioned there and never issues a
+/// GStreamer seek (unreliable on this WebKitGTK build — issue #24). `-ss` before
+/// `-i` does a fast keyframe seek and `-c copy` remuxes without re-encoding, so
+/// this is cheap; `frag_keyframe+empty_moov` makes a streamable fragmented MP4
+/// (the moov is up front, no second pass — so it works over a pipe, which
+/// `+faststart` would not). ffmpeg's stdout streams straight to the response body
+/// with no `Content-Length` (the cut length isn't known ahead of time); the body
+/// is sent chunked. [`ChildStream`] kills and reaps ffmpeg when the webview drops
+/// the connection (a new seek reloads a fresh stream), so no zombie lingers.
+fn serve_stream_at(request: Request, path: &str, t_secs: f64) {
+    let mut child = match Command::new(sidecar_path("ffmpeg"))
+        .args([
+            "-v", "error", "-nostats",
+            "-ss", &format!("{t_secs}"),
+            "-i", path,
+            "-c", "copy", // remux only — no re-encode, so the cut is fast
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return respond_error(request, 500, &format!("could not start ffmpeg: {e}")),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return respond_error(request, 500, "ffmpeg produced no output stream");
+    };
+    let stream = ChildStream { child, stdout };
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            header("Content-Type", "video/mp4"),
+            // No byte-range seeking here: this is a one-way progressive stream
+            // already positioned at the target, of unknown length.
+            header("Accept-Ranges", "none"),
+        ],
+        stream,
+        None,
+        None,
+    );
+    let _ = request.respond(response);
+}
+
+/// An ffmpeg child whose stdout is streamed as a response body. Reads delegate to
+/// stdout; dropping the stream (the webview closed the connection, or the body
+/// finished) kills and reaps the child so a long recording's ffmpeg doesn't
+/// linger after the seek that spawned it is superseded (issue #24).
+struct ChildStream {
+    child: std::process::Child,
+    stdout: std::process::ChildStdout,
+}
+
+impl Read for ChildStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stdout.read(buf)
+    }
+}
+
+impl Drop for ChildStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Sample rate the segmenter analyzes at (ADR 0002). 16 kHz comfortably
