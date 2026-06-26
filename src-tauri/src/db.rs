@@ -100,6 +100,24 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // unknown. The in-place transcode does not resample fps, so the probed value
     // stays valid afterward.
     let _ = conn.execute("ALTER TABLE recordings ADD COLUMN fps REAL", []);
+
+    // One-time reprocess for issue #24. Recordings imported before keyframe-density
+    // gating were passed straight through whenever their codecs were web-playable,
+    // keeping the camera's native GOP (often many seconds). Copy-based seeking
+    // snaps to the keyframe ≤ the target, so on those files a short arrow-key seek
+    // landed a whole GOP off and replayed the same scene. Re-probe every recording
+    // that was marked playable so the media worker re-evaluates it with the new
+    // density check and transcodes the sparse ones to dense keyframes (ADR 0005);
+    // an already-dense recording returns to 'ready' from a cheap re-probe. Guarded
+    // by `user_version` so it runs exactly once per database.
+    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version < 1 {
+        conn.execute(
+            "UPDATE recordings SET transcode_state = 'unknown' WHERE transcode_state = 'ready'",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", 1)?;
+    }
     Ok(conn)
 }
 
