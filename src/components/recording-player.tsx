@@ -1230,7 +1230,7 @@ export function RecordingPlayer({
                   // its first `playing`, so its stretched first frame (before
                   // `object-contain` applies) is never seen — the live held frame
                   // covers the reload (issue #24).
-                  className={`absolute inset-0 size-full rounded-lg bg-black object-contain ${
+                  className={`absolute inset-0 size-full rounded-lg bg-black object-contain select-none focus:outline-none ${
                     isLive ? "opacity-100" : "opacity-0"
                   }`}
                   src={load.src}
