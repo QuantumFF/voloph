@@ -67,6 +67,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             capture_day TEXT NOT NULL,
             transcode_state TEXT NOT NULL DEFAULT 'unknown',
             segment_state   TEXT NOT NULL DEFAULT 'unknown',
+            date_state      TEXT NOT NULL DEFAULT 'unknown',
             duration_ms     INTEGER,
             waveform        TEXT
         );
@@ -90,6 +91,15 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
         "ALTER TABLE recordings ADD COLUMN segment_state TEXT NOT NULL DEFAULT 'unknown'",
         [],
     );
+    // Capture-date lifecycle: `unknown` until the media worker reads the embedded
+    // creation date and re-homes the session (see `refine_capture_day`), then
+    // `refined`. Adding it as `unknown` to an existing DB re-derives every
+    // already-imported recording's day on the next worker pass — the backfill
+    // that fixes recordings grouped by a wrong mtime.
+    let _ = conn.execute(
+        "ALTER TABLE recordings ADD COLUMN date_state TEXT NOT NULL DEFAULT 'unknown'",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE recordings ADD COLUMN duration_ms INTEGER", []);
     // Downsampled audio waveform peaks for the timeline strip (issue #6), stored
     // as a JSON array of normalized `[0,1]` floats. Produced alongside the draft
@@ -105,8 +115,55 @@ fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Capture day as `YYYY-MM-DD`, derived from the file's modified time (UTC).
-/// ffprobe-derived dates land in a later slice (issue #3).
+/// The session capture day (`YYYY-MM-DD`) for a recording, preferring the date
+/// the camera embedded in the file over the file's mtime. mtime is
+/// content-independent and gets clobbered by copying off a camera/SD card, by
+/// cloud sync, and by our own in-place transcode (ADR 0005), so it is an
+/// unreliable signal for *when* a recording was made; the embedded creation date
+/// rides with the bytes. We take the first source that yields a plausible date:
+///   1. `com.apple.quicktime.creationdate` — local wall-clock **with** offset, so
+///      its date portion is the player's local day (a late-evening session stays
+///      on its own day instead of rolling into the next UTC one).
+///   2. `creation_time` — ISO-8601 UTC; grouped by its UTC day.
+///   3. file mtime (UTC day) — last resort.
+///
+/// A tag that is absent, unparseable, or implausible (the `0000-00-00` a
+/// metadata-stripped transcode used to leave behind, a dead-clock epoch date) is
+/// skipped, not trusted, so it falls through to the next source.
+pub fn derive_capture_day(
+    embedded: &crate::media::CaptureDate,
+    modified: std::time::SystemTime,
+) -> String {
+    embedded
+        .quicktime_creationdate
+        .as_deref()
+        .and_then(day_from_iso)
+        .or_else(|| embedded.creation_time.as_deref().and_then(day_from_iso))
+        .unwrap_or_else(|| capture_day(modified))
+}
+
+/// Extract a plausible `YYYY-MM-DD` from the front of an ISO-8601-ish timestamp
+/// (e.g. `2024-03-15T21:30:00+0800`). Returns `None` unless the string starts
+/// with a well-formed date in a plausible year range, so a garbage tag value
+/// falls through to the next capture-date source rather than mis-grouping.
+fn day_from_iso(timestamp: &str) -> Option<String> {
+    let date = timestamp.get(..10)?;
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let year: i32 = date.get(0..4)?.parse().ok()?;
+    let month: u32 = date.get(5..7)?.parse().ok()?;
+    let day: u32 = date.get(8..10)?.parse().ok()?;
+    if !(2000..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(date.to_string())
+}
+
+/// Capture day as `YYYY-MM-DD`, derived from the file's modified time (UTC). The
+/// provisional day at scan time and the final fallback in [`derive_capture_day`]
+/// when a recording carries no usable embedded capture date.
 fn capture_day(modified: std::time::SystemTime) -> String {
     let secs = modified
         .duration_since(std::time::UNIX_EPOCH)
@@ -210,6 +267,70 @@ pub fn scan_folder(conn: &mut Connection, folder: &Path) -> rusqlite::Result<Sca
     })
 }
 
+/// Re-derive a recording's capture day from its embedded metadata (falling back
+/// to mtime) and re-home it under the matching session — creating that session if
+/// it does not exist and deleting its previous session if re-homing leaves it
+/// empty — then mark its capture date `refined` so it is not probed again.
+///
+/// Runs in one transaction so the recording is never momentarily attached to two
+/// sessions (or none), and is idempotent: a recording already on the correct day
+/// stays put and only its `date_state` flips. Rallies and annotations key off the
+/// recording, not the session, so they travel with it automatically.
+pub fn refine_capture_day(
+    conn: &mut Connection,
+    id: i64,
+    path: &str,
+    embedded: &crate::media::CaptureDate,
+) -> rusqlite::Result<()> {
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let day = derive_capture_day(embedded, modified);
+
+    let tx = conn.transaction()?;
+    let old_session: Option<i64> = tx
+        .query_row(
+            "SELECT session_id FROM recordings WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // The recording may have been removed between scan and this pass; nothing to
+    // re-home, so just drop out without touching any session.
+    let Some(old_session) = old_session else {
+        tx.commit()?;
+        return Ok(());
+    };
+
+    tx.execute(
+        "INSERT OR IGNORE INTO sessions (capture_day) VALUES (?1)",
+        [&day],
+    )?;
+    let new_session: i64 = tx.query_row(
+        "SELECT id FROM sessions WHERE capture_day = ?1",
+        [&day],
+        |row| row.get(0),
+    )?;
+
+    tx.execute(
+        "UPDATE recordings
+         SET capture_day = ?1, session_id = ?2, date_state = 'refined'
+         WHERE id = ?3",
+        rusqlite::params![day, new_session, id],
+    )?;
+
+    // Garbage-collect the old session if this was its last recording.
+    if old_session != new_session {
+        tx.execute(
+            "DELETE FROM sessions WHERE id = ?1
+             AND NOT EXISTS (SELECT 1 FROM recordings WHERE session_id = ?1)",
+            [old_session],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// All sessions (newest day first) with their recordings nested under them.
 pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
     let mut stmt =
@@ -256,6 +377,10 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
 /// it always runs against the final, playable bytes.
 #[derive(Debug, PartialEq)]
 pub enum MediaWork {
+    /// Capture day not yet refined — read the camera's embedded creation date and
+    /// re-home the recording's session if it differs from the provisional
+    /// mtime-derived day (see [`refine_capture_day`]).
+    CaptureDate(i64, String),
     /// Web-playability not yet determined — run ffprobe (ADR 0005).
     Probe(i64, String),
     /// Web-incompatible — transcode in place (ADR 0005).
@@ -267,6 +392,20 @@ pub enum MediaWork {
 /// The next unit of background media work, lowest id first within each phase, or
 /// `None` when every recording is both playable and segmented (or has failed).
 pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>> {
+    // Phase 0: anything whose capture day is still the provisional mtime guess.
+    // Runs first so a recording settles into the right session as quickly as
+    // possible; independent of the transcode/segment pipeline below.
+    let date = conn
+        .query_row(
+            "SELECT id, path FROM recordings
+             WHERE date_state = 'unknown' ORDER BY id LIMIT 1",
+            [],
+            |row| Ok(MediaWork::CaptureDate(row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if date.is_some() {
+        return Ok(date);
+    }
     // Phase 1: anything not yet probed.
     let probe = conn
         .query_row(
@@ -715,5 +854,140 @@ mod tests {
         assert!(!update_rally(&conn, "/missing.mp4", 1, 0, 1).unwrap());
         assert!(add_rally(&conn, "/missing.mp4", 0, 1).unwrap().is_none());
         assert!(!delete_rally(&conn, "/missing.mp4", 1).unwrap());
+    }
+
+    use crate::media::CaptureDate;
+    use std::time::UNIX_EPOCH;
+
+    /// The offset-bearing Apple tag wins, and its *local* day is used — here the
+    /// recording is at 00:30 local on the 16th but only 16:30 UTC on the 15th, so
+    /// grouping by the local day (16th) is the difference that matters.
+    #[test]
+    fn capture_day_prefers_quicktime_local_day() {
+        let embedded = CaptureDate {
+            quicktime_creationdate: Some("2024-03-16T00:30:00+0800".to_string()),
+            creation_time: Some("2024-03-15T16:30:00.000000Z".to_string()),
+        };
+        assert_eq!(derive_capture_day(&embedded, UNIX_EPOCH), "2024-03-16");
+    }
+
+    /// With no Apple tag, the UTC `creation_time` day is used; with neither tag,
+    /// the day falls back to the file's mtime.
+    #[test]
+    fn capture_day_falls_back_through_sources() {
+        let creation_only = CaptureDate {
+            quicktime_creationdate: None,
+            creation_time: Some("2024-03-15T16:30:00.000000Z".to_string()),
+        };
+        assert_eq!(derive_capture_day(&creation_only, UNIX_EPOCH), "2024-03-15");
+        // mtime fallback: UNIX_EPOCH is 1970-01-01.
+        assert_eq!(
+            derive_capture_day(&CaptureDate::default(), UNIX_EPOCH),
+            "1970-01-01"
+        );
+    }
+
+    /// A garbage embedded value (the `0000-00-00` a stripped transcode leaves, or
+    /// a dead-clock year) is not trusted — it falls through to the next source.
+    #[test]
+    fn capture_day_skips_implausible_embedded_dates() {
+        let junk = CaptureDate {
+            quicktime_creationdate: Some("0000-00-00T00:00:00Z".to_string()),
+            creation_time: Some("1899-12-31T00:00:00Z".to_string()),
+        };
+        // Both implausible → mtime fallback (UNIX_EPOCH → 1970-01-01).
+        assert_eq!(derive_capture_day(&junk, UNIX_EPOCH), "1970-01-01");
+    }
+
+    /// Inserts a recording on `day` under a session for that day, returning its id.
+    fn insert_recording(conn: &Connection, path: &str, day: &str) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (capture_day) VALUES (?1)",
+            [day],
+        )
+        .unwrap();
+        let session_id: i64 = conn
+            .query_row("SELECT id FROM sessions WHERE capture_day = ?1", [day], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day)
+             VALUES (?1, ?2, 0, '', ?3)",
+            rusqlite::params![session_id, path, day],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn day_of(conn: &Connection, path: &str) -> String {
+        conn.query_row(
+            "SELECT capture_day FROM recordings WHERE path = ?1",
+            [path],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn session_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Refining a recording onto a different day re-homes it under a new session
+    /// and garbage-collects the old session it emptied.
+    #[test]
+    fn refine_rehomes_and_gcs_emptied_session() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        let id = insert_recording(&conn, "/r.mp4", "2026-01-01"); // wrong provisional day
+        let embedded = CaptureDate {
+            quicktime_creationdate: Some("2024-03-15T21:00:00+0800".to_string()),
+            creation_time: None,
+        };
+        refine_capture_day(&mut conn, id, "/r.mp4", &embedded).unwrap();
+
+        assert_eq!(day_of(&conn, "/r.mp4"), "2024-03-15");
+        // Old (emptied) session gone, new one present → exactly one session.
+        assert_eq!(session_count(&conn), 1);
+        assert_eq!(
+            conn.query_row("SELECT capture_day FROM sessions", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "2024-03-15"
+        );
+    }
+
+    /// Re-homing one recording out of a shared session leaves that session intact
+    /// for the recordings that remain.
+    #[test]
+    fn refine_keeps_session_shared_by_others() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        let a = insert_recording(&conn, "/a.mp4", "2026-01-01");
+        insert_recording(&conn, "/b.mp4", "2026-01-01"); // shares the day with /a
+        let embedded = CaptureDate {
+            quicktime_creationdate: Some("2024-03-15T10:00:00+0800".to_string()),
+            creation_time: None,
+        };
+        refine_capture_day(&mut conn, a, "/a.mp4", &embedded).unwrap();
+
+        assert_eq!(day_of(&conn, "/a.mp4"), "2024-03-15");
+        assert_eq!(day_of(&conn, "/b.mp4"), "2026-01-01"); // untouched
+        assert_eq!(session_count(&conn), 2); // both days survive
+    }
+
+    /// Refining a recording already on the correct day is a no-op for grouping and
+    /// creates no duplicate session.
+    #[test]
+    fn refine_is_idempotent_on_correct_day() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        let embedded = CaptureDate {
+            quicktime_creationdate: Some("2024-03-15T10:00:00+0800".to_string()),
+            creation_time: None,
+        };
+        let id = insert_recording(&conn, "/r.mp4", "2024-03-15");
+        refine_capture_day(&mut conn, id, "/r.mp4", &embedded).unwrap();
+        refine_capture_day(&mut conn, id, "/r.mp4", &embedded).unwrap();
+        assert_eq!(day_of(&conn, "/r.mp4"), "2024-03-15");
+        assert_eq!(session_count(&conn), 1);
     }
 }
