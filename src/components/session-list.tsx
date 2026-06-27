@@ -2,9 +2,28 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { AlertTriangleIcon, FolderOpenIcon, Loader2Icon, VideoIcon } from "lucide-react"
+import {
+  AlertTriangleIcon,
+  FilmIcon,
+  FolderOpenIcon,
+  Loader2Icon,
+  MoreVerticalIcon,
+  RefreshCwIcon,
+  RotateCwIcon,
+  VideoIcon,
+} from "lucide-react"
 
-import { Button } from "@/components/ui/button"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { Button, buttonVariants } from "@/components/ui/button"
 import {
   Card,
   CardAction,
@@ -13,6 +32,13 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { trackedInvoke } from "@/lib/tauri"
 
 interface Recording {
@@ -43,7 +69,10 @@ function isTranscoding(state: string): boolean {
  * ready recording means "queued or analyzing".
  */
 function isAnalyzing(recording: Recording): boolean {
-  return recording.transcode_state === "ready" && recording.segment_state === "unknown"
+  return (
+    recording.transcode_state === "ready" &&
+    recording.segment_state === "unknown"
+  )
 }
 
 /** True while any background media work is still pending for this recording. */
@@ -65,7 +94,10 @@ interface ScanResult {
 function formatSize(bytes: number): string {
   if (bytes <= 0) return "0 B"
   const units = ["B", "KB", "MB", "GB", "TB"]
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1
+  )
   return `${(bytes / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
 }
 
@@ -86,6 +118,13 @@ interface SessionListProps {
 export function SessionList({ onPlay }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [scanning, setScanning] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  const [retranscodingAll, setRetranscodingAll] = useState(false)
+  const [reanalyzingAll, setReanalyzingAll] = useState(false)
+  // Which bulk action is awaiting confirmation in the dialog, if any.
+  const [confirmAction, setConfirmAction] = useState<
+    "retranscode" | "reanalyze" | null
+  >(null)
   const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
@@ -109,7 +148,7 @@ export function SessionList({ onPlay }: SessionListProps) {
   // rally count once the draft timeline is ready.
   useEffect(() => {
     const stillWorking = sessions.some((session) =>
-      session.recordings.some((recording) => isProcessing(recording)),
+      session.recordings.some((recording) => isProcessing(recording))
     )
     if (!stillWorking) return
     const interval = setInterval(() => void refresh(), 3000)
@@ -132,25 +171,186 @@ export function SessionList({ onPlay }: SessionListProps) {
     }
   }
 
+  // Re-walk every previously scanned folder for recordings added since, without
+  // re-picking the folder. New recordings flow through the same import pipeline.
+  async function handleRefresh() {
+    setError(null)
+    setRefreshing(true)
+    try {
+      await trackedInvoke<ScanResult>("rescan_folders")
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  // Re-run the transcode for every recording (e.g. after a transcode change).
+  // The rows flip back to "Converting…" as the worker re-encodes them. Confirmed
+  // through the dialog first, since it can take a while across the library.
+  async function runRetranscodeAll() {
+    setError(null)
+    setRetranscodingAll(true)
+    try {
+      await trackedInvoke("retranscode_all")
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRetranscodingAll(false)
+    }
+  }
+
+  // Re-detect rallies for every recording. Discards every draft timeline,
+  // including manual corrections, so it is confirmed through the dialog first.
+  async function runReanalyzeAll() {
+    setError(null)
+    setReanalyzingAll(true)
+    try {
+      await trackedInvoke("reanalyze_all")
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setReanalyzingAll(false)
+    }
+  }
+
+  // Run whichever bulk action the confirmation dialog is open for, then close it.
+  function handleConfirm() {
+    if (confirmAction === "retranscode") void runRetranscodeAll()
+    else if (confirmAction === "reanalyze") void runReanalyzeAll()
+    setConfirmAction(null)
+  }
+
+  // Per-recording re-transcode: return one recording to the transcode queue.
+  async function handleRetranscode(path: string) {
+    setError(null)
+    try {
+      await trackedInvoke("retranscode_recording", { path })
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // Per-recording re-analyze: re-run rally detection for one recording in place
+  // (discards its draft timeline). Mirrors the player's Re-analyze action.
+  async function handleReanalyze(path: string) {
+    setError(null)
+    try {
+      await trackedInvoke("reanalyze_recording", { path })
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const confirmCopy = {
+    retranscode: {
+      title: "Re-transcode all recordings?",
+      description:
+        "This re-runs the transcode for every recording across the whole library. It can take a while, but does not change your draft timelines.",
+      action: "Re-transcode all",
+      destructive: false,
+    },
+    reanalyze: {
+      title: "Re-analyze all recordings?",
+      description:
+        "This re-detects rallies in every recording and discards every draft timeline — including any manual corrections you have made.",
+      action: "Re-analyze all",
+      destructive: true,
+    },
+  } as const
+  const copy = confirmAction ? confirmCopy[confirmAction] : null
+
   return (
     <Card>
+      <AlertDialog
+        open={confirmAction !== null}
+        onOpenChange={(o) => {
+          if (!o) setConfirmAction(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{copy?.title}</AlertDialogTitle>
+            <AlertDialogDescription>{copy?.description}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleConfirm}
+              className={
+                copy?.destructive
+                  ? buttonVariants({ variant: "destructive" })
+                  : undefined
+              }
+            >
+              {copy?.action}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <CardHeader>
         <CardTitle>Sessions</CardTitle>
         <CardDescription>
-          Recordings grouped by capture day, referenced in place. Recordings in a
-          format the player can&apos;t handle are converted once on import.
+          Recordings grouped by capture day, referenced in place. Recordings in
+          a format the player can&apos;t handle are converted once on import.
         </CardDescription>
-        <CardAction>
+        <CardAction className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            onClick={handleRefresh}
+            disabled={refreshing}
+            title="Re-scan known folders for newly added recordings."
+          >
+            <RefreshCwIcon
+              className={`size-4 ${refreshing ? "animate-spin" : ""}`}
+            />
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </Button>
           <Button onClick={handlePickFolder} disabled={scanning}>
             <FolderOpenIcon className="size-4" />
             {scanning ? "Scanning…" : "Scan folder"}
           </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                size="icon"
+                disabled={sessions.length === 0}
+                title="More library actions"
+              >
+                <MoreVerticalIcon className="size-4" />
+                <span className="sr-only">More library actions</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-34">
+              <DropdownMenuLabel>All recordings</DropdownMenuLabel>
+              <DropdownMenuItem
+                onClick={() => setConfirmAction("retranscode")}
+                disabled={retranscodingAll}
+                className="whitespace-nowrap"
+              >
+                <FilmIcon className="size-4" />
+                Re-transcode all
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => setConfirmAction("reanalyze")}
+                disabled={reanalyzingAll}
+                className="whitespace-nowrap"
+              >
+                <RotateCwIcon className="size-4" />
+                Re-analyze all
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </CardAction>
       </CardHeader>
       <CardContent className="space-y-4">
-        {error ? (
-          <p className="text-sm text-destructive">{error}</p>
-        ) : null}
+        {error ? <p className="text-sm text-destructive">{error}</p> : null}
         {sessions.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             No sessions yet. Scan a folder of recordings to get started.
@@ -179,14 +379,20 @@ export function SessionList({ onPlay }: SessionListProps) {
               </div>
               <ul className="divide-y">
                 {session.recordings.map((recording, recordingIndex) => (
-                  <li key={recording.id}>
+                  <li
+                    key={recording.id}
+                    className="flex items-center hover:bg-accent"
+                  >
                     <button
                       type="button"
                       onClick={() => onPlay(session.recordings, recordingIndex)}
-                      className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-accent"
+                      className="flex min-w-0 flex-1 items-center gap-3 px-4 py-2 text-left text-sm"
                     >
                       <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <span className="truncate font-medium" title={recording.path}>
+                      <span
+                        className="truncate font-medium"
+                        title={recording.path}
+                      >
                         {fileName(recording.path)}
                       </span>
                       {isTranscoding(recording.transcode_state) ? (
@@ -214,11 +420,13 @@ export function SessionList({ onPlay }: SessionListProps) {
                           Analyzing…
                         </span>
                       ) : (
-                        <span className="ml-auto flex shrink-0 items-center gap-3 tabular-nums text-muted-foreground">
+                        <span className="ml-auto flex shrink-0 items-center gap-3 text-muted-foreground tabular-nums">
                           {recording.segment_state === "ready" ? (
                             <span title="Rallies detected in the draft timeline">
                               {recording.rally_count}{" "}
-                              {recording.rally_count === 1 ? "rally" : "rallies"}
+                              {recording.rally_count === 1
+                                ? "rally"
+                                : "rallies"}
                             </span>
                           ) : recording.segment_state === "failed" ? (
                             <span
@@ -233,6 +441,35 @@ export function SessionList({ onPlay }: SessionListProps) {
                         </span>
                       )}
                     </button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          className="mr-2 shrink-0 text-muted-foreground"
+                          title="Recording actions"
+                        >
+                          <MoreVerticalIcon className="size-4" />
+                          <span className="sr-only">Recording actions</span>
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-32">
+                        <DropdownMenuItem
+                          onClick={() => handleRetranscode(recording.path)}
+                          disabled={isTranscoding(recording.transcode_state)}
+                        >
+                          <FilmIcon className="size-4" />
+                          Re-transcode
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => handleReanalyze(recording.path)}
+                          disabled={isProcessing(recording)}
+                        >
+                          <RotateCwIcon className="size-4" />
+                          Re-analyze
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </li>
                 ))}
               </ul>

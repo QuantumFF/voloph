@@ -78,7 +78,10 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             end_ms       INTEGER NOT NULL,
             confidence   REAL NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_rallies_recording ON rallies(recording_id);",
+        CREATE INDEX IF NOT EXISTS idx_rallies_recording ON rallies(recording_id);
+        CREATE TABLE IF NOT EXISTS scanned_folders (
+            path TEXT NOT NULL UNIQUE
+        );",
     )?;
     // Upgrade DBs created before later slices. The CREATE above is a no-op when
     // a table already exists, so add new columns here; ignore the
@@ -235,6 +238,12 @@ pub fn scan_folder(conn: &mut Connection, folder: &Path) -> rusqlite::Result<Sca
     let mut skipped = 0usize;
 
     let tx = conn.transaction()?;
+    // Remember the scanned root so Refresh can re-walk it for files added since
+    // (see [`scanned_folders`]). Idempotent, like the recording dedup below.
+    tx.execute(
+        "INSERT OR IGNORE INTO scanned_folders (path) VALUES (?1)",
+        [&folder.to_string_lossy().to_string()],
+    )?;
     for entry in walkdir::WalkDir::new(folder)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -288,6 +297,16 @@ pub fn scan_folder(conn: &mut Connection, folder: &Path) -> rusqlite::Result<Sca
         registered,
         skipped,
     })
+}
+
+/// Every folder root a previous scan registered, so Refresh can re-walk them all
+/// for recordings added since the last scan (see [`scan_folder`]).
+pub fn scanned_folders(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM scanned_folders ORDER BY path")?;
+    let folders = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(folders)
 }
 
 /// Re-derive a recording's capture day from its embedded metadata (falling back
@@ -464,6 +483,26 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     .optional()
 }
 
+/// Return the recording at `path` to the start of the transcode lifecycle so the
+/// media worker re-probes and (if still web-incompatible) re-encodes it in place
+/// (ADR 0005). Backs the per-recording Re-transcode action. Segmentation is left
+/// untouched — the in-place transcode does not change the duration, so the
+/// existing draft timeline stays valid. A no-op when `path` is not registered.
+pub fn reset_transcode(conn: &Connection, path: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recordings SET transcode_state = 'unknown' WHERE path = ?1",
+        [path],
+    )?;
+    Ok(())
+}
+
+/// Return every recording to the start of the transcode lifecycle — the bulk
+/// Re-transcode-all counterpart of [`reset_transcode`].
+pub fn reset_all_transcodes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("UPDATE recordings SET transcode_state = 'unknown'", [])?;
+    Ok(())
+}
+
 /// Advance a recording's transcode lifecycle state.
 pub fn set_transcode_state(conn: &Connection, id: i64, state: &str) -> rusqlite::Result<()> {
     conn.execute(
@@ -547,6 +586,19 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
          SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL
          WHERE path = ?1",
         [path],
+    )?;
+    Ok(())
+}
+
+/// Reset every recording's draft timeline so the media worker re-segments the
+/// whole library on its next pass — the bulk Re-analyze-all counterpart of
+/// [`reset_segmentation`]. Like a per-recording re-analyze, this discards manual
+/// corrections (ADR 0002).
+pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM rallies", [])?;
+    conn.execute(
+        "UPDATE recordings SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL",
+        [],
     )?;
     Ok(())
 }
