@@ -898,6 +898,13 @@ fn video_args(enc: &Encoder) -> Vec<String> {
             "23".into(),
             "-pix_fmt".into(),
             "yuv420p".into(),
+            // NVENC ignores the shared `-force_key_frames` unless forced keyframes
+            // are emitted as IDR frames; without this it falls back to its sparse
+            // default GOP and copy-based seeks snap a whole GOP, replaying the same
+            // scene (issue #24 regression from the GPU-encoder change, #29). libx264
+            // honors `-force_key_frames` on its own, so this is NVENC-only.
+            "-forced-idr".into(),
+            "1".into(),
         ],
         Encoder::Vaapi(_) => vec![
             "-vf".into(),
@@ -993,7 +1000,7 @@ mod tests {
     use super::{
         detect_encoder, input_args, is_web_playable, keyframes_dense_enough, max_keyframe_gap,
         parse_capture_date, parse_fps, percent_decode, probe, sidecar_path, start, transcode_args,
-        transcode_in_place, video_args, CaptureDate, Encoder,
+        transcode_in_place, video_args, CaptureDate, Encoder, MAX_KEYFRAME_GAP_SECS,
     };
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -1118,6 +1125,11 @@ format_name=mov,mp4,m4a,3gp,3g2,mj2";
             nv.windows(2).any(|w| w == ["-pix_fmt", "yuv420p"]),
             "NVENC must force 8-bit yuv420p so 10-bit HEVC stays web-playable"
         );
+        assert!(
+            nv.windows(2).any(|w| w == ["-forced-idr", "1"]),
+            "NVENC ignores the shared -force_key_frames without -forced-idr 1, so it \
+             would emit a sparse default GOP and break copy-based seeking (issue #24)"
+        );
 
         let va = video_args(&Encoder::Vaapi("/dev/dri/renderD128".to_string()));
         assert!(va.iter().any(|a| a == "h264_vaapi"));
@@ -1168,9 +1180,12 @@ format_name=mov,mp4,m4a,3gp,3g2,mj2";
         let status = std::process::Command::new(&ff)
             .args([
                 "-v", "error", "-y",
-                "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                // A sparse-GOP source (keyframes ~4s apart) so a transcode that fails
+                // to force dense keyframes is visibly distinguishable from one that does.
+                "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=4",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
                 "-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p10le",
+                "-g", "120", "-keyint_min", "120", "-sc_threshold", "0",
                 "-c:a", "aac",
                 "-metadata", "creation_time=2024-03-15T13:30:00.000000Z",
                 "-metadata", "make=Apple", "-metadata", "model=iPhone 15 Pro",
@@ -1205,6 +1220,28 @@ format_name=mov,mp4,m4a,3gp,3g2,mj2";
             "lost capture date:\n{report}"
         );
         assert!(report.contains("model=iPhone 15 Pro"), "lost model:\n{report}");
+
+        // The transcode must force ~1s keyframes regardless of which encoder ran
+        // (issue #24): without dense keyframes a copy-based `&t=` seek snaps back a
+        // whole GOP and replays the same scene. NVENC in particular ignores
+        // `-force_key_frames` unless `-forced-idr 1` is set (#29 regression), so a
+        // sparse-GOP source coming out dense is the real signal here.
+        let packets = std::process::Command::new(&ffprobe)
+            .args([
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "packet=pts_time,flags",
+                "-of", "csv=p=0",
+            ])
+            .arg(&src)
+            .output()
+            .unwrap();
+        let gap = max_keyframe_gap(&String::from_utf8_lossy(&packets.stdout));
+        assert!(
+            matches!(gap, Some(g) if g <= MAX_KEYFRAME_GAP_SECS),
+            "transcode left a sparse GOP (max keyframe gap {gap:?}s > {MAX_KEYFRAME_GAP_SECS}s); \
+             copy-based seeking would replay the same scene (issue #24)"
+        );
 
         let _ = std::fs::remove_file(&src);
     }
