@@ -26,6 +26,7 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { decideTogglePlay } from "@/components/recording-player-transport"
 import { trackedInvoke } from "@/lib/tauri"
 
 /** One recording in the session playlist, in capture-time order. */
@@ -906,19 +907,34 @@ export function RecordingPlayer({
   // --- Transport (issue #19): the custom bar and keymap drive these. ---
 
   const togglePlay = useCallback(() => {
-    // Resuming out of frame-step: the live stream is still parked at the pre-step
-    // position (frame-stepping only overlaid stills, never moved the video), so
-    // reopen it at the stepped frame rather than playing from where it froze.
-    // `seekTo` clears the accumulator and autoplays the reloaded stream.
-    if (frameStepMsRef.current != null) {
-      seekTo(frameStepMsRef.current)
-      return
-    }
     const media = liveVideo()
-    if (!media) return
-    if (media.paused) void media.play()
-    else media.pause()
-  }, [liveVideo, seekTo])
+    // The decision (frame-step resume, ignore-while-loading, play, pause) lives
+    // in a pure helper so it can be unit-tested without a `<video>` (issue #27).
+    // `incoming != null` means a (re)load is still buffering: the live element is
+    // the stale pre-seek one held on its freeze frame, so a press must not resume
+    // it — the incoming stream autoplays and promotes on its own.
+    const action = decideTogglePlay({
+      frameStepMs: frameStepMsRef.current,
+      loadInFlight: incoming != null,
+      hasLiveMedia: media != null,
+      livePaused: media?.paused ?? true,
+    })
+    switch (action.kind) {
+      case "reopen-at-frame":
+        // `seekTo` clears the frame-step accumulator and autoplays the reloaded
+        // stream at the stepped frame, rather than playing from where it froze.
+        seekTo(action.atMs)
+        break
+      case "play":
+        void media?.play()
+        break
+      case "pause":
+        media?.pause()
+        break
+      case "ignore":
+        break
+    }
+  }, [liveVideo, seekTo, incoming])
 
   const toggleMute = useCallback(() => setMuted((m) => !m), [])
 
