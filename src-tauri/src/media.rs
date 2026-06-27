@@ -21,7 +21,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -625,6 +625,75 @@ fn parse_fps(report: &str) -> Option<f64> {
     None
 }
 
+/// The capture date a recording carries in its container metadata. Both fields
+/// are the raw tag values (ISO-8601-ish strings) when present, so the caller
+/// decides precedence and parsing. Empty when the recording carries neither tag.
+#[derive(Debug, Default, PartialEq)]
+pub struct CaptureDate {
+    /// `com.apple.quicktime.creationdate` — local wall-clock time **with** the
+    /// camera's UTC offset (e.g. `2024-03-15T21:30:00+0800`). iPhone footage. The
+    /// best source for "which day did the player record on": its date portion is
+    /// already the local day, so a late-evening session does not roll into the
+    /// next day the way a UTC timestamp would.
+    pub quicktime_creationdate: Option<String>,
+    /// `creation_time` — ISO-8601 in **UTC** (e.g. `2024-03-15T13:30:00.000000Z`).
+    /// Present on most cameras. Grouped by its UTC day when the offset-bearing tag
+    /// above is absent.
+    pub creation_time: Option<String>,
+}
+
+/// Read a recording's container capture-date tags with the `ffprobe` sidecar.
+/// Errors only when ffprobe cannot run or read the file at all; a file that
+/// simply carries no date tags yields an empty [`CaptureDate`], not an error, so
+/// the caller falls back to the file's mtime rather than retrying forever.
+pub fn probe_capture_date(path: &str) -> Result<CaptureDate, String> {
+    let output = Command::new(sidecar_path("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags=creation_time,com.apple.quicktime.creationdate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=0",
+            path,
+        ])
+        .output()
+        .map_err(|e| format!("ffprobe could not run: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe could not read the file: {stderr}"));
+    }
+
+    Ok(parse_capture_date(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parse the capture-date tags out of an ffprobe `format_tags` report. ffprobe
+/// prints each tag as `TAG:<key>=<value>`; we pick out the two date keys and
+/// ignore the rest. Split out from [`probe_capture_date`] so the parsing is
+/// unit-testable without invoking the sidecar.
+fn parse_capture_date(report: &str) -> CaptureDate {
+    let mut date = CaptureDate::default();
+    for line in report.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.strip_prefix("TAG:").unwrap_or(key).trim();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "com.apple.quicktime.creationdate" => {
+                date.quicktime_creationdate = Some(value.to_string());
+            }
+            "creation_time" => date.creation_time = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    date
+}
+
 /// Decide whether an ffprobe report describes a source the webview can play
 /// directly: an mp4/mov-family container carrying H.264 video and, if present,
 /// AAC audio. Anything else (HEVC, AV1, mkv, AC-3 audio, …) needs transcoding.
@@ -670,6 +739,77 @@ fn is_web_playable(report: &str) -> bool {
     web_container && video_ok && audio_ok
 }
 
+/// Which H.264 encoder the transcode drives, resolved once against the host's
+/// actual hardware. The bundled ffmpeg (ADR 0004) is compiled with NVENC, VAAPI,
+/// QSV and AMF, but "compiled in" is not "usable": a box may carry the codec yet
+/// have no device that can open it (an iGPU with no H.264 encode entrypoint fails
+/// at encoder-open, not at the encoder list). So each GPU candidate is confirmed
+/// with a throwaway test encode before we trust it for real recordings; anything
+/// that fails — or a machine with no GPU at all — falls back to software libx264,
+/// which always works. A working GPU encoder cuts a transcode to roughly a third
+/// of the software time on high-motion footage.
+#[derive(Clone, Debug, PartialEq)]
+enum Encoder {
+    /// NVIDIA NVENC. Software-decode + GPU-encode (not a full `-hwaccel cuda`
+    /// pipeline): marginally slower than keeping frames on the GPU, but it decodes
+    /// anything ffmpeg can and lets us force 8-bit `yuv420p`, so 10-bit HEVC
+    /// (iPhone HDR) still lands as web-playable 8-bit H.264.
+    Nvenc,
+    /// VAAPI on a specific render node (Intel/AMD iGPU). The `hwupload` filter
+    /// also normalizes to 8-bit `nv12` for the same web-playability reason.
+    Vaapi(String),
+    /// CPU libx264 `veryfast`. The universal fallback — no hardware required.
+    Software,
+}
+
+/// The fastest working H.264 encoder for this host, probed once and cached for
+/// the process lifetime (the answer cannot change while the app runs). Probed
+/// lazily on the first transcode, off the UI thread in the media worker.
+fn encoder() -> &'static Encoder {
+    static ENCODER: OnceLock<Encoder> = OnceLock::new();
+    ENCODER.get_or_init(detect_encoder)
+}
+
+/// Find the fastest usable encoder: prefer NVENC, then VAAPI on whichever render
+/// node opens, else software. Each GPU candidate is confirmed with a real (tiny)
+/// test encode — listing `-encoders` only says what was compiled in, not what the
+/// hardware will accept (VAAPI on a machine whose iGPU lacks an H.264 entrypoint
+/// lists the codec but fails to open it).
+fn detect_encoder() -> Encoder {
+    if encoder_works(&Encoder::Nvenc) {
+        log::info!("transcode: using NVENC hardware encoder");
+        return Encoder::Nvenc;
+    }
+    for node in ["/dev/dri/renderD128", "/dev/dri/renderD129"] {
+        if Path::new(node).exists() {
+            let candidate = Encoder::Vaapi(node.to_string());
+            if encoder_works(&candidate) {
+                log::info!("transcode: using VAAPI hardware encoder ({node})");
+                return candidate;
+            }
+        }
+    }
+    log::info!("transcode: no usable GPU encoder; using software libx264");
+    Encoder::Software
+}
+
+/// Confirm `enc` can actually open and encode on this host by running a fraction
+/// of a second of a generated source through it to the null muxer. Cheap and the
+/// only reliable signal — it exercises the real encoder-open path. Failure (or an
+/// unrunnable sidecar) reads as "not usable".
+fn encoder_works(enc: &Encoder) -> bool {
+    let mut cmd = Command::new(sidecar_path("ffmpeg"));
+    cmd.args(["-v", "error", "-nostats", "-y"]);
+    cmd.args(input_args(enc));
+    cmd.args(["-f", "lavfi", "-i", "color=c=black:s=320x240:r=30:d=0.2"]);
+    cmd.args(video_args(enc));
+    cmd.args(["-f", "null", "-"]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
 /// Transcode the recording at `path` to a complete, seekable H.264/AAC file and
 /// replace the original in place via the ffmpeg sidecar. The source codec is
 /// discarded (ADR 0005). Writes to a hidden temp file in the same directory and
@@ -679,6 +819,11 @@ fn is_web_playable(report: &str) -> bool {
 /// duration. The path (and its extension) are preserved — the playback server
 /// declares `video/mp4` regardless of extension. Keyframes are forced ~once per
 /// second so arbitrary scrub seeks land near a keyframe and stay smooth (ADR 0005).
+///
+/// Uses the host's fastest usable encoder ([`encoder`]). A GPU encoder that
+/// passed the startup probe can still choke on a particular recording (a busy
+/// device, an exotic input), so a GPU failure falls back to software libx264 for
+/// that one file rather than marking it failed.
 pub fn transcode_in_place(path: &str) -> Result<(), String> {
     let src = Path::new(path);
     let parent = src
@@ -692,43 +837,16 @@ pub fn transcode_in_place(path: &str) -> Result<(), String> {
     // the in-progress file is neither user-visible nor picked up by a re-scan.
     let temp = parent.join(format!(".{file_name}.voloph-transcoding.tmp"));
 
-    let output = Command::new(sidecar_path("ffmpeg"))
-        .args([
-            "-v",
-            "error",
-            "-nostats",
-            "-y",
-            "-i",
-            path,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            // Force a keyframe roughly once per second (fps-independent), so seeking
-            // to an arbitrary scrub point decodes forward from a nearby keyframe
-            // rather than x264's sparse default GOP (~250 frames ≈ 8s). Trades a
-            // modest file-size increase for smooth, frame-accurate scrubbing in the
-            // seek-dominated review loop (ADR 0005).
-            "-force_key_frames",
-            "expr:gte(t,n_forced*1)",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-        ])
-        .arg(&temp)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("ffmpeg could not run: {e}"))?;
-
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&temp);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg failed to transcode: {stderr}"));
+    let enc = encoder();
+    match run_transcode(enc, path, &temp) {
+        Ok(()) => {}
+        Err(e) if *enc != Encoder::Software => {
+            log::warn!(
+                "transcode: {enc:?} failed for {path} ({e}); retrying with software libx264"
+            );
+            run_transcode(&Encoder::Software, path, &temp)?;
+        }
+        Err(e) => return Err(e),
     }
 
     std::fs::rename(&temp, src).map_err(|e| {
@@ -736,6 +854,106 @@ pub fn transcode_in_place(path: &str) -> Result<(), String> {
         format!("could not replace original with transcode: {e}")
     })?;
     Ok(())
+}
+
+/// Run one ffmpeg transcode of `path` into `temp` with `enc`. On failure the
+/// partial temp is removed (so a fallback retry starts clean) and the sidecar's
+/// stderr is surfaced.
+fn run_transcode(enc: &Encoder, path: &str, temp: &Path) -> Result<(), String> {
+    let output = Command::new(sidecar_path("ffmpeg"))
+        .args(transcode_args(enc, path, temp))
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg could not run: {e}"))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(temp);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg failed to transcode: {stderr}"));
+    }
+    Ok(())
+}
+
+/// Encoder-specific flags that must precede `-i` (input options). VAAPI opens its
+/// device before the input; the others need nothing here.
+fn input_args(enc: &Encoder) -> Vec<String> {
+    match enc {
+        Encoder::Vaapi(node) => vec!["-vaapi_device".to_string(), node.clone()],
+        Encoder::Nvenc | Encoder::Software => vec![],
+    }
+}
+
+/// The video-encode flags for `enc`: the codec, its speed/quality knob, and the
+/// pixel-format handling that guarantees 8-bit, web-playable H.264 even from
+/// 10-bit HEVC. Software uses `veryfast` at the default CRF; NVENC targets the
+/// same nominal quality with `-cq`; VAAPI normalizes to `nv12` on upload.
+fn video_args(enc: &Encoder) -> Vec<String> {
+    match enc {
+        Encoder::Nvenc => vec![
+            "-c:v".into(),
+            "h264_nvenc".into(),
+            "-preset".into(),
+            "p4".into(),
+            "-cq".into(),
+            "23".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ],
+        Encoder::Vaapi(_) => vec![
+            "-vf".into(),
+            "format=nv12,hwupload".into(),
+            "-c:v".into(),
+            "h264_vaapi".into(),
+        ],
+        Encoder::Software => vec![
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "veryfast".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ],
+    }
+}
+
+/// The full ffmpeg argument vector that transcodes `path` to `out` as
+/// web-playable H.264/AAC with `enc`, **preserving the source's metadata** across
+/// the rewrite.
+///
+/// A QuickTime recording (iPhone footage) carries a "Create Date", camera
+/// make/model, GPS and similar tags. ffmpeg silently drops most of these on a
+/// mov→mp4 rewrite unless told to keep them (issue #25), which matters because
+/// the recording is replaced in place (ADR 0005) — once the transcode lands the
+/// original metadata is gone for good, including the capture date the app means
+/// to group sessions by. Two flags together preserve it:
+///   * `-map_metadata 0` keeps recognized tags such as `creation_time`, which
+///     the mp4 muxer otherwise blanks (writing `0000-00-00`) rather than copying.
+///   * `+use_metadata_tags` keeps arbitrary/unrecognized tags (make, model, …)
+///     that the muxer would otherwise discard as not part of its known set.
+///
+/// `+faststart` moves the moov atom to the front for instant playback. `-f mp4`
+/// forces the muxer since the temp file's `.tmp` extension can't. The per-encoder
+/// codec flags come from [`video_args`]; the metadata, container, audio and
+/// forced-keyframe flags are shared so they hold no matter which encoder ran.
+///
+/// Keyframes are forced roughly once per second (`expr:gte(t,n_forced*1)`,
+/// fps-independent) so an arbitrary scrub seek decodes forward from a nearby
+/// keyframe rather than the encoder's sparse default GOP (~250 frames ≈ 8s).
+/// This is a correctness requirement of the copy-based seek mechanism, not just
+/// smoothness (ADR 0005, issue #24), so it must hold across every encoder.
+fn transcode_args(enc: &Encoder, path: &str, out: &Path) -> Vec<String> {
+    let mut args = vec!["-v".into(), "error".into(), "-nostats".into(), "-y".into()];
+    args.extend(input_args(enc));
+    args.push("-i".into());
+    args.push(path.to_string());
+    args.extend(["-map_metadata".into(), "0".into()]);
+    args.extend(video_args(enc));
+    args.extend(["-force_key_frames".into(), "expr:gte(t,n_forced*1)".into()]);
+    args.extend(["-c:a".into(), "aac".into()]);
+    args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
+    args.extend(["-f".into(), "mp4".into()]);
+    args.push(out.to_string_lossy().into_owned());
+    args
 }
 
 /// Minimal percent-decoding for query values (avoids a url-crate dependency).
@@ -773,8 +991,9 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_web_playable, keyframes_dense_enough, max_keyframe_gap, parse_fps, percent_decode,
-        probe, start,
+        detect_encoder, input_args, is_web_playable, keyframes_dense_enough, max_keyframe_gap,
+        parse_capture_date, parse_fps, percent_decode, probe, sidecar_path, start, transcode_args,
+        transcode_in_place, video_args, CaptureDate, Encoder,
     };
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -830,6 +1049,211 @@ codec_name=ac3
 codec_type=audio
 format_name=mov,mp4,m4a,3gp,3g2,mj2";
         assert!(!is_web_playable(report));
+    }
+
+    /// Whatever encoder is chosen, the transcode must carry the source's metadata
+    /// across the in-place rewrite (issue #25): without `-map_metadata 0` ffmpeg
+    /// blanks the "Create Date" on a mov→mp4 transcode, and without
+    /// `use_metadata_tags` it drops camera make/model and similar tags. These
+    /// shared flags — plus a forced mp4 muxer (the `.tmp` temp has no usable
+    /// extension), AAC audio, and faststart — must hold across every encoder, so
+    /// switching to a GPU encoder for speed never regresses playability or the
+    /// capture date that sessions group by (ADR 0005/0007).
+    #[test]
+    fn transcode_preserves_source_metadata_for_every_encoder() {
+        let out = Path::new("/tmp/.in.mov.voloph-transcoding.tmp");
+        for enc in [
+            Encoder::Software,
+            Encoder::Nvenc,
+            Encoder::Vaapi("/dev/dri/renderD128".to_string()),
+        ] {
+            let args = transcode_args(&enc, "/in.mov", out);
+            let pos = |needle: &str| args.iter().position(|a| a == needle);
+
+            let metadata_idx = pos("-map_metadata");
+            assert_eq!(
+                metadata_idx.and_then(|i| args.get(i + 1)).map(String::as_str),
+                Some("0"),
+                "{enc:?}: must pass `-map_metadata 0` to keep creation_time"
+            );
+            let movflags = pos("-movflags")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+                .unwrap_or("");
+            assert!(
+                movflags.contains("use_metadata_tags"),
+                "{enc:?}: must pass `use_metadata_tags` to keep make/model, got `{movflags}`"
+            );
+            assert!(movflags.contains("faststart"), "{enc:?}: lost +faststart");
+            assert!(
+                args.iter().any(|a| a == "aac"),
+                "{enc:?}: lost AAC audio"
+            );
+            assert!(
+                args.windows(2).any(|w| w == ["-f", "mp4"]),
+                "{enc:?}: lost forced mp4 muxer (temp file has no usable extension)"
+            );
+            assert_eq!(
+                args.last().map(String::as_str),
+                out.to_str(),
+                "{enc:?}: output path must be the final argument"
+            );
+        }
+    }
+
+    /// Each encoder selects the right H.264 codec and the pixel-format handling
+    /// that keeps 10-bit HEVC (iPhone HDR) coming out as 8-bit, web-playable
+    /// H.264: software/NVENC force `yuv420p`, VAAPI normalizes to `nv12` on
+    /// upload. A regression here means either no speedup (wrong codec) or
+    /// unplayable 10-bit output.
+    #[test]
+    fn each_encoder_picks_its_codec_and_keeps_8bit() {
+        let sw = video_args(&Encoder::Software);
+        assert!(sw.iter().any(|a| a == "libx264"));
+        assert!(sw.windows(2).any(|w| w == ["-pix_fmt", "yuv420p"]));
+
+        let nv = video_args(&Encoder::Nvenc);
+        assert!(nv.iter().any(|a| a == "h264_nvenc"));
+        assert!(
+            nv.windows(2).any(|w| w == ["-pix_fmt", "yuv420p"]),
+            "NVENC must force 8-bit yuv420p so 10-bit HEVC stays web-playable"
+        );
+
+        let va = video_args(&Encoder::Vaapi("/dev/dri/renderD128".to_string()));
+        assert!(va.iter().any(|a| a == "h264_vaapi"));
+        assert!(
+            va.iter().any(|a| a.contains("nv12") && a.contains("hwupload")),
+            "VAAPI must hwupload as nv12 (8-bit) for web playability"
+        );
+    }
+
+    /// End-to-end against the real ffmpeg sidecar: a HEVC source is transcoded in
+    /// place to seekable 8-bit H.264/AAC with its capture date and make/model
+    /// intact, exercising the actual encoder detection, fallback wiring and atomic
+    /// rename — not just the assembled args. Ignored by default (needs the bundled
+    /// sidecar and is slower than a unit test); run with `--ignored`. Self-skips
+    /// if the sidecar can't be located next to the test binary.
+    #[test]
+    #[ignore = "needs the ffmpeg sidecar; run with --ignored"]
+    fn transcodes_a_real_hevc_file_in_place() {
+        // The sidecar resolves next to current_exe; provision it there from the
+        // committed repo binaries if missing (the test binary lives in deps/).
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        for name in ["ffmpeg", "ffprobe"] {
+            let dest = sidecar_path(name);
+            if !dest.exists() {
+                let repo = exe_dir
+                    .ancestors()
+                    .map(|a| a.join(format!("binaries/{name}-x86_64-unknown-linux-gnu")))
+                    .find(|p| p.exists());
+                let Some(src) = repo.or_else(|| {
+                    // also try the workspace src-tauri/binaries relative to CARGO_MANIFEST_DIR
+                    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join(format!("binaries/{name}-x86_64-unknown-linux-gnu"));
+                    p.exists().then_some(p)
+                }) else {
+                    eprintln!("skipping: sidecar {name} not found");
+                    return;
+                };
+                std::fs::copy(&src, &dest).unwrap();
+            }
+        }
+        let ff = sidecar_path("ffmpeg");
+        let ffprobe = sidecar_path("ffprobe");
+
+        // A short HEVC/AAC clip carrying the tags sessions group by.
+        let dir = std::env::temp_dir();
+        let src = dir.join("voloph-transcode-it.mov");
+        let _ = std::fs::remove_file(&src);
+        let status = std::process::Command::new(&ff)
+            .args([
+                "-v", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-c:v", "libx265", "-tag:v", "hvc1", "-pix_fmt", "yuv420p10le",
+                "-c:a", "aac",
+                "-metadata", "creation_time=2024-03-15T13:30:00.000000Z",
+                "-metadata", "make=Apple", "-metadata", "model=iPhone 15 Pro",
+            ])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not synthesize HEVC fixture");
+
+        // Detection must land on something usable (NVENC here, but any is fine).
+        eprintln!("detected encoder: {:?}", detect_encoder());
+
+        transcode_in_place(src.to_str().unwrap()).expect("transcode failed");
+
+        // The file at the same path is now 8-bit H.264/AAC with metadata intact.
+        let report = std::process::Command::new(&ffprobe)
+            .args([
+                "-v", "error",
+                "-show_entries",
+                "stream=codec_name,pix_fmt:format_tags=creation_time,make,model",
+                "-of", "default=noprint_wrappers=1:nokey=0",
+            ])
+            .arg(&src)
+            .output()
+            .unwrap();
+        let report = String::from_utf8_lossy(&report.stdout);
+        assert!(report.contains("codec_name=h264"), "not H.264:\n{report}");
+        assert!(report.contains("codec_name=aac"), "not AAC:\n{report}");
+        assert!(report.contains("pix_fmt=yuv420p"), "not 8-bit yuv420p:\n{report}");
+        assert!(
+            report.contains("creation_time=2024-03-15"),
+            "lost capture date:\n{report}"
+        );
+        assert!(report.contains("model=iPhone 15 Pro"), "lost model:\n{report}");
+
+        let _ = std::fs::remove_file(&src);
+    }
+
+    /// VAAPI needs its device opened *before* the input; the other encoders take
+    /// no pre-input flags. Wrong ordering means ffmpeg can't find the device.
+    #[test]
+    fn vaapi_opens_its_device_before_input() {
+        let va = input_args(&Encoder::Vaapi("/dev/dri/renderD129".to_string()));
+        assert_eq!(va, vec!["-vaapi_device", "/dev/dri/renderD129"]);
+        assert!(input_args(&Encoder::Nvenc).is_empty());
+        assert!(input_args(&Encoder::Software).is_empty());
+
+        // And in the full command the device really precedes `-i`.
+        let args = transcode_args(
+            &Encoder::Vaapi("/dev/dri/renderD129".to_string()),
+            "/in.mov",
+            Path::new("/out.tmp"),
+        );
+        let dev = args.iter().position(|a| a == "-vaapi_device").unwrap();
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        assert!(dev < input, "`-vaapi_device` must come before `-i`");
+    }
+
+    /// ffprobe prints date tags as `TAG:<key>=<value>`; the parser must pull both
+    /// the offset-bearing Apple tag (as real iPhone footage carries it) and the
+    /// generic UTC `creation_time`, ignoring unrelated tags.
+    #[test]
+    fn parses_both_capture_date_tags() {
+        let report = "\
+TAG:major_brand=qt
+TAG:creation_time=2024-03-15T13:30:00.000000Z
+TAG:com.apple.quicktime.creationdate=2024-03-15T21:30:00+0800
+TAG:encoder=Lavf62.12.102";
+        assert_eq!(
+            parse_capture_date(report),
+            CaptureDate {
+                quicktime_creationdate: Some("2024-03-15T21:30:00+0800".to_string()),
+                creation_time: Some("2024-03-15T13:30:00.000000Z".to_string()),
+            }
+        );
+    }
+
+    /// A recording with no date tags parses to an empty result (caller falls back
+    /// to mtime), not an error.
+    #[test]
+    fn parses_missing_capture_date_as_empty() {
+        let report = "TAG:major_brand=isom\nTAG:encoder=Lavf62.12.102";
+        assert_eq!(parse_capture_date(report), CaptureDate::default());
     }
 
     #[test]

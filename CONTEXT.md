@@ -5,7 +5,7 @@ A desktop app for reviewing badminton games recorded by the player. Its purpose 
 ## Language
 
 **Session**:
-The top-level grouping and the unit the user reviews by — one outing, identified by its day. Holds one or more recordings.
+The top-level grouping and the unit the user reviews by — one outing, identified by its day. Holds one or more recordings. The day is the recording's embedded capture date (the camera's creation date), falling back to file mtime only when no usable embedded date exists (see ADR 0007); recordings are re-homed to the matching day in the background after import.
 _Avoid_: match, day, event
 
 **Recording**:
@@ -13,7 +13,7 @@ A single raw video file as it came off the camera, attached to a session. May co
 _Avoid_: VOD, video, clip, game, match
 
 **Transcode** (codec normalization):
-Re-encoding a recording the webview cannot decode natively (e.g. iPhone HEVC) to web-playable H.264/AAC, **in place** — the new file replaces the original at its path and the source codec is discarded (see ADR 0005). Done once in the background at import; a recording already in a playable codec is never transcoded. Distinct from **export**, which renders a *new* file from a selection of rallies and never touches the recording.
+Re-encoding a recording the webview cannot decode natively (e.g. iPhone HEVC) to web-playable H.264/AAC, **in place** — the new file replaces the original at its path and the source codec is discarded (see ADR 0005). The container metadata — the camera's creation date, make/model and the like — is carried across the rewrite, so only the codec is lost, not the recording's identity. Done once in the background at import; a recording already in a playable codec is never transcoded. Uses the host's fastest usable encoder — GPU (NVENC/VAAPI) where present, software libx264 otherwise, chosen by a one-time probe and falling back safely (see ADR 0005). Distinct from **export**, which renders a *new* file from a selection of rallies and never touches the recording.
 _Avoid_: proxy, cache, copy (there is no second copy), preview, lower-res copy
 
 **Rally**:

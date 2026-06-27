@@ -203,6 +203,7 @@ fn run_media_worker(conn: &Mutex<Connection>) {
         };
 
         match work {
+            db::MediaWork::CaptureDate(id, path) => refine_recording_date(conn, id, &path),
             db::MediaWork::Probe(id, path) => {
                 let (next, fps) = match media::probe(&path) {
                     Ok(probe) => (
@@ -284,6 +285,22 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
             }
         }
         Err(e) => log::error!("media worker: db lock poisoned saving {path}: {e}"),
+    }
+}
+
+/// Read a recording's embedded capture date with ffprobe and re-home its session
+/// to the matching day, under a brief lock. An ffprobe failure (missing/unreadable
+/// file) is not fatal: it falls back to the mtime-derived day rather than looping,
+/// since the recording is still marked `refined` afterward.
+fn refine_recording_date(conn: &Mutex<Connection>, id: i64, path: &str) {
+    let embedded = media::probe_capture_date(path).unwrap_or_default();
+    match conn.lock() {
+        Ok(mut c) => {
+            if let Err(e) = db::refine_capture_day(&mut c, id, path, &embedded) {
+                log::error!("media worker: could not refine capture day for {path}: {e}");
+            }
+        }
+        Err(e) => log::error!("media worker: db lock poisoned refining date for {path}: {e}"),
     }
 }
 
