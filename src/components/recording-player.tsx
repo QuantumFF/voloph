@@ -2107,7 +2107,7 @@ function SessionTimeline({
                         onSeekGlobal(rally.globalStart)
                       }
                     }}
-                    className={`absolute inset-y-0 rounded-sm transition-opacity hover:opacity-80 ${
+                    className={`absolute inset-y-0 rounded-sm transition-opacity hover:opacity-80 focus:outline-none ${
                       uncertain
                         ? "border border-amber-500/70 bg-amber-500/40"
                         : "bg-primary/70"
