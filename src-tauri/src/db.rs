@@ -105,6 +105,29 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // as a JSON array of normalized `[0,1]` floats. Produced alongside the draft
     // timeline during segmentation; null until a recording is segmented.
     let _ = conn.execute("ALTER TABLE recordings ADD COLUMN waveform TEXT", []);
+    // Video frame rate captured at probe time (issue #19) so the player can
+    // frame-step exactly. Null until probed; the player defaults to 30 fps when
+    // unknown. The in-place transcode does not resample fps, so the probed value
+    // stays valid afterward.
+    let _ = conn.execute("ALTER TABLE recordings ADD COLUMN fps REAL", []);
+
+    // One-time reprocess for issue #24. Recordings imported before keyframe-density
+    // gating were passed straight through whenever their codecs were web-playable,
+    // keeping the camera's native GOP (often many seconds). Copy-based seeking
+    // snaps to the keyframe ≤ the target, so on those files a short arrow-key seek
+    // landed a whole GOP off and replayed the same scene. Re-probe every recording
+    // that was marked playable so the media worker re-evaluates it with the new
+    // density check and transcodes the sparse ones to dense keyframes (ADR 0005);
+    // an already-dense recording returns to 'ready' from a cheap re-probe. Guarded
+    // by `user_version` so it runs exactly once per database.
+    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version < 1 {
+        conn.execute(
+            "UPDATE recordings SET transcode_state = 'unknown' WHERE transcode_state = 'ready'",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", 1)?;
+    }
     Ok(conn)
 }
 
@@ -448,6 +471,36 @@ pub fn set_transcode_state(conn: &Connection, id: i64, state: &str) -> rusqlite:
         rusqlite::params![state, id],
     )?;
     Ok(())
+}
+
+/// Record a probe's outcome (issue #19): the next transcode state and the
+/// captured frame rate. fps is stored even when the recording still needs a
+/// transcode, since the in-place transcode does not resample fps (ADR 0005), so
+/// the probed value stays valid for frame-stepping.
+pub fn set_probe_result(
+    conn: &Connection,
+    id: i64,
+    state: &str,
+    fps: Option<f64>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recordings SET transcode_state = ?1, fps = ?2 WHERE id = ?3",
+        rusqlite::params![state, fps, id],
+    )?;
+    Ok(())
+}
+
+/// The probed frame rate of the recording at `path` (issue #19), surfaced to the
+/// player so frame-step is exact. `None` when the path is not registered or it
+/// has no captured fps yet; the player then defaults to 30 fps.
+pub fn recording_fps(conn: &Connection, path: &str) -> rusqlite::Result<Option<f64>> {
+    conn.query_row(
+        "SELECT fps FROM recordings WHERE path = ?1",
+        [path],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|opt| opt.flatten())
 }
 
 /// Mark a recording `ready` after an in-place transcode, refreshing the stored

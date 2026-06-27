@@ -86,9 +86,11 @@ fn generate_token() -> String {
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Route one request: validate the token, then serve the file with range
-/// support. By playback time every recording is already web-playable (ADR
-/// 0005), so this only ever passes bytes through — it never transcodes.
+/// Route one request: validate the token, then serve the recording. By playback
+/// time every recording is already web-playable (ADR 0005), so the whole-file
+/// path only passes bytes through. A `&t=` request instead remuxes a fragmented
+/// MP4 starting at that offset (codec-copy, no re-encode) so the webview can
+/// "seek" by reloading rather than via the unreliable GStreamer seek (issue #24).
 fn handle_request(request: Request, token: &str) {
     let url = request.url().to_string();
     let (route, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
@@ -98,6 +100,8 @@ fn handle_request(request: Request, token: &str) {
 
     let mut path = None;
     let mut supplied_token = None;
+    let mut t = None;
+    let mut frame = false;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
@@ -106,6 +110,8 @@ fn handle_request(request: Request, token: &str) {
         match key {
             "path" => path = Some(decoded),
             "token" => supplied_token = Some(decoded),
+            "t" => t = Some(decoded),
+            "frame" => frame = decoded == "1",
             _ => {}
         }
     }
@@ -117,7 +123,28 @@ fn handle_request(request: Request, token: &str) {
         return respond_error(request, 400, "missing `path` query parameter");
     };
 
-    serve_file(request, &path);
+    let t_secs = t.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
+    // `frame=1` asks for a single still decoded at exactly `t`: frame-step can't
+    // nudge the `<video>` by writing `currentTime` (dropped on this WebKitGTK
+    // build — issue #24 / ADR 0007), so the player overlays this exact JPEG over
+    // the paused video instead. Checked before the stream/file split so the
+    // first-frame case (`t == 0`) still decodes a frame rather than serving the
+    // whole file.
+    if frame {
+        return serve_frame_at(request, &path, t_secs.max(0.0));
+    }
+
+    // A positive `t` (seconds) means "open already positioned here": GStreamer
+    // seeking is unreliable on this WebKitGTK build (issue #24), so the frontend
+    // reloads the `<video>` at a `&t=` URL instead of writing `currentTime`. We
+    // hand back a fragmented MP4 that begins at the keyframe ≤ `t`, so the webview
+    // never issues a seek. `t == 0` (or absent) is the plain whole-file path.
+    if t_secs > 0.0 {
+        serve_stream_at(request, &path, t_secs);
+    } else {
+        serve_file(request, &path);
+    }
 }
 
 fn respond_error(request: Request, code: u16, message: &str) {
@@ -197,6 +224,140 @@ fn serve_file(request: Request, path: &str) {
         }
     };
     let _ = result;
+}
+
+/// Serve a recording as a fragmented MP4 that begins at the keyframe at or before
+/// `t_secs`, so the webview opens already positioned there and never issues a
+/// GStreamer seek (unreliable on this WebKitGTK build — issue #24). `-ss` before
+/// `-i` does a fast keyframe seek and `-c copy` remuxes without re-encoding, so
+/// the cut is cheap and uses almost no CPU — which matters because every seek in
+/// the review loop reloads a fresh stream; `frag_keyframe+empty_moov` makes a
+/// streamable fragmented MP4 (the moov is up front, no second pass — so it works
+/// over a pipe, which `+faststart` would not). ffmpeg's stdout streams straight to
+/// the response body with no `Content-Length` (the cut length isn't known ahead of
+/// time); the body is sent chunked. [`ChildStream`] kills and reaps ffmpeg when
+/// the webview drops the connection (a new seek reloads a fresh stream), so no
+/// zombie lingers.
+///
+/// A `-c copy` cut cannot start mid-GOP — it snaps to the keyframe ≤ `t` and the
+/// stream replays from there. That snap is only acceptable because **every**
+/// recording is kept at ~1s keyframes at rest: incompatible ones via the transcode
+/// (ADR 0005), and web-playable-but-sparse ones are transcoded at import for this
+/// very reason (a recording's native GOP can be many seconds, which made short
+/// arrow-key seeks land on the same keyframe and replay the identical scene —
+/// issue #24). With dense keyframes the snap is ≤~1s, the tolerance scrubbing
+/// already lived with — and output timestamps reset to ~0, so the frontend's
+/// `seekBaseMs + currentTime` mapping (seekBaseMs = `t`) stays correct.
+fn serve_stream_at(request: Request, path: &str, t_secs: f64) {
+    let mut child = match Command::new(sidecar_path("ffmpeg"))
+        .args([
+            "-v", "error", "-nostats",
+            "-ss", &format!("{t_secs}"),
+            "-i", path,
+            "-c", "copy", // remux only — no re-encode, so the cut is fast and cheap
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return respond_error(request, 500, &format!("could not start ffmpeg: {e}")),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return respond_error(request, 500, "ffmpeg produced no output stream");
+    };
+    let stream = ChildStream { child, stdout };
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            header("Content-Type", "video/mp4"),
+            // No byte-range seeking here: this is a one-way progressive stream
+            // already positioned at the target, of unknown length.
+            header("Accept-Ranges", "none"),
+        ],
+        stream,
+        None,
+        None,
+    );
+    let _ = request.respond(response);
+}
+
+/// Serve a single still frame as a JPEG, decoded at exactly `t_secs`. Frame-step
+/// (issue #19) can't advance the `<video>` a frame by writing `currentTime` —
+/// this WebKitGTK build silently drops those seeks (issue #24 / ADR 0007) — so
+/// the player overlays this exact still over the paused video instead. `-ss`
+/// before `-i` seeks to the keyframe ≤ `t` and decodes forward to the exact
+/// frame, so the JPEG is frame-accurate (unlike the `-c copy` `&t=` stream, which
+/// can only start on a keyframe). It is a single-frame decode of one GOP — small
+/// because every recording is kept at ~1s keyframes at rest (ADR 0005) — so the
+/// per-step cost is modest. Unlike the stream, the whole JPEG is buffered (it is
+/// tiny and its length must be known) rather than piped.
+fn serve_frame_at(request: Request, path: &str, t_secs: f64) {
+    let output = Command::new(sidecar_path("ffmpeg"))
+        .args([
+            "-v", "error", "-nostats",
+            "-ss", &format!("{t_secs}"),
+            "-i", path,
+            "-frames:v", "1",
+            "-an", // no audio in a still
+            "-c:v", "mjpeg",
+            "-q:v", "3", // visually lossless enough for frame inspection, still small
+            "-f", "mjpeg",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => return respond_error(request, 500, &format!("could not start ffmpeg: {e}")),
+    };
+    if !output.status.success() || output.stdout.is_empty() {
+        return respond_error(request, 500, "could not decode frame");
+    }
+    let len = output.stdout.len();
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            header("Content-Type", "image/jpeg"),
+            // A stepped frame is never the same URL twice in a row anyway, but be
+            // explicit: the webview must not serve a stale still for a position.
+            header("Cache-Control", "no-store"),
+        ],
+        std::io::Cursor::new(output.stdout),
+        Some(len),
+        None,
+    );
+    let _ = request.respond(response);
+}
+
+/// An ffmpeg child whose stdout is streamed as a response body. Reads delegate to
+/// stdout; dropping the stream (the webview closed the connection, or the body
+/// finished) kills and reaps the child so a long recording's ffmpeg doesn't
+/// linger after the seek that spawned it is superseded (issue #24).
+struct ChildStream {
+    child: std::process::Child,
+    stdout: std::process::ChildStdout,
+}
+
+impl Read for ChildStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stdout.read(buf)
+    }
+}
+
+impl Drop for ChildStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Sample rate the segmenter analyzes at (ADR 0002). 16 kHz comfortably
@@ -303,11 +464,33 @@ pub fn extract_motion(path: &str) -> Result<Vec<f64>, String> {
     Ok(energy)
 }
 
+/// Longest tolerable gap between keyframes (seconds) for a recording to be played
+/// without transcoding. Seeking reloads a `&t=` stream that `-c copy` snaps to the
+/// keyframe ≤ `t` (issue #24); the snap is only acceptable while keyframes are
+/// dense, so a web-playable file whose native GOP exceeds this is transcoded at
+/// import to the forced ~1s keyframes (ADR 0005) like an incompatible one. Set a
+/// little above the forced ~1s so an already-dense file (or one with the odd
+/// scene-cut keyframe) is not needlessly re-encoded.
+const MAX_KEYFRAME_GAP_SECS: f64 = 2.0;
+
+/// How far into the video to read packets when measuring the keyframe gap. A short
+/// window is enough to characterize a constant-GOP camera recording and keeps the
+/// probe cheap; a file with a single keyframe in this window has a GOP at least
+/// this long and is treated as sparse.
+const KEYFRAME_PROBE_WINDOW_SECS: u32 = 12;
+
 /// What a probe tells us about whether a source can play in the webview as-is.
 pub struct Probe {
-    /// True when the container + codecs are web-playable (H.264/AAC in mp4/mov)
-    /// and so need no transcode.
+    /// True when the source can play directly: web-playable container + codecs
+    /// (H.264/AAC in mp4/mov) **and** keyframes dense enough for copy-based seeking
+    /// (issue #24). Otherwise it is transcoded in place (ADR 0005).
     pub passthrough: bool,
+    /// Frames per second of the video stream, parsed from ffprobe's
+    /// `avg_frame_rate` rational (issue #19), so the player can frame-step
+    /// exactly. `None` when ffprobe reports no usable rate; the player then
+    /// defaults to 30 fps. The in-place transcode does not resample, so this
+    /// stays valid afterward.
+    pub fps: Option<f64>,
 }
 
 /// Resolve a bundled sidecar binary. Tauri places `externalBin` next to the
@@ -334,7 +517,7 @@ pub fn probe(path: &str) -> Result<Probe, String> {
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,codec_name:format=format_name",
+            "stream=codec_type,codec_name,avg_frame_rate:format=format_name",
             "-of",
             "default=noprint_wrappers=1:nokey=0",
             path,
@@ -348,9 +531,98 @@ pub fn probe(path: &str) -> Result<Probe, String> {
     }
 
     let report = String::from_utf8_lossy(&output.stdout);
+    // A file is only safe to play directly when it is web-playable *and* its
+    // keyframes are dense enough for copy-based seeking (issue #24). Skip the
+    // keyframe read for files already bound for transcode — the density is moot.
+    let passthrough = is_web_playable(&report)
+        && keyframes_dense_enough(probe_keyframe_gap(path));
     Ok(Probe {
-        passthrough: is_web_playable(&report),
+        passthrough,
+        fps: parse_fps(&report),
     })
+}
+
+/// Whether the largest keyframe gap (seconds) is within [`MAX_KEYFRAME_GAP_SECS`].
+/// `None` (the gap could not be measured) is treated as dense: an unreadable
+/// keyframe layout is not worth a destructive re-encode on a file that already
+/// decodes.
+fn keyframes_dense_enough(max_gap: Option<f64>) -> bool {
+    max_gap.map(|g| g <= MAX_KEYFRAME_GAP_SECS).unwrap_or(true)
+}
+
+/// Measure the largest keyframe gap in the first [`KEYFRAME_PROBE_WINDOW_SECS`] of
+/// the video via the `ffprobe` sidecar. Returns `None` if the probe cannot run or
+/// reports no keyframe, so the caller falls back to "dense" rather than transcode
+/// on uncertainty.
+fn probe_keyframe_gap(path: &str) -> Option<f64> {
+    let output = Command::new(sidecar_path("ffprobe"))
+        .args([
+            "-v", "error",
+            "-read_intervals", &format!("%+{KEYFRAME_PROBE_WINDOW_SECS}"),
+            "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,flags",
+            "-of", "csv=p=0",
+            path,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    max_keyframe_gap(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Largest gap between consecutive keyframes in an ffprobe `packet=pts_time,flags`
+/// CSV (a keyframe is a packet whose flags contain `K`). The gap from time 0 to
+/// the first keyframe is included. Fewer than two keyframes in the read window
+/// means the GOP is at least the window long, reported as [`f64::INFINITY`] so it
+/// reads as sparse; no keyframe at all is `None` (unmeasurable).
+fn max_keyframe_gap(report: &str) -> Option<f64> {
+    let mut times = Vec::new();
+    for line in report.lines() {
+        let mut fields = line.split(',');
+        let Some(pts) = fields.next() else { continue };
+        let is_key = fields.any(|f| f.contains('K'));
+        if !is_key {
+            continue;
+        }
+        if let Ok(t) = pts.trim().parse::<f64>() {
+            times.push(t);
+        }
+    }
+    if times.is_empty() {
+        return None;
+    }
+    if times.len() < 2 {
+        return Some(f64::INFINITY);
+    }
+    let mut max = times[0].max(0.0);
+    for pair in times.windows(2) {
+        max = max.max(pair[1] - pair[0]);
+    }
+    Some(max)
+}
+
+/// Parse the video stream's frame rate from an ffprobe report (issue #19).
+/// ffprobe emits `avg_frame_rate` as a rational such as `30000/1001` (29.97) or
+/// `0/0` for a stream with no usable rate (e.g. an audio-only stream's line).
+/// Returns the first positive rate found, or `None` when no video stream
+/// reports one — the player then defaults to 30 fps.
+fn parse_fps(report: &str) -> Option<f64> {
+    for line in report.lines() {
+        let Some(("avg_frame_rate", value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let (num, den) = value.split_once('/').unwrap_or((value, "1"));
+        let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>()) else {
+            continue;
+        };
+        if num > 0.0 && den > 0.0 {
+            return Some(num / den);
+        }
+    }
+    None
 }
 
 /// The capture date a recording carries in its container metadata. Both fields
@@ -545,7 +817,8 @@ fn encoder_works(enc: &Encoder) -> bool {
 /// recording half-written. `+faststart` moves the moov atom to the front for
 /// instant playback; the output is a normal (non-fragmented) mp4 with a real
 /// duration. The path (and its extension) are preserved — the playback server
-/// declares `video/mp4` regardless of extension.
+/// declares `video/mp4` regardless of extension. Keyframes are forced ~once per
+/// second so arbitrary scrub seeks land near a keyframe and stay smooth (ADR 0005).
 ///
 /// Uses the host's fastest usable encoder ([`encoder`]). A GPU encoder that
 /// passed the startup probe can still choke on a particular recording (a busy
@@ -660,8 +933,14 @@ fn video_args(enc: &Encoder) -> Vec<String> {
 ///
 /// `+faststart` moves the moov atom to the front for instant playback. `-f mp4`
 /// forces the muxer since the temp file's `.tmp` extension can't. The per-encoder
-/// codec flags come from [`video_args`]; the metadata, container and audio flags
-/// are shared so they hold no matter which encoder ran.
+/// codec flags come from [`video_args`]; the metadata, container, audio and
+/// forced-keyframe flags are shared so they hold no matter which encoder ran.
+///
+/// Keyframes are forced roughly once per second (`expr:gte(t,n_forced*1)`,
+/// fps-independent) so an arbitrary scrub seek decodes forward from a nearby
+/// keyframe rather than the encoder's sparse default GOP (~250 frames ≈ 8s).
+/// This is a correctness requirement of the copy-based seek mechanism, not just
+/// smoothness (ADR 0005, issue #24), so it must hold across every encoder.
 fn transcode_args(enc: &Encoder, path: &str, out: &Path) -> Vec<String> {
     let mut args = vec!["-v".into(), "error".into(), "-nostats".into(), "-y".into()];
     args.extend(input_args(enc));
@@ -669,6 +948,7 @@ fn transcode_args(enc: &Encoder, path: &str, out: &Path) -> Vec<String> {
     args.push(path.to_string());
     args.extend(["-map_metadata".into(), "0".into()]);
     args.extend(video_args(enc));
+    args.extend(["-force_key_frames".into(), "expr:gte(t,n_forced*1)".into()]);
     args.extend(["-c:a".into(), "aac".into()]);
     args.extend(["-movflags".into(), "+faststart+use_metadata_tags".into()]);
     args.extend(["-f".into(), "mp4".into()]);
@@ -711,12 +991,14 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_encoder, input_args, is_web_playable, parse_capture_date, percent_decode,
-        sidecar_path, start, transcode_args, transcode_in_place, video_args, CaptureDate, Encoder,
+        detect_encoder, input_args, is_web_playable, keyframes_dense_enough, max_keyframe_gap,
+        parse_capture_date, parse_fps, percent_decode, probe, sidecar_path, start, transcode_args,
+        transcode_in_place, video_args, CaptureDate, Encoder,
     };
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
 
     // codec_name precedes codec_type per stream in ffprobe's real output.
     const H264_AAC_MP4: &str = "\
@@ -975,8 +1257,59 @@ TAG:encoder=Lavf62.12.102";
     }
 
     #[test]
+    fn parses_rational_frame_rate() {
+        let report = "\
+codec_name=h264
+codec_type=video
+avg_frame_rate=30000/1001
+codec_name=aac
+codec_type=audio
+avg_frame_rate=0/0";
+        let fps = parse_fps(report).unwrap();
+        assert!((fps - 29.97).abs() < 0.01, "fps was {fps}");
+    }
+
+    #[test]
+    fn missing_frame_rate_is_none() {
+        let report = "\
+codec_name=h264
+codec_type=video
+avg_frame_rate=0/0";
+        assert!(parse_fps(report).is_none());
+    }
+
+    #[test]
     fn percent_decode_handles_paths_and_spaces() {
         assert_eq!(percent_decode("%2Fhome%2Fa+b.mov"), "/home/a b.mov");
+    }
+
+    // ffprobe `packet=pts_time,flags` CSV: `K` in the flags marks a keyframe.
+    #[test]
+    fn keyframe_gap_reads_dense_and_sparse_layouts() {
+        // ~1s keyframes (a transcoded file): largest gap ~1s.
+        let dense = "0.000000,K__\n0.033333,__\n1.000000,K__\n2.000000,K__\n3.000000,K__";
+        assert!((max_keyframe_gap(dense).unwrap() - 1.0).abs() < 1e-6);
+
+        // ~8s keyframes (a passthrough camera recording) with a scene-cut keyframe:
+        // the max gap is what matters, not the close pair.
+        let sparse = "0.000000,K__\n1.566667,K__\n9.900000,K__";
+        assert!((max_keyframe_gap(sparse).unwrap() - 8.333333).abs() < 1e-4);
+
+        // A single keyframe in the window → GOP at least the window → sparse.
+        assert_eq!(max_keyframe_gap("0.000000,K__\n0.033333,__"), Some(f64::INFINITY));
+
+        // No keyframe line at all → unmeasurable.
+        assert_eq!(max_keyframe_gap("0.033333,__\n0.066667,__"), None);
+    }
+
+    #[test]
+    fn density_threshold_gates_passthrough() {
+        assert!(keyframes_dense_enough(Some(1.0)));
+        assert!(keyframes_dense_enough(Some(2.0))); // exactly at the bound
+        assert!(!keyframes_dense_enough(Some(8.3))); // a sparse camera GOP
+        assert!(!keyframes_dense_enough(Some(f64::INFINITY)));
+        // Unmeasurable → assume dense (don't re-encode a file that already decodes).
+        assert!(keyframes_dense_enough(None));
     }
 
     /// End-to-end: the loopback server serves a ranged `video/mp4` body to a real
@@ -1020,6 +1353,100 @@ TAG:encoder=Lavf62.12.102";
         assert!(denied.status_line.contains("403"), "status: {}", denied.status_line);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression for issue #24: a web-playable recording with a **sparse GOP**
+    /// (the camera's native keyframe spacing) must NOT pass through — it has to be
+    /// transcoded so copy-based seeking lands within ~1s of the target instead of
+    /// snapping back a whole GOP and replaying the same scene. A dense-GOP clip of
+    /// the same codecs still passes through. Drives the real `probe()` end-to-end;
+    /// skips cleanly when the ffmpeg/ffprobe sidecars aren't reachable (cargo-test's
+    /// binary dir isn't the sidecar layout).
+    #[test]
+    fn sparse_keyframe_recording_is_not_passthrough() {
+        let (Some(ffmpeg), true) = (ensure_sidecar("ffmpeg"), ensure_sidecar("ffprobe").is_some())
+        else {
+            eprintln!("skipping sparse_keyframe_recording_is_not_passthrough: sidecars unavailable");
+            return;
+        };
+
+        // Same H.264/AAC codecs and container for both; only the keyframe spacing
+        // differs — sparse (~10s GOP) vs dense (~1s forced keyframes).
+        let dir = std::env::temp_dir();
+        let sparse = dir.join("voloph-sparse-probe-test.mp4");
+        let dense = dir.join("voloph-dense-probe-test.mp4");
+        let encode = |out: &Path, key_args: &[&str]| {
+            let mut cmd = std::process::Command::new(&ffmpeg);
+            cmd.args([
+                "-v", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=192x108:rate=30:duration=12",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+                "-c:v", "libx264", "-preset", "ultrafast",
+            ])
+            .args(key_args)
+            .args(["-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", "-f", "mp4"])
+            .arg(out)
+            .stdin(Stdio::null());
+            matches!(cmd.status(), Ok(s) if s.success())
+        };
+        let sparse_ok = encode(&sparse, &["-g", "300", "-keyint_min", "300", "-sc_threshold", "0"]);
+        let dense_ok = encode(&dense, &["-force_key_frames", "expr:gte(t,n_forced*1)"]);
+        if !sparse_ok || !dense_ok {
+            let _ = std::fs::remove_file(&sparse);
+            let _ = std::fs::remove_file(&dense);
+            eprintln!("skipping sparse_keyframe_recording_is_not_passthrough: fixture encode failed");
+            return;
+        }
+
+        let sparse_probe = probe(sparse.to_str().unwrap()).unwrap();
+        let dense_probe = probe(dense.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&sparse);
+        let _ = std::fs::remove_file(&dense);
+
+        assert!(
+            !sparse_probe.passthrough,
+            "a ~10s-GOP web-playable recording must be transcoded for dense keyframes (issue #24)"
+        );
+        assert!(
+            dense_probe.passthrough,
+            "a ~1s-GOP web-playable recording should play directly"
+        );
+    }
+
+    /// True if `bin` runs (`-version` exits 0).
+    fn sidecar_runs(bin: &Path) -> bool {
+        std::process::Command::new(bin)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Ensure the named sidecar (`ffmpeg`/`ffprobe`) is reachable where the
+    /// server's `sidecar_path` looks (beside the running binary) and return that
+    /// path. Under `cargo test` the binary's dir has no sidecar, so locate a real
+    /// one among the binary's ancestor dirs (the dev/Tauri layout copies them to
+    /// `target/debug`) and copy it into the sidecar slot. Returns `None` — so tests
+    /// skip — when none is found, rather than failing in a bare environment.
+    fn ensure_sidecar(name: &str) -> Option<PathBuf> {
+        let sidecar = std::env::current_exe().ok()?.parent()?.join(name);
+        if sidecar_runs(&sidecar) {
+            return Some(sidecar);
+        }
+        let exe = std::env::current_exe().ok()?;
+        let source = exe.ancestors().find_map(|dir| {
+            for candidate_name in [name.to_string(), format!("{name}-x86_64-unknown-linux-gnu")] {
+                let cand = dir.join(&candidate_name);
+                if cand != sidecar && sidecar_runs(&cand) {
+                    return Some(cand);
+                }
+            }
+            None
+        })?;
+        std::fs::copy(&source, &sidecar).ok()?;
+        sidecar_runs(&sidecar).then_some(sidecar)
     }
 
     struct HttpResponse {
