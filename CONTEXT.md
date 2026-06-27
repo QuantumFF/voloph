@@ -13,7 +13,7 @@ A single raw video file as it came off the camera, attached to a session. May co
 _Avoid_: VOD, video, clip, game, match
 
 **Transcode** (codec normalization):
-Re-encoding a recording the webview cannot decode natively (e.g. iPhone HEVC) to web-playable H.264/AAC, **in place** — the new file replaces the original at its path and the source codec is discarded (see ADR 0005). The container metadata — the camera's creation date, make/model and the like — is carried across the rewrite, so only the codec is lost, not the recording's identity. Done once in the background at import; a recording already in a playable codec is never transcoded. Distinct from **export**, which renders a *new* file from a selection of rallies and never touches the recording.
+Re-encoding a recording the webview cannot decode natively (e.g. iPhone HEVC) to web-playable H.264/AAC, **in place** — the new file replaces the original at its path and the source codec is discarded (see ADR 0005). The container metadata — the camera's creation date, make/model and the like — is carried across the rewrite, so only the codec is lost, not the recording's identity. Done once in the background at import; a recording already in a playable codec is never transcoded. Uses the host's fastest usable encoder — GPU (NVENC/VAAPI) where present, software libx264 otherwise, chosen by a one-time probe and falling back safely (see ADR 0005). Distinct from **export**, which renders a *new* file from a selection of rallies and never touches the recording.
 _Avoid_: proxy, cache, copy (there is no second copy), preview, lower-res copy
 
 **Rally**:
