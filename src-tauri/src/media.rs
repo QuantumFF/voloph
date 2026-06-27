@@ -101,6 +101,7 @@ fn handle_request(request: Request, token: &str) {
     let mut path = None;
     let mut supplied_token = None;
     let mut t = None;
+    let mut frame = false;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
@@ -110,6 +111,7 @@ fn handle_request(request: Request, token: &str) {
             "path" => path = Some(decoded),
             "token" => supplied_token = Some(decoded),
             "t" => t = Some(decoded),
+            "frame" => frame = decoded == "1",
             _ => {}
         }
     }
@@ -121,14 +123,27 @@ fn handle_request(request: Request, token: &str) {
         return respond_error(request, 400, "missing `path` query parameter");
     };
 
+    let t_secs = t.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
+    // `frame=1` asks for a single still decoded at exactly `t`: frame-step can't
+    // nudge the `<video>` by writing `currentTime` (dropped on this WebKitGTK
+    // build — issue #24 / ADR 0007), so the player overlays this exact JPEG over
+    // the paused video instead. Checked before the stream/file split so the
+    // first-frame case (`t == 0`) still decodes a frame rather than serving the
+    // whole file.
+    if frame {
+        return serve_frame_at(request, &path, t_secs.max(0.0));
+    }
+
     // A positive `t` (seconds) means "open already positioned here": GStreamer
     // seeking is unreliable on this WebKitGTK build (issue #24), so the frontend
     // reloads the `<video>` at a `&t=` URL instead of writing `currentTime`. We
     // hand back a fragmented MP4 that begins at the keyframe ≤ `t`, so the webview
     // never issues a seek. `t == 0` (or absent) is the plain whole-file path.
-    match t.and_then(|s| s.parse::<f64>().ok()).filter(|v| *v > 0.0) {
-        Some(t_secs) => serve_stream_at(request, &path, t_secs),
-        None => serve_file(request, &path),
+    if t_secs > 0.0 {
+        serve_stream_at(request, &path, t_secs);
+    } else {
+        serve_file(request, &path);
     }
 }
 
@@ -268,6 +283,56 @@ fn serve_stream_at(request: Request, path: &str, t_secs: f64) {
         ],
         stream,
         None,
+        None,
+    );
+    let _ = request.respond(response);
+}
+
+/// Serve a single still frame as a JPEG, decoded at exactly `t_secs`. Frame-step
+/// (issue #19) can't advance the `<video>` a frame by writing `currentTime` —
+/// this WebKitGTK build silently drops those seeks (issue #24 / ADR 0007) — so
+/// the player overlays this exact still over the paused video instead. `-ss`
+/// before `-i` seeks to the keyframe ≤ `t` and decodes forward to the exact
+/// frame, so the JPEG is frame-accurate (unlike the `-c copy` `&t=` stream, which
+/// can only start on a keyframe). It is a single-frame decode of one GOP — small
+/// because every recording is kept at ~1s keyframes at rest (ADR 0005) — so the
+/// per-step cost is modest. Unlike the stream, the whole JPEG is buffered (it is
+/// tiny and its length must be known) rather than piped.
+fn serve_frame_at(request: Request, path: &str, t_secs: f64) {
+    let output = Command::new(sidecar_path("ffmpeg"))
+        .args([
+            "-v", "error", "-nostats",
+            "-ss", &format!("{t_secs}"),
+            "-i", path,
+            "-frames:v", "1",
+            "-an", // no audio in a still
+            "-c:v", "mjpeg",
+            "-q:v", "3", // visually lossless enough for frame inspection, still small
+            "-f", "mjpeg",
+            "pipe:1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => return respond_error(request, 500, &format!("could not start ffmpeg: {e}")),
+    };
+    if !output.status.success() || output.stdout.is_empty() {
+        return respond_error(request, 500, "could not decode frame");
+    }
+    let len = output.stdout.len();
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            header("Content-Type", "image/jpeg"),
+            // A stepped frame is never the same URL twice in a row anyway, but be
+            // explicit: the webview must not serve a stale still for a position.
+            header("Cache-Control", "no-store"),
+        ],
+        std::io::Cursor::new(output.stdout),
+        Some(len),
         None,
     );
     let _ = request.respond(response);

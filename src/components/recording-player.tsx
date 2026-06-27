@@ -366,6 +366,24 @@ export function RecordingPlayer({
   // cheat-sheet overlay. `fps` is the probed frame rate (for exact frame-step),
   // defaulting to DEFAULT_FPS until resolve_playback supplies it.
   const [fps, setFps] = useState(DEFAULT_FPS)
+  // Frame-step still (issue #19): the exact frame served as a JPEG and overlaid
+  // over the paused video, because this WebKitGTK build drops the `currentTime`
+  // write a frame nudge would need (issue #24 / ADR 0007). Null means not
+  // frame-stepping. `frameStepMsRef` accumulates the target recording-local ms
+  // synchronously so holding `,`/`.` doesn't lose steps to React state batching;
+  // null means the next step seeds afresh from the live position.
+  const [frameStill, setFrameStill] = useState<string | null>(null)
+  const frameStepMsRef = useRef<number | null>(null)
+  // Stills are preloaded and the visible <img> swapped only once decoded, so a
+  // step never flashes black (a not-yet-loaded <img>) and never starves: while one
+  // still decodes, only the latest wanted URL is kept (`framePendingRef`) and
+  // fetched when the in-flight one lands, so holding `,`/`.` advances as fast as
+  // the server can decode instead of superseding every request before it finishes.
+  // `frameGenRef` invalidates in-flight loads when frame-step is left, so a late
+  // still never paints over resumed playback.
+  const frameLoadingRef = useRef(false)
+  const framePendingRef = useRef<string | null>(null)
+  const frameGenRef = useRef(0)
   const [paused, setPaused] = useState(true)
   const [muted, setMuted] = useState(false)
   const [speedIndex, setSpeedIndex] = useState(DEFAULT_SPEED_INDEX)
@@ -393,6 +411,18 @@ export function RecordingPlayer({
     return url.toString()
   }, [])
 
+  // Build the still-frame URL for a recording-local time (ms): one exact JPEG the
+  // server decodes at `t`, which the player overlays while frame-stepping. Goes
+  // through the same `/play` route with `frame=1` (issue #24 drops `currentTime`
+  // seeks, so a frame nudge can't move the `<video>`; ADR 0007). `t == 0` is a
+  // valid frame here (unlike `urlAt`, where it means the whole-file head).
+  const urlAtFrame = useCallback((base: string, ms: number) => {
+    const url = new URL(base)
+    url.searchParams.set("t", (Math.max(0, ms) / 1000).toString())
+    url.searchParams.set("frame", "1")
+    return url.toString()
+  }, [])
+
   // The visible `<video>` element (the live load), for transport actions.
   const liveVideo = useCallback(
     () =>
@@ -412,6 +442,10 @@ export function RecordingPlayer({
     setIncoming(null)
     setLoading(false)
     setPaused(false)
+    // A frame-step still (if any) is held until here so the swap is seamless: the
+    // promoted element is already showing the right frame, so dropping the still
+    // never flashes the pre-step held frame underneath (issue #24).
+    setFrameStill(null)
   }, [])
 
   // Load a recording's head into the buffer whenever it resolves (or changes):
@@ -472,6 +506,11 @@ export function RecordingPlayer({
     seekBaseMsRef.current = 0
     seekingRef.current = false
     liveRef.current = null
+    frameStepMsRef.current = null
+    framePendingRef.current = null
+    frameLoadingRef.current = false
+    frameGenRef.current += 1
+    setFrameStill(null)
     setLive(null)
     setIncoming(null)
     setLoading(true)
@@ -546,6 +585,50 @@ export function RecordingPlayer({
       .catch(() => {})
   }, [])
 
+  // Leave frame-step mode: stop accumulating, drop any pending fetch, and bump the
+  // generation so an in-flight still-decode that lands later is ignored (it must
+  // not paint over resumed playback or a normal seek). The visible still overlay
+  // is *not* cleared here — `promote` drops it once the reloaded stream shows the
+  // matching frame, so the swap is seamless.
+  const exitFrameStep = useCallback(() => {
+    frameStepMsRef.current = null
+    framePendingRef.current = null
+    frameLoadingRef.current = false
+    frameGenRef.current += 1
+  }, [])
+
+  // Show a still by URL, preloading it before swapping the visible <img>: the
+  // browser caches the decode, so setting `frameStill` paints instantly (no black
+  // gap) and the previous frame stays up until the next is ready. Requests are
+  // coalesced — while one decodes, later asks only update the pending target — so
+  // holding `,`/`.` doesn't starve. A load that finishes after frame-step is left
+  // (generation changed) is discarded.
+  const showFrameStill = useCallback((url: string) => {
+    if (frameLoadingRef.current) {
+      framePendingRef.current = url
+      return
+    }
+    const load = (target: string) => {
+      frameLoadingRef.current = true
+      const gen = frameGenRef.current
+      const img = new Image()
+      const done = () => {
+        frameLoadingRef.current = false
+        if (gen !== frameGenRef.current) return
+        const pending = framePendingRef.current
+        framePendingRef.current = null
+        if (pending && pending !== target) load(pending)
+      }
+      img.onload = () => {
+        if (gen === frameGenRef.current) setFrameStill(target)
+        done()
+      }
+      img.onerror = done
+      img.src = target
+    }
+    load(url)
+  }, [])
+
   // Seek to a recording-local position (ms) by loading a `&t=` stream positioned
   // there into the incoming buffer, rather than writing `currentTime` — this
   // WebKitGTK build silently drops `currentTime` seeks (issue #24). The live
@@ -558,6 +641,11 @@ export function RecordingPlayer({
     (ms: number) => {
       if (!src) return
       const target = Math.max(0, Math.round(ms))
+      // Any seek leaves frame-step mode. The still overlay is left up until the
+      // reloaded stream is promoted (it covers the held pre-seek frame); the
+      // accumulator and in-flight fetch are dropped so the next `,`/`.` reseeds
+      // from here and no late still paints over the seek (issue #19).
+      exitFrameStep()
       // Freeze the visible frame: a paused `<video>` holds its current frame.
       liveVideo()?.pause()
       seekBaseMsRef.current = target
@@ -567,7 +655,7 @@ export function RecordingPlayer({
       loadIdRef.current += 1
       setIncoming({ id: loadIdRef.current, src: urlAt(src, target) })
     },
-    [src, liveVideo, urlAt]
+    [src, liveVideo, urlAt, exitFrameStep]
   )
 
   // Rallies for the current recording, ascending by start (sorted by
@@ -818,11 +906,19 @@ export function RecordingPlayer({
   // --- Transport (issue #19): the custom bar and keymap drive these. ---
 
   const togglePlay = useCallback(() => {
+    // Resuming out of frame-step: the live stream is still parked at the pre-step
+    // position (frame-stepping only overlaid stills, never moved the video), so
+    // reopen it at the stepped frame rather than playing from where it froze.
+    // `seekTo` clears the accumulator and autoplays the reloaded stream.
+    if (frameStepMsRef.current != null) {
+      seekTo(frameStepMsRef.current)
+      return
+    }
     const media = liveVideo()
     if (!media) return
     if (media.paused) void media.play()
     else media.pause()
-  }, [liveVideo])
+  }, [liveVideo, seekTo])
 
   const toggleMute = useCallback(() => setMuted((m) => !m), [])
 
@@ -847,23 +943,31 @@ export function RecordingPlayer({
     [globalPlayheadMs, seekSession]
   )
 
-  // Exact frame-step (issue #19): pause, then nudge by one frame using the probed
-  // fps. This stays a *direct* `currentTime` write rather than a `&t=` reload
-  // (issue #24) — reloading a whole stream per single frame would be absurd, and
-  // a paused one-frame nudge is the case least likely to hit the seek-drop bug.
-  // Stream `currentTime` is recording-local minus the seek base, so the displayed
-  // playhead adds the base back.
+  // Exact frame-step (issue #19): pause and show the neighbouring frame as a still
+  // overlaid on the paused video. A direct `currentTime` nudge is silently dropped
+  // on this WebKitGTK build (issue #24 / ADR 0007) — the video stays frozen while
+  // the playhead moves — so instead the server decodes the exact frame at the
+  // target time (`frame=1`) and we overlay that JPEG. The target accumulates in a
+  // ref (seeded once from the true live position) so holding `,`/`.` steps frame
+  // by frame without waiting on a React state round-trip; `currentMs` follows so
+  // the playhead tracks the still. Resuming play reopens the stream there
+  // (`togglePlay`), so the overlay is only ever shown while paused.
   const frameStep = useCallback(
     (dir: -1 | 1) => {
+      if (!src) return
       const media = liveVideo()
-      if (!media) return
-      media.pause()
-      const frame = 1 / (fps > 0 ? fps : DEFAULT_FPS)
-      const next = Math.max(0, media.currentTime + dir * frame)
-      media.currentTime = next
-      setCurrentMs(seekBaseMsRef.current + next * 1000)
+      media?.pause()
+      const frameMs = 1000 / (fps > 0 ? fps : DEFAULT_FPS)
+      const base =
+        frameStepMsRef.current ??
+        (media ? seekBaseMsRef.current + media.currentTime * 1000 : currentMs)
+      const max = timeline?.duration_ms ?? Number.MAX_SAFE_INTEGER
+      const target = clamp(base + dir * frameMs, 0, max)
+      frameStepMsRef.current = target
+      setCurrentMs(target)
+      showFrameStill(urlAtFrame(src, target))
     },
-    [fps, liveVideo]
+    [src, fps, liveVideo, currentMs, timeline, urlAtFrame, showFrameStill]
   )
 
   // When the current recording ends naturally (no later rally triggered a skip,
@@ -1282,6 +1386,22 @@ export function RecordingPlayer({
                 />
               )
             })}
+            {/* Frame-step still (issue #19): the exact frame as a JPEG, overlaid
+                over the paused video because a `currentTime` nudge is dropped on
+                this build (issue #24 / ADR 0007). `object-contain` letterboxes it
+                like the video; no background, so the brief moment before a swap
+                shows the video underneath, never black (the still is only set once
+                preloaded — `showFrameStill`). `pointer-events-none` so a click
+                still reaches the video's `onClick` (resume). Held until the
+                reloaded stream is promoted on resume, so no flash. */}
+            {frameStill ? (
+              <img
+                src={frameStill}
+                alt=""
+                draggable={false}
+                className="pointer-events-none absolute inset-0 size-full rounded-lg object-contain select-none"
+              />
+            ) : null}
             {/* Spinner over the held frame while the (re)load hasn't rendered, so
                 a seek reads as "loading the next position", not a frozen app. */}
             {loading ? (
