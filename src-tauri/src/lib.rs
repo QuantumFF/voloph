@@ -413,6 +413,20 @@ fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's DMA-BUF renderer is broken on the NVIDIA proprietary driver
+    // under Wayland: GPU-composited frames lose their pacing, so continuous CSS
+    // animations (e.g. the "Converting…"/"Analyzing…" spinners) visibly stutter.
+    // Forcing the renderer off restores smooth frame pacing. Gated on the nvidia
+    // kernel module being loaded so Intel/AMD users keep the accelerated path,
+    // and skipped if the user already set the variable themselves. Must run
+    // before any GTK/WebKit thread starts, hence the very top of run().
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+        && std::path::Path::new("/sys/module/nvidia").exists()
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
