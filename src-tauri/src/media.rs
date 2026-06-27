@@ -353,6 +353,75 @@ pub fn probe(path: &str) -> Result<Probe, String> {
     })
 }
 
+/// The capture date a recording carries in its container metadata. Both fields
+/// are the raw tag values (ISO-8601-ish strings) when present, so the caller
+/// decides precedence and parsing. Empty when the recording carries neither tag.
+#[derive(Debug, Default, PartialEq)]
+pub struct CaptureDate {
+    /// `com.apple.quicktime.creationdate` — local wall-clock time **with** the
+    /// camera's UTC offset (e.g. `2024-03-15T21:30:00+0800`). iPhone footage. The
+    /// best source for "which day did the player record on": its date portion is
+    /// already the local day, so a late-evening session does not roll into the
+    /// next day the way a UTC timestamp would.
+    pub quicktime_creationdate: Option<String>,
+    /// `creation_time` — ISO-8601 in **UTC** (e.g. `2024-03-15T13:30:00.000000Z`).
+    /// Present on most cameras. Grouped by its UTC day when the offset-bearing tag
+    /// above is absent.
+    pub creation_time: Option<String>,
+}
+
+/// Read a recording's container capture-date tags with the `ffprobe` sidecar.
+/// Errors only when ffprobe cannot run or read the file at all; a file that
+/// simply carries no date tags yields an empty [`CaptureDate`], not an error, so
+/// the caller falls back to the file's mtime rather than retrying forever.
+pub fn probe_capture_date(path: &str) -> Result<CaptureDate, String> {
+    let output = Command::new(sidecar_path("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags=creation_time,com.apple.quicktime.creationdate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=0",
+            path,
+        ])
+        .output()
+        .map_err(|e| format!("ffprobe could not run: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe could not read the file: {stderr}"));
+    }
+
+    Ok(parse_capture_date(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parse the capture-date tags out of an ffprobe `format_tags` report. ffprobe
+/// prints each tag as `TAG:<key>=<value>`; we pick out the two date keys and
+/// ignore the rest. Split out from [`probe_capture_date`] so the parsing is
+/// unit-testable without invoking the sidecar.
+fn parse_capture_date(report: &str) -> CaptureDate {
+    let mut date = CaptureDate::default();
+    for line in report.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.strip_prefix("TAG:").unwrap_or(key).trim();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "com.apple.quicktime.creationdate" => {
+                date.quicktime_creationdate = Some(value.to_string());
+            }
+            "creation_time" => date.creation_time = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    date
+}
+
 /// Decide whether an ffprobe report describes a source the webview can play
 /// directly: an mp4/mov-family container carrying H.264 video and, if present,
 /// AAC audio. Anything else (HEVC, AV1, mkv, AC-3 audio, …) needs transcoding.
@@ -420,26 +489,7 @@ pub fn transcode_in_place(path: &str) -> Result<(), String> {
     let temp = parent.join(format!(".{file_name}.voloph-transcoding.tmp"));
 
     let output = Command::new(sidecar_path("ffmpeg"))
-        .args([
-            "-v",
-            "error",
-            "-nostats",
-            "-y",
-            "-i",
-            path,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-        ])
+        .args(transcode_args(path))
         .arg(&temp)
         .stdin(Stdio::null())
         .output()
@@ -456,6 +506,48 @@ pub fn transcode_in_place(path: &str) -> Result<(), String> {
         format!("could not replace original with transcode: {e}")
     })?;
     Ok(())
+}
+
+/// The ffmpeg arguments that transcode `path` to web-playable H.264/AAC,
+/// **preserving the source's metadata** across the rewrite — everything except
+/// the output temp file, which the caller appends.
+///
+/// A QuickTime recording (iPhone footage) carries a "Create Date", camera
+/// make/model, GPS and similar tags. ffmpeg silently drops most of these on a
+/// mov→mp4 rewrite unless told to keep them (issue #25), which matters because
+/// the recording is replaced in place (ADR 0005) — once the transcode lands the
+/// original metadata is gone for good, including the capture date the app means
+/// to group sessions by. Two flags together preserve it:
+///   * `-map_metadata 0` keeps recognized tags such as `creation_time`, which
+///     the mp4 muxer otherwise blanks (writing `0000-00-00`) rather than copying.
+///   * `+use_metadata_tags` keeps arbitrary/unrecognized tags (make, model, …)
+///     that the muxer would otherwise discard as not part of its known set.
+///
+/// `+faststart` still moves the moov atom to the front for instant playback.
+/// `-f mp4` forces the muxer since the temp file's `.tmp` extension can't.
+fn transcode_args(path: &str) -> [&str; 20] {
+    [
+        "-v",
+        "error",
+        "-nostats",
+        "-y",
+        "-i",
+        path,
+        "-map_metadata",
+        "0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart+use_metadata_tags",
+        "-f",
+        "mp4",
+    ]
 }
 
 /// Minimal percent-decoding for query values (avoids a url-crate dependency).
@@ -492,7 +584,7 @@ fn percent_decode(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_web_playable, percent_decode, start};
+    use super::{is_web_playable, parse_capture_date, percent_decode, start, transcode_args, CaptureDate};
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -545,6 +637,67 @@ codec_name=ac3
 codec_type=audio
 format_name=mov,mp4,m4a,3gp,3g2,mj2";
         assert!(!is_web_playable(report));
+    }
+
+    /// The transcode must carry the source's metadata across the in-place
+    /// rewrite (issue #25): without `-map_metadata 0` ffmpeg blanks the
+    /// "Create Date" on a mov→mp4 transcode, and without `use_metadata_tags`
+    /// it drops camera make/model and similar tags. Both were verified to
+    /// actually preserve the tags end-to-end against the ffmpeg sidecar; this
+    /// guards against either flag being silently dropped from the invocation.
+    #[test]
+    fn transcode_preserves_source_metadata() {
+        let args = transcode_args("/in.mov");
+        let metadata_idx = args.iter().position(|a| *a == "-map_metadata");
+        assert_eq!(
+            metadata_idx.and_then(|i| args.get(i + 1)).copied(),
+            Some("0"),
+            "transcode must pass `-map_metadata 0` to keep creation_time"
+        );
+        let movflags_idx = args.iter().position(|a| *a == "-movflags");
+        let movflags = movflags_idx
+            .and_then(|i| args.get(i + 1))
+            .copied()
+            .unwrap_or("");
+        assert!(
+            movflags.contains("use_metadata_tags"),
+            "transcode must pass `use_metadata_tags` to keep make/model/etc., got `{movflags}`"
+        );
+        // The metadata flags must not have cost us the things that make the
+        // file playable: still H.264/AAC, still faststart, still forced mp4.
+        assert!(movflags.contains("faststart"), "lost +faststart");
+        assert!(args.contains(&"libx264") && args.contains(&"aac"), "lost codecs");
+        assert!(
+            args.windows(2).any(|w| w == ["-f", "mp4"]),
+            "lost forced mp4 muxer (temp file has no usable extension)"
+        );
+    }
+
+    /// ffprobe prints date tags as `TAG:<key>=<value>`; the parser must pull both
+    /// the offset-bearing Apple tag (as real iPhone footage carries it) and the
+    /// generic UTC `creation_time`, ignoring unrelated tags.
+    #[test]
+    fn parses_both_capture_date_tags() {
+        let report = "\
+TAG:major_brand=qt
+TAG:creation_time=2024-03-15T13:30:00.000000Z
+TAG:com.apple.quicktime.creationdate=2024-03-15T21:30:00+0800
+TAG:encoder=Lavf62.12.102";
+        assert_eq!(
+            parse_capture_date(report),
+            CaptureDate {
+                quicktime_creationdate: Some("2024-03-15T21:30:00+0800".to_string()),
+                creation_time: Some("2024-03-15T13:30:00.000000Z".to_string()),
+            }
+        );
+    }
+
+    /// A recording with no date tags parses to an empty result (caller falls back
+    /// to mtime), not an error.
+    #[test]
+    fn parses_missing_capture_date_as_empty() {
+        let report = "TAG:major_brand=isom\nTAG:encoder=Lavf62.12.102";
+        assert_eq!(parse_capture_date(report), CaptureDate::default());
     }
 
     #[test]
