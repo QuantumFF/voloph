@@ -120,6 +120,68 @@ fn reanalyze_recording(app: AppHandle, db: State<'_, Db>, path: String) -> Resul
     Ok(())
 }
 
+/// Re-walk every folder a previous scan registered, picking up recordings added
+/// to them since (see [`db::scanned_folders`]). Idempotent like a fresh scan, and
+/// kicks off background media work for anything new. Backs the Refresh action.
+#[tauri::command]
+fn rescan_folders(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanResult, String> {
+    let result = {
+        let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+        let folders = db::scanned_folders(&conn).map_err(|e| e.to_string())?;
+        let mut total = db::ScanResult {
+            registered: 0,
+            skipped: 0,
+        };
+        for folder in folders {
+            let r = db::scan_folder(&mut conn, std::path::Path::new(&folder))
+                .map_err(|e| e.to_string())?;
+            total.registered += r.registered;
+            total.skipped += r.skipped;
+        }
+        total
+    };
+    spawn_media_worker(&app);
+    Ok(result)
+}
+
+/// Re-transcode the recording at `path`: return it to the start of the transcode
+/// lifecycle so the media worker re-probes and re-encodes it in place (ADR 0005).
+#[tauri::command]
+fn retranscode_recording(app: AppHandle, db: State<'_, Db>, path: String) -> Result<(), String> {
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::reset_transcode(&conn, &path).map_err(|e| e.to_string())?;
+    }
+    spawn_media_worker(&app);
+    Ok(())
+}
+
+/// Re-transcode every recording (ADR 0005) — the bulk counterpart of
+/// [`retranscode_recording`], for re-running a changed transcode across the
+/// library at once.
+#[tauri::command]
+fn retranscode_all(app: AppHandle, db: State<'_, Db>) -> Result<(), String> {
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::reset_all_transcodes(&conn).map_err(|e| e.to_string())?;
+    }
+    spawn_media_worker(&app);
+    Ok(())
+}
+
+/// Re-analyze every recording (ADR 0002) — the bulk counterpart of
+/// [`reanalyze_recording`], for re-segmenting the whole library after a segmenter
+/// change. Discards manual corrections, as a re-analyze does.
+#[tauri::command]
+fn reanalyze_all(app: AppHandle, db: State<'_, Db>) -> Result<(), String> {
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::reset_all_segmentation(&conn).map_err(|e| e.to_string())?;
+    }
+    spawn_media_worker(&app);
+    Ok(())
+}
+
 /// Move a rally's boundaries in the draft timeline (issue #7). Backs the
 /// adjust-boundary correction directly, and the split and merge corrections
 /// indirectly (the frontend composes those from update + add/delete). Persists
@@ -393,6 +455,10 @@ pub fn run() {
             resolve_playback,
             recording_timeline,
             reanalyze_recording,
+            rescan_folders,
+            retranscode_recording,
+            retranscode_all,
+            reanalyze_all,
             update_rally,
             add_rally,
             delete_rally,
