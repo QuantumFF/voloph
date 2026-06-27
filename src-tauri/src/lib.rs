@@ -66,9 +66,6 @@ struct PlaybackSource {
     /// transcode is still in progress (the player should wait rather than load
     /// the as-yet-undecodable original); `failed` is an error.
     state: String,
-    /// Probed frame rate (issue #19) so the player can frame-step exactly, even
-    /// before segmentation. `null` when unknown; the player defaults to 30 fps.
-    fps: Option<f64>,
 }
 
 /// Resolve how to play the recording at `path`. When `ready` the file is
@@ -77,16 +74,13 @@ struct PlaybackSource {
 /// would not decode in the webview, so the frontend waits on the state instead.
 #[tauri::command]
 fn resolve_playback(db: State<'_, Db>, path: String) -> Result<PlaybackSource, String> {
-    let (state, fps) = {
+    let state = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let state = db::recording_transcode_state(&conn, &path).map_err(|e| e.to_string())?;
-        let fps = db::recording_fps(&conn, &path).map_err(|e| e.to_string())?;
-        (state, fps)
+        db::recording_transcode_state(&conn, &path).map_err(|e| e.to_string())?
     };
     Ok(PlaybackSource {
         // Not registered (e.g. played straight from a dialog) — assume playable.
         state: state.unwrap_or_else(|| "ready".to_string()),
-        fps,
         path,
     })
 }
@@ -205,25 +199,15 @@ fn run_media_worker(conn: &Mutex<Connection>) {
         match work {
             db::MediaWork::CaptureDate(id, path) => refine_recording_date(conn, id, &path),
             db::MediaWork::Probe(id, path) => {
-                let (next, fps) = match media::probe(&path) {
-                    Ok(probe) => (
-                        if probe.passthrough {
-                            "ready"
-                        } else {
-                            "pending"
-                        },
-                        probe.fps,
-                    ),
+                let next = match media::probe(&path) {
+                    Ok(probe) if probe.passthrough => "ready",
+                    Ok(_) => "pending",
                     Err(e) => {
                         log::warn!("media worker: probe failed for {path}: {e}");
-                        ("failed", None)
+                        "failed"
                     }
                 };
-                if let Ok(c) = conn.lock() {
-                    if let Err(e) = db::set_probe_result(&c, id, next, fps) {
-                        log::error!("media worker: could not record probe for {path}: {e}");
-                    }
-                }
+                set_transcode_state(conn, id, next, &path);
             }
             db::MediaWork::Transcode(id, path) => match media::transcode_in_place(&path) {
                 Ok(()) => {
