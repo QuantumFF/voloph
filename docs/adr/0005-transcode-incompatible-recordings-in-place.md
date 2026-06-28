@@ -1,5 +1,11 @@
 # Transcode web-incompatible recordings in place
 
+> **Status: superseded by ADR 0008.** Playback moved from the webview `<video>`
+> to embedded libmpv, which decodes any codec and seeks sparse GOPs natively — so
+> the import transcode (both codec normalization and the dense-keyframe re-encode)
+> is eliminated and originals are never modified. The history below is retained
+> for context.
+
 Recordings the webview cannot decode (notably iPhone HEVC, which WebKitGTK refuses) are made playable by transcoding them **once, in place, to H.264/AAC**: the transcoded file replaces the original at its existing path and the source codec is discarded. A recording already in a web-playable codec (H.264/AAC in an mp4/mov container) is left untouched **only if its keyframes are also dense enough for copy-based seeking** — one whose native GOP is too sparse is likewise transcoded, for the dense keyframes alone (issue #24, ADR 0007). There is never a second copy of a recording.
 
 Chosen over keeping a separate cached proxy alongside the untouched original (the approach this supersedes) because a proxy means storing two near-identical copies of a multi-gigabyte recording — the original the webview can't use and the transcode it can. For footage imported specifically to be reviewed in this app, the original codec carries no further value once a seekable H.264/AAC version exists, so paying double the disk to retain it is waste, not safety. A single in-place file keeps the reference-in-place model (the recording stays at its path, merely re-encoded) and gives the seek-dominated review loop a complete, frame-accurate, known-duration file.
