@@ -16,15 +16,16 @@ pub struct Recording {
     pub file_size: i64,
     pub quick_hash: String,
     pub capture_day: String,
-    /// Transcode lifecycle (see ADR 0005): `unknown` (not yet probed), `pending`
-    /// (web-incompatible, transcode queued/in progress), `ready` (playable —
-    /// either already web-playable or transcoded in place), or `failed`
-    /// (probe/transcode error).
+    /// Playability lifecycle: `unknown` (not yet probed), `ready` (probed — the
+    /// frame rate is captured and libmpv can play the original directly, ADR
+    /// 0008), or `failed` (probe could not read the file). The column keeps its
+    /// historical `transcode_state` name; there is no longer a transcode step
+    /// (ADR 0005 superseded), so it never holds `pending`.
     pub transcode_state: String,
     /// Segmentation lifecycle (ADR 0002): `unknown` (not yet segmented or
     /// queued), `ready` (draft timeline produced), or `failed` (audio
     /// extraction / segmentation error). Only starts once `transcode_state` is
-    /// `ready`, so it always runs against the final, playable bytes.
+    /// `ready` (i.e. the recording has been probed).
     pub segment_state: String,
     /// Recording duration in milliseconds, learned during segmentation. `None`
     /// until segmented; the player uses it to lay rallies out over the timeline.
@@ -113,24 +114,6 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // unknown. The in-place transcode does not resample fps, so the probed value
     // stays valid afterward.
     let _ = conn.execute("ALTER TABLE recordings ADD COLUMN fps REAL", []);
-
-    // One-time reprocess for issue #24. Recordings imported before keyframe-density
-    // gating were passed straight through whenever their codecs were web-playable,
-    // keeping the camera's native GOP (often many seconds). Copy-based seeking
-    // snaps to the keyframe ≤ the target, so on those files a short arrow-key seek
-    // landed a whole GOP off and replayed the same scene. Re-probe every recording
-    // that was marked playable so the media worker re-evaluates it with the new
-    // density check and transcodes the sparse ones to dense keyframes (ADR 0005);
-    // an already-dense recording returns to 'ready' from a cheap re-probe. Guarded
-    // by `user_version` so it runs exactly once per database.
-    let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if schema_version < 1 {
-        conn.execute(
-            "UPDATE recordings SET transcode_state = 'unknown' WHERE transcode_state = 'ready'",
-            [],
-        )?;
-        conn.pragma_update(None, "user_version", 1)?;
-    }
     Ok(conn)
 }
 
@@ -413,30 +396,29 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
     Ok(out)
 }
 
-/// One unit of work for the background media worker, in priority order: make a
-/// recording playable first (probe, then transcode), then produce its draft
-/// timeline (segment). Segmentation is gated on `transcode_state = 'ready'` so
-/// it always runs against the final, playable bytes.
+/// One unit of work for the background media worker, in priority order: probe a
+/// recording for its frame rate (which also marks it playable), then produce its
+/// draft timeline (segment). Segmentation is gated on `transcode_state = 'ready'`
+/// so it always runs after the probe.
 #[derive(Debug, PartialEq)]
 pub enum MediaWork {
     /// Capture day not yet refined — read the camera's embedded creation date and
     /// re-home the recording's session if it differs from the provisional
     /// mtime-derived day (see [`refine_capture_day`]).
     CaptureDate(i64, String),
-    /// Web-playability not yet determined — run ffprobe (ADR 0005).
+    /// Not yet probed — run ffprobe for the frame rate and mark it playable
+    /// (issue #19; libmpv plays the original directly, ADR 0008).
     Probe(i64, String),
-    /// Web-incompatible — transcode in place (ADR 0005).
-    Transcode(i64, String),
     /// Playable but not yet segmented — extract audio and segment (ADR 0002).
     Segment(i64, String),
 }
 
 /// The next unit of background media work, lowest id first within each phase, or
-/// `None` when every recording is both playable and segmented (or has failed).
+/// `None` when every recording is both probed and segmented (or has failed).
 pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>> {
     // Phase 0: anything whose capture day is still the provisional mtime guess.
     // Runs first so a recording settles into the right session as quickly as
-    // possible; independent of the transcode/segment pipeline below.
+    // possible; independent of the probe/segment pipeline below.
     let date = conn
         .query_row(
             "SELECT id, path FROM recordings
@@ -460,19 +442,7 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     if probe.is_some() {
         return Ok(probe);
     }
-    // Phase 2: anything probed as web-incompatible, awaiting transcode.
-    let transcode = conn
-        .query_row(
-            "SELECT id, path FROM recordings
-             WHERE transcode_state = 'pending' ORDER BY id LIMIT 1",
-            [],
-            |row| Ok(MediaWork::Transcode(row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if transcode.is_some() {
-        return Ok(transcode);
-    }
-    // Phase 3: anything playable but not yet segmented.
+    // Phase 2: anything probed but not yet segmented.
     conn.query_row(
         "SELECT id, path FROM recordings
          WHERE transcode_state = 'ready' AND segment_state = 'unknown'
@@ -483,39 +453,9 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     .optional()
 }
 
-/// Return the recording at `path` to the start of the transcode lifecycle so the
-/// media worker re-probes and (if still web-incompatible) re-encodes it in place
-/// (ADR 0005). Backs the per-recording Re-transcode action. Segmentation is left
-/// untouched — the in-place transcode does not change the duration, so the
-/// existing draft timeline stays valid. A no-op when `path` is not registered.
-pub fn reset_transcode(conn: &Connection, path: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE recordings SET transcode_state = 'unknown' WHERE path = ?1",
-        [path],
-    )?;
-    Ok(())
-}
-
-/// Return every recording to the start of the transcode lifecycle — the bulk
-/// Re-transcode-all counterpart of [`reset_transcode`].
-pub fn reset_all_transcodes(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute("UPDATE recordings SET transcode_state = 'unknown'", [])?;
-    Ok(())
-}
-
-/// Advance a recording's transcode lifecycle state.
-pub fn set_transcode_state(conn: &Connection, id: i64, state: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE recordings SET transcode_state = ?1 WHERE id = ?2",
-        rusqlite::params![state, id],
-    )?;
-    Ok(())
-}
-
-/// Record a probe's outcome (issue #19): the next transcode state and the
-/// captured frame rate. fps is stored even when the recording still needs a
-/// transcode, since the in-place transcode does not resample fps (ADR 0005), so
-/// the probed value stays valid for frame-stepping.
+/// Record a probe's outcome (issue #19): the playability state (`ready` once
+/// probed, since libmpv plays the original directly — ADR 0008 — or `failed`)
+/// and the captured frame rate, which the player frame-steps by.
 pub fn set_probe_result(
     conn: &Connection,
     id: i64,
@@ -542,24 +482,9 @@ pub fn recording_fps(conn: &Connection, path: &str) -> rusqlite::Result<Option<f
     .map(|opt| opt.flatten())
 }
 
-/// Mark a recording `ready` after an in-place transcode, refreshing the stored
-/// file size and quick hash to match the new bytes on disk (ADR 0003) so the
-/// move-detection fingerprint stays valid.
-pub fn mark_transcoded(conn: &Connection, id: i64, path: &str) -> rusqlite::Result<()> {
-    let p = Path::new(path);
-    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    let hash = quick_hash(p, size).unwrap_or_default();
-    conn.execute(
-        "UPDATE recordings
-         SET file_size = ?1, quick_hash = ?2, transcode_state = 'ready'
-         WHERE id = ?3",
-        rusqlite::params![size as i64, hash, id],
-    )?;
-    Ok(())
-}
-
-/// The transcode state of the recording at `path`, used by the player to decide
-/// whether it can load the file yet. `None` when the path is not registered.
+/// The playability state of the recording at `path` (`unknown` until probed,
+/// then `ready`; `failed` if the probe could not read it), used by the player.
+/// `None` when the path is not registered.
 pub fn recording_transcode_state(
     conn: &Connection,
     path: &str,
@@ -574,8 +499,8 @@ pub fn recording_transcode_state(
 
 /// Reset a recording's draft timeline so the media worker re-segments it on its
 /// next pass: drop its rallies and return it to `unknown`. Backs the Re-analyze
-/// action used while tuning the segmenter (ADR 0002) — it re-runs segmentation
-/// without paying for another transcode. A no-op when `path` is not registered.
+/// action used while tuning the segmenter (ADR 0002). A no-op when `path` is not
+/// registered.
 pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM rallies WHERE recording_id = (SELECT id FROM recordings WHERE path = ?1)",

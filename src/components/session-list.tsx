@@ -4,7 +4,6 @@ import { useCallback, useEffect, useState } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
 import {
   AlertTriangleIcon,
-  FilmIcon,
   FolderOpenIcon,
   Loader2Icon,
   MoreVerticalIcon,
@@ -47,7 +46,11 @@ interface Recording {
   file_size: number
   quick_hash: string
   capture_day: string
-  /** Transcode lifecycle: unknown | pending | ready | failed (ADR 0005). */
+  /**
+   * Playability lifecycle: unknown (not yet probed) | ready | failed. libmpv
+   * plays originals directly (ADR 0008), so there is no transcode step; the
+   * column keeps its historical `transcode_state` name.
+   */
   transcode_state: string
   /** Segmentation lifecycle: unknown | ready | failed (ADR 0002). */
   segment_state: string
@@ -57,16 +60,16 @@ interface Recording {
   rally_count: number
 }
 
-/** True while a recording is still being probed or transcoded for playback. */
-function isTranscoding(state: string): boolean {
-  return state === "unknown" || state === "pending"
+/** True during the brief window before a recording has been probed for playback. */
+function isPreparing(state: string): boolean {
+  return state === "unknown"
 }
 
 /**
  * True while a recording is playable but its draft timeline is still being
  * produced — audio extraction + segmentation (ADR 0002). Segmentation only
- * starts once the transcode is `ready`, so a still-`unknown` segment state on a
- * ready recording means "queued or analyzing".
+ * starts once the recording is probed (`ready`), so a still-`unknown` segment
+ * state on a ready recording means "queued or analyzing".
  */
 function isAnalyzing(recording: Recording): boolean {
   return (
@@ -77,7 +80,7 @@ function isAnalyzing(recording: Recording): boolean {
 
 /** True while any background media work is still pending for this recording. */
 function isProcessing(recording: Recording): boolean {
-  return isTranscoding(recording.transcode_state) || isAnalyzing(recording)
+  return isPreparing(recording.transcode_state) || isAnalyzing(recording)
 }
 
 interface Session {
@@ -119,12 +122,9 @@ export function SessionList({ onPlay }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [scanning, setScanning] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
-  const [retranscodingAll, setRetranscodingAll] = useState(false)
   const [reanalyzingAll, setReanalyzingAll] = useState(false)
   // Which bulk action is awaiting confirmation in the dialog, if any.
-  const [confirmAction, setConfirmAction] = useState<
-    "retranscode" | "reanalyze" | null
-  >(null)
+  const [confirmAction, setConfirmAction] = useState<"reanalyze" | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
@@ -143,8 +143,8 @@ export function SessionList({ onPlay }: SessionListProps) {
     void refresh()
   }, [refresh])
 
-  // While any recording is still being transcoded or segmented in the
-  // background, poll so the row flips from "Converting…"/"Analyzing…" to its
+  // While any recording is still being prepared or segmented in the
+  // background, poll so the row flips from "Preparing…"/"Analyzing…" to its
   // rally count once the draft timeline is ready.
   useEffect(() => {
     const stillWorking = sessions.some((session) =>
@@ -186,22 +186,6 @@ export function SessionList({ onPlay }: SessionListProps) {
     }
   }
 
-  // Re-run the transcode for every recording (e.g. after a transcode change).
-  // The rows flip back to "Converting…" as the worker re-encodes them. Confirmed
-  // through the dialog first, since it can take a while across the library.
-  async function runRetranscodeAll() {
-    setError(null)
-    setRetranscodingAll(true)
-    try {
-      await trackedInvoke("retranscode_all")
-      await refresh()
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setRetranscodingAll(false)
-    }
-  }
-
   // Re-detect rallies for every recording. Discards every draft timeline,
   // including manual corrections, so it is confirmed through the dialog first.
   async function runReanalyzeAll() {
@@ -219,20 +203,8 @@ export function SessionList({ onPlay }: SessionListProps) {
 
   // Run whichever bulk action the confirmation dialog is open for, then close it.
   function handleConfirm() {
-    if (confirmAction === "retranscode") void runRetranscodeAll()
-    else if (confirmAction === "reanalyze") void runReanalyzeAll()
+    if (confirmAction === "reanalyze") void runReanalyzeAll()
     setConfirmAction(null)
-  }
-
-  // Per-recording re-transcode: return one recording to the transcode queue.
-  async function handleRetranscode(path: string) {
-    setError(null)
-    try {
-      await trackedInvoke("retranscode_recording", { path })
-      await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
   }
 
   // Per-recording re-analyze: re-run rally detection for one recording in place
@@ -248,13 +220,6 @@ export function SessionList({ onPlay }: SessionListProps) {
   }
 
   const confirmCopy = {
-    retranscode: {
-      title: "Re-transcode all recordings?",
-      description:
-        "This re-runs the transcode for every recording across the whole library. It can take a while, but does not change your draft timelines.",
-      action: "Re-transcode all",
-      destructive: false,
-    },
     reanalyze: {
       title: "Re-analyze all recordings?",
       description:
@@ -296,8 +261,8 @@ export function SessionList({ onPlay }: SessionListProps) {
       <CardHeader>
         <CardTitle>Sessions</CardTitle>
         <CardDescription>
-          Recordings grouped by capture day, referenced in place. Recordings in
-          a format the player can&apos;t handle are converted once on import.
+          Recordings grouped by capture day, referenced in place. Originals play
+          directly and are never modified.
         </CardDescription>
         <CardAction className="flex items-center gap-2">
           <Button
@@ -329,14 +294,6 @@ export function SessionList({ onPlay }: SessionListProps) {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-34">
               <DropdownMenuLabel>All recordings</DropdownMenuLabel>
-              <DropdownMenuItem
-                onClick={() => setConfirmAction("retranscode")}
-                disabled={retranscodingAll}
-                className="whitespace-nowrap"
-              >
-                <FilmIcon className="size-4" />
-                Re-transcode all
-              </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => setConfirmAction("reanalyze")}
                 disabled={reanalyzingAll}
@@ -395,18 +352,18 @@ export function SessionList({ onPlay }: SessionListProps) {
                       >
                         {fileName(recording.path)}
                       </span>
-                      {isTranscoding(recording.transcode_state) ? (
+                      {isPreparing(recording.transcode_state) ? (
                         <span
                           className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
-                          title="Converting this recording for playback…"
+                          title="Preparing this recording for playback…"
                         >
                           <Loader2Icon className="size-3.5 animate-spin" />
-                          Converting…
+                          Preparing…
                         </span>
                       ) : recording.transcode_state === "failed" ? (
                         <span
                           className="ml-auto flex shrink-0 items-center gap-1.5 text-destructive"
-                          title="This recording could not be converted for playback."
+                          title="This recording could not be read for playback."
                         >
                           <AlertTriangleIcon className="size-3.5" />
                           Failed
@@ -454,13 +411,6 @@ export function SessionList({ onPlay }: SessionListProps) {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-32">
-                        <DropdownMenuItem
-                          onClick={() => handleRetranscode(recording.path)}
-                          disabled={isTranscoding(recording.transcode_state)}
-                        >
-                          <FilmIcon className="size-4" />
-                          Re-transcode
-                        </DropdownMenuItem>
                         <DropdownMenuItem
                           onClick={() => handleReanalyze(recording.path)}
                           disabled={isProcessing(recording)}
