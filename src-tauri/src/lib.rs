@@ -25,6 +25,26 @@ mod mpv {
     pub fn mpv_show() {}
     #[tauri::command]
     pub fn mpv_hide() {}
+    #[tauri::command]
+    pub fn mpv_seek(_ms: f64) -> Result<(), String> {
+        Err("embedded playback is only available on Linux".into())
+    }
+    #[tauri::command]
+    pub fn mpv_frame_step(_forward: bool) -> Result<(), String> {
+        Err("embedded playback is only available on Linux".into())
+    }
+    #[tauri::command]
+    pub fn mpv_set_speed(_speed: f64) -> Result<(), String> {
+        Err("embedded playback is only available on Linux".into())
+    }
+    #[tauri::command]
+    pub fn mpv_set_volume(_volume: f64) -> Result<(), String> {
+        Err("embedded playback is only available on Linux".into())
+    }
+    #[tauri::command]
+    pub fn mpv_set_mute(_muted: bool) -> Result<(), String> {
+        Err("embedded playback is only available on Linux".into())
+    }
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -511,7 +531,12 @@ pub fn run() {
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,
             mpv::mpv_show,
-            mpv::mpv_hide
+            mpv::mpv_hide,
+            mpv::mpv_seek,
+            mpv::mpv_frame_step,
+            mpv::mpv_set_speed,
+            mpv::mpv_set_volume,
+            mpv::mpv_set_mute
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {
