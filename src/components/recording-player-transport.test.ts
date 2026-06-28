@@ -2,10 +2,32 @@ import { describe, expect, it } from "vitest"
 
 import {
   SPEED_LADDER,
+  buildSessionModel,
   clampVolume,
+  gapSkipAction,
+  nextRallyMs,
+  nextUncertainMs,
+  prevRallyAction,
   seekTarget,
   stepSpeedIndex,
+  type Rally,
+  type Timeline,
 } from "./recording-player-transport"
+
+/** A rally with a default-certain confidence unless overridden. */
+function rally(
+  id: number,
+  start_ms: number,
+  end_ms: number,
+  confidence = 1
+): Rally {
+  return { id, start_ms, end_ms, confidence }
+}
+
+/** A ready timeline of the given duration and rallies. */
+function timeline(duration_ms: number, rallies: Rally[]): Timeline {
+  return { segment_state: "ready", duration_ms, rallies, waveform: [] }
+}
 
 describe("stepSpeedIndex", () => {
   it("steps up and down the ladder", () => {
@@ -40,5 +62,176 @@ describe("clampVolume", () => {
     expect(clampVolume(110)).toBe(100)
     expect(clampVolume(-10)).toBe(0)
     expect(clampVolume(55)).toBe(55)
+  })
+})
+
+describe("gapSkipAction", () => {
+  const rallies = [rally(1, 1000, 2000), rally(2, 5000, 6000)]
+
+  it("does nothing with no rallies (plays straight through)", () => {
+    expect(gapSkipAction([], 1234, false, false, false)).toEqual({
+      kind: "none",
+    })
+  })
+
+  it("does nothing inside a rally", () => {
+    expect(gapSkipAction(rallies, 1500, false, false, false)).toEqual({
+      kind: "none",
+    })
+  })
+
+  it("jumps to the next rally when in a gap", () => {
+    expect(gapSkipAction(rallies, 3000, false, false, false)).toEqual({
+      kind: "seek",
+      ms: 5000,
+    })
+  })
+
+  it("jumps from the head gap to the first rally", () => {
+    expect(gapSkipAction(rallies, 0, false, false, false)).toEqual({
+      kind: "seek",
+      ms: 1000,
+    })
+  })
+
+  it("crosses into the next recording past the last rally", () => {
+    expect(gapSkipAction(rallies, 6500, false, false, false)).toEqual({
+      kind: "next-recording",
+    })
+  })
+
+  it("stops past the last rally of the last recording", () => {
+    expect(gapSkipAction(rallies, 6500, false, false, true)).toEqual({
+      kind: "stop",
+    })
+  })
+
+  it("plays a gap through under free-play", () => {
+    expect(gapSkipAction(rallies, 3000, false, true, false)).toEqual({
+      kind: "none",
+    })
+  })
+
+  it("restarts the current rally at its end when looping", () => {
+    expect(gapSkipAction(rallies, 2000, true, false, false)).toEqual({
+      kind: "seek",
+      ms: 1000,
+    })
+  })
+
+  it("does not loop while free-play is on", () => {
+    // Free-play wins: the gap past the rally's end plays through.
+    expect(gapSkipAction(rallies, 2000, true, true, false)).toEqual({
+      kind: "none",
+    })
+  })
+})
+
+describe("nextRallyMs", () => {
+  const rallies = [rally(1, 1000, 2000), rally(2, 5000, 6000)]
+
+  it("finds the first rally after the playhead", () => {
+    expect(nextRallyMs(rallies, 0)).toBe(1000)
+    expect(nextRallyMs(rallies, 1500)).toBe(5000)
+  })
+
+  it("returns null past the last rally (caller crosses the boundary)", () => {
+    expect(nextRallyMs(rallies, 5500)).toBeNull()
+  })
+})
+
+describe("prevRallyAction", () => {
+  const rallies = [rally(1, 1000, 2000), rally(2, 5000, 6000)]
+
+  it("restarts the rally when played well into it", () => {
+    // Past rally 2's start by more than the restart slack → rewind to its start.
+    expect(prevRallyAction(rallies, 6500, false)).toEqual({
+      kind: "seek",
+      ms: 5000,
+    })
+  })
+
+  it("steps to the previous rally when at the current's start", () => {
+    expect(prevRallyAction(rallies, 5000, false)).toEqual({
+      kind: "seek",
+      ms: 1000,
+    })
+  })
+
+  it("crosses into the previous recording from the first rally", () => {
+    expect(prevRallyAction(rallies, 1000, false)).toEqual({
+      kind: "prev-recording",
+    })
+  })
+
+  it("snaps to the first rally on the first recording", () => {
+    expect(prevRallyAction(rallies, 1000, true)).toEqual({
+      kind: "seek",
+      ms: 1000,
+    })
+  })
+
+  it("reports none with no rallies", () => {
+    expect(prevRallyAction([], 1000, true)).toEqual({ kind: "none" })
+  })
+})
+
+describe("nextUncertainMs", () => {
+  it("finds the next low-confidence rally on the session axis, wrapping", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }], {
+      "a.mp4": timeline(10000, [
+        rally(1, 1000, 2000, 0.9),
+        rally(2, 4000, 5000, 0.2),
+        rally(3, 7000, 8000, 0.3),
+      ]),
+    })
+    expect(nextUncertainMs(model.rallies, 0)).toBe(4000)
+    expect(nextUncertainMs(model.rallies, 4500)).toBe(7000)
+    // Past the last uncertain region → wrap to the first.
+    expect(nextUncertainMs(model.rallies, 9000)).toBe(4000)
+  })
+
+  it("returns null when nothing is uncertain", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }], {
+      "a.mp4": timeline(10000, [rally(1, 1000, 2000, 0.9)]),
+    })
+    expect(nextUncertainMs(model.rallies, 0)).toBeNull()
+  })
+})
+
+describe("buildSessionModel", () => {
+  it("stitches recordings onto one axis, offsetting rallies", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": timeline(10000, [rally(1, 1000, 2000)]),
+      "b.mp4": timeline(8000, [rally(2, 500, 1500)]),
+    })
+    expect(model.placedCount).toBe(2)
+    expect(model.totalMs).toBe(18000)
+    expect(model.rallies).toHaveLength(2)
+    // b.mp4's rally is lifted by a.mp4's duration.
+    expect(model.rallies[1].globalStart).toBe(10500)
+    expect(model.rallies[1].globalEnd).toBe(11500)
+    expect(model.rallies[1].recordingIndex).toBe(1)
+  })
+
+  it("stops placing at the first recording with an unknown duration", () => {
+    const model = buildSessionModel(
+      [{ path: "a.mp4" }, { path: "b.mp4" }, { path: "c.mp4" }],
+      {
+        "a.mp4": timeline(10000, [rally(1, 1000, 2000)]),
+        // b has no duration yet → it's included but nothing after it is placed.
+        "b.mp4": {
+          segment_state: "unknown",
+          duration_ms: null,
+          rallies: [],
+          waveform: [],
+        },
+        "c.mp4": timeline(5000, [rally(2, 0, 1000)]),
+      }
+    )
+    expect(model.placedCount).toBe(1)
+    expect(model.totalMs).toBe(10000)
+    expect(model.segments).toHaveLength(2) // a (placed) + b (the unknown one)
+    expect(model.rallies).toHaveLength(1) // only a's rally is placed
   })
 })
