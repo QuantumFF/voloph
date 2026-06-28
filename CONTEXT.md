@@ -1,6 +1,6 @@
 # Voloph
 
-A desktop app for reviewing badminton games recorded by the player. Its purpose is to make starting a review frictionless: skip the downtime between points and jump straight between meaningful moments. Reviewing is non-destructive — nothing the user does while reviewing alters a file; all structure lives as metadata layered over the recordings. The sole exception is one-time codec normalization at import: a recording in a format the webview can't play is transcoded in place to a playable codec (see ADR 0005).
+A desktop app for reviewing badminton games recorded by the player. Its purpose is to make starting a review frictionless: skip the downtime between points and jump straight between meaningful moments. Reviewing is non-destructive — nothing the user does alters a recording; all structure lives as metadata layered over the recordings, which are reviewed in place exactly as they came off the camera.
 
 ## Language
 
@@ -11,10 +11,6 @@ _Avoid_: match, day, event
 **Recording**:
 A single raw video file as it came off the camera, attached to a session. May contain one or several games of play. The app does not model games or matches as entities — they are not navigated by.
 _Avoid_: VOD, video, clip, game, match
-
-**Transcode** (codec normalization):
-Re-encoding a recording the webview cannot decode natively (e.g. iPhone HEVC) to web-playable H.264/AAC, **in place** — the new file replaces the original at its path and the source codec is discarded (see ADR 0005). The container metadata — the camera's creation date, make/model and the like — is carried across the rewrite, so only the codec is lost, not the recording's identity. Done once in the background at import; a recording already in a playable codec is never transcoded. Uses the host's fastest usable encoder — GPU (NVENC/VAAPI) where present, software libx264 otherwise, chosen by a one-time probe and falling back safely (see ADR 0005). Distinct from **export**, which renders a *new* file from a selection of rallies and never touches the recording.
-_Avoid_: proxy, cache, copy (there is no second copy), preview, lower-res copy
 
 **Rally**:
 A continuous segment of play, roughly serve to point decided. The atomic unit of review — you navigate, annotate, and skip at the granularity of rallies.

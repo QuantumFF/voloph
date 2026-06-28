@@ -40,3 +40,12 @@ lto = true        # Enables link-time-optimizations.
 opt-level = "s"   # Prioritizes small binary size. Use `3` if you prefer speed.
 panic = "abort"   # Higher performance by disabling panic handlers.
 strip = true      # Ensures debug symbols are removed.
+
+# Embedded libmpv playback (ADR 0008). libmpv is linked in-process and rendered
+# into a GtkGLArea overlaid on the Tauri webview; Linux-only (the app ships on
+# Linux). gtk/glib come transitively from Tauri 2 — pinned here so mpv.rs can use
+# them directly. GL symbols for the mpv render API are resolved at runtime via
+# the platform EGL loader (dlsym), so no GL crate is needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+glib = "0.18"

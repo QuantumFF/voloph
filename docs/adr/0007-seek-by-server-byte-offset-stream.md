@@ -1,5 +1,11 @@
 # Seek by reloading a server-side byte-offset stream
 
+> **Status: superseded by ADR 0008.** This whole mechanism existed only because
+> WebKitGTK silently drops `currentTime` seeks. Playback moved to embedded
+> libmpv, which seeks natively, so the seek-by-reload stream, the double buffer,
+> the JPEG frame-step, and the loopback server are all removed. The diagnosis
+> below remains the record of *why* the webview path was abandoned.
+
 Seeking the player to a position is done by **reloading the `<video>` at a `&t=<seconds>` URL** that the playback server answers with a fragmented MP4 beginning at the keyframe at or before `t` — **not** by writing `media.currentTime`. Recording-local time is then `seekBaseMs + media.currentTime`, where `seekBaseMs` is the `t` the stream was opened at; the frontend threads that base through every place playhead time is read or written (the timeline playhead, gap-skip, rally bounds, the session global/local conversion). The whole-file path (`t == 0`, range-seekable) is kept for opening a recording at its head; every non-zero seek — a timeline click, an arrow-key jump, gap-skip into the next rally, a rally-loop restart, a boundary crossing — reloads a fresh `&t=` stream.
 
 Chosen because **`currentTime` seeks are silently dropped on this WebKitGTK/GStreamer build** (2.52.4 / 1.28.4): the write is ignored and `seeked` fires back at the pre-seek position, even on a fully-buffered local file seeking a few seconds forward. This was reproduced interactively across ~8 rounds and every plausible frontend cause was ruled out with a live repro — HTTP range serving, buffering/`seekable` range, keyframe density (a dense 1s-keyframe transcode failed identically), moov position, `souphttpsrc` streaming mode, our pause/play machinery, server concurrency, missing plugins (issue #24, escalated from #23/#20). No frontend retry converges, so the player must avoid issuing a GStreamer seek at all: a stream that *opens* already positioned never seeks.

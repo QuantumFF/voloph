@@ -2,6 +2,31 @@ mod db;
 mod media;
 mod segment;
 
+// Embedded libmpv playback (ADR 0008). Linux-only — it links libmpv and drives
+// GTK directly; other targets get inert stubs so the crate still builds.
+#[cfg(target_os = "linux")]
+mod mpv;
+#[cfg(not(target_os = "linux"))]
+mod mpv {
+    pub fn init(_app: &tauri::AppHandle) -> Result<(), String> {
+        Ok(())
+    }
+    #[tauri::command]
+    pub fn mpv_load(_path: String) -> Result<(), String> {
+        Err("embedded playback is only available on Linux".into())
+    }
+    #[tauri::command]
+    pub fn mpv_set_pause(_paused: bool) -> Result<(), String> {
+        Err("embedded playback is only available on Linux".into())
+    }
+    #[tauri::command]
+    pub fn mpv_set_rect(_x: i32, _y: i32, _w: i32, _h: i32) {}
+    #[tauri::command]
+    pub fn mpv_show() {}
+    #[tauri::command]
+    pub fn mpv_hide() {}
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -460,6 +485,11 @@ pub fn run() {
             // still needing a probe, transcode, or segmentation) so every
             // recording becomes playable and gets its draft timeline.
             spawn_media_worker(app.handle());
+            // Embed libmpv in the main window for native playback (ADR 0008).
+            // Must run on the GTK main thread, which `setup` is.
+            if let Err(e) = mpv::init(app.handle()) {
+                log::error!("mpv: embedding failed: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -476,7 +506,12 @@ pub fn run() {
             update_rally,
             add_rally,
             delete_rally,
-            playback_endpoint
+            playback_endpoint,
+            mpv::mpv_load,
+            mpv::mpv_set_pause,
+            mpv::mpv_set_rect,
+            mpv::mpv_show,
+            mpv::mpv_hide
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {
