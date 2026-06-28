@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { listen } from "@tauri-apps/api/event"
+import { getCurrentWindow } from "@tauri-apps/api/window"
 import {
   ArrowLeftIcon,
   ChevronLeftIcon,
@@ -193,6 +194,9 @@ export function RecordingPlayer({
   const [looping, setLooping] = useState(false)
   const [editing, setEditing] = useState(false)
   const [showCheatSheet, setShowCheatSheet] = useState(false)
+  // True while the window is minimized; the native surface is suppressed so it
+  // leaves no stray window (ADR 0008), and restored on un-minimize.
+  const [minimized, setMinimized] = useState(false)
   const [error, setError] = useState<string | null>(null)
   // Bumped by Re-analyze to re-trigger the timeline fetch/poll; `reanalyzing`
   // guards the button (ADR 0002, the tuning loop).
@@ -247,6 +251,41 @@ export function RecordingPlayer({
     void trackedInvoke("mpv_show").catch(() => {})
     return () => {
       void trackedInvoke("mpv_hide").catch(() => {})
+    }
+  }, [])
+
+  // The one constraint of the tiled native surface (ADR 0008): the webview cannot
+  // draw over the video rect, so a full-area HTML overlay must hide the surface
+  // first. Suppress it whenever a full-area modal (currently only the cheat-sheet)
+  // is open or the window is minimized, and restore it once both clear. Playback
+  // continues underneath — this only toggles the surface's visibility, unlike the
+  // unmount teardown above. Any in-video HUD (e.g. a verdict flash) must use mpv's
+  // OSD, not HTML over the video rect, so it stays visible under this hide.
+  const surfaceSuppressed = showCheatSheet || minimized
+  useEffect(() => {
+    void trackedInvoke("mpv_suppress_surface", {
+      suppressed: surfaceSuppressed,
+    }).catch(() => {})
+  }, [surfaceSuppressed])
+
+  // Track the window's minimized state from its resize events (a minimize is a
+  // resize on GTK) so the surface can be suppressed while minimized and restored
+  // on un-minimize, leaving no stray or mispositioned surface (ADR 0008).
+  useEffect(() => {
+    const appWindow = getCurrentWindow()
+    let unlisten: (() => void) | undefined
+    let cancelled = false
+    void appWindow
+      .onResized(() => {
+        void appWindow.isMinimized().then((m) => setMinimized(m))
+      })
+      .then((fn) => {
+        if (cancelled) fn()
+        else unlisten = fn
+      })
+    return () => {
+      cancelled = true
+      unlisten?.()
     }
   }, [])
 

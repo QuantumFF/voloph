@@ -644,10 +644,29 @@ pub fn mpv_set_rect(tx: State<'_, SurfaceTx>, x: i32, y: i32, w: i32, h: i32) {
     tx.send(SurfaceMsg::Rect { x, y, w, h });
 }
 
-/// Reveal the native surface (player view mounted).
+/// Reveal the native surface (player view mounted, or a full-area modal closed /
+/// the window restored — see [`mpv_suppress_surface`]). Playback is untouched.
 #[tauri::command]
 pub fn mpv_show(tx: State<'_, SurfaceTx>) {
     tx.send(SurfaceMsg::Show);
+}
+
+/// Hide the native surface *without* stopping playback, for the one constraint of
+/// the tiled surface (ADR 0008): the webview cannot draw over the video rect, so a
+/// full-area HTML overlay (the cheat-sheet) must hide the surface first, and a
+/// minimized window must not leave a stray surface. Restore with [`mpv_show`].
+///
+/// Distinct from [`mpv_hide`], which also `stop`s playback because it is the
+/// leave-the-player teardown — here playback continues underneath, paused or not.
+/// In-video HUD (e.g. an annotation verdict flash) belongs on mpv's OSD, never an
+/// HTML overlay over the video rect, precisely so it does not trip this hide.
+#[tauri::command]
+pub fn mpv_suppress_surface(tx: State<'_, SurfaceTx>, suppressed: bool) {
+    tx.send(if suppressed {
+        SurfaceMsg::Hide
+    } else {
+        SurfaceMsg::Show
+    });
 }
 
 /// Hide the native surface and stop playback (back to the session list — no

@@ -26,6 +26,8 @@ mod mpv {
     #[tauri::command]
     pub fn mpv_hide() {}
     #[tauri::command]
+    pub fn mpv_suppress_surface(_suppressed: bool) {}
+    #[tauri::command]
     pub fn mpv_seek(_ms: f64) -> Result<(), String> {
         Err("embedded playback is only available on Linux".into())
     }
@@ -532,6 +534,7 @@ pub fn run() {
             mpv::mpv_set_rect,
             mpv::mpv_show,
             mpv::mpv_hide,
+            mpv::mpv_suppress_surface,
             mpv::mpv_seek,
             mpv::mpv_frame_step,
             mpv::mpv_set_speed,
