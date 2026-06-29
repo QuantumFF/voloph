@@ -2,15 +2,20 @@ import { describe, expect, it } from "vitest"
 
 import {
   SPEED_LADDER,
+  addAtPlayheadEdit,
+  adjustRallyEdit,
   buildSessionModel,
   clampVolume,
   gapSkipAction,
+  mergeRallyEdit,
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
   seekTarget,
+  splitRallyEdit,
   stepSpeedIndex,
   type Rally,
+  type SessionRally,
   type Timeline,
 } from "./recording-player-transport"
 
@@ -233,5 +238,139 @@ describe("buildSessionModel", () => {
     expect(model.totalMs).toBe(10000)
     expect(model.segments).toHaveLength(2) // a (placed) + b (the unknown one)
     expect(model.rallies).toHaveLength(1) // only a's rally is placed
+  })
+})
+
+/** A session rally on b.mp4 at recording index 1, with the given local bounds. */
+function sessionRally(
+  id: number,
+  localStart: number,
+  localEnd: number,
+  offset = 10000
+): SessionRally {
+  return {
+    recordingIndex: 1,
+    path: "b.mp4",
+    id,
+    localStart,
+    localEnd,
+    globalStart: offset + localStart,
+    globalEnd: offset + localEnd,
+    confidence: 1,
+  }
+}
+
+describe("adjustRallyEdit", () => {
+  it("maps global drag bounds to recording-local and updates the rally", () => {
+    const plan = adjustRallyEdit(
+      sessionRally(7, 1000, 2000),
+      11200, // global start
+      11800, // global end
+      10000, // offset
+      8000 // duration
+    )
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [
+        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1200, endMs: 1800 },
+      ],
+    })
+  })
+
+  it("orders flipped drag endpoints (start past end)", () => {
+    const plan = adjustRallyEdit(sessionRally(7, 1000, 2000), 11800, 11200, 10000, 8000)
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [
+        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1200, endMs: 1800 },
+      ],
+    })
+  })
+
+  it("clamps to the recording's bounds", () => {
+    const plan = adjustRallyEdit(sessionRally(7, 1000, 2000), 9000, 99999, 10000, 8000)
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [
+        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 0, endMs: 8000 },
+      ],
+    })
+  })
+
+  it("rejects a zero-or-negative-length result", () => {
+    // Both endpoints clamp to 0 (before the recording start) → empty rally.
+    const plan = adjustRallyEdit(sessionRally(7, 1000, 2000), 9000, 9500, 10000, 8000)
+    expect(plan).toEqual({ kind: "reject" })
+  })
+})
+
+describe("addAtPlayheadEdit", () => {
+  it("centres a rally on the playhead spanning halfMs each side", () => {
+    const plan = addAtPlayheadEdit("b.mp4", 5000, 8000, 2000)
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [{ command: "add_rally", path: "b.mp4", startMs: 3000, endMs: 7000 }],
+    })
+  })
+
+  it("clamps the start at zero near the recording head", () => {
+    const plan = addAtPlayheadEdit("b.mp4", 1000, 8000, 2000)
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [{ command: "add_rally", path: "b.mp4", startMs: 0, endMs: 3000 }],
+    })
+  })
+
+  it("leaves the end uncapped when the duration is unknown (Infinity)", () => {
+    const plan = addAtPlayheadEdit("b.mp4", 5000, Number.POSITIVE_INFINITY, 2000)
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [{ command: "add_rally", path: "b.mp4", startMs: 3000, endMs: 7000 }],
+    })
+  })
+})
+
+describe("splitRallyEdit", () => {
+  it("shrinks the rally to the cut and adds the remainder", () => {
+    // Cut at global 11500 → local 1500, inside [1000, 2000].
+    const plan = splitRallyEdit(sessionRally(7, 1000, 2000), 11500, 10000)
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [
+        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1000, endMs: 1500 },
+        { command: "add_rally", path: "b.mp4", startMs: 1500, endMs: 2000 },
+      ],
+    })
+  })
+
+  it("rejects a cut at or outside the rally's bounds", () => {
+    expect(splitRallyEdit(sessionRally(7, 1000, 2000), 11000, 10000)).toEqual({
+      kind: "reject",
+    })
+    expect(splitRallyEdit(sessionRally(7, 1000, 2000), 12000, 10000)).toEqual({
+      kind: "reject",
+    })
+  })
+})
+
+describe("mergeRallyEdit", () => {
+  it("stretches the first over both and deletes the second", () => {
+    const plan = mergeRallyEdit(
+      sessionRally(7, 1000, 2000),
+      sessionRally(8, 2500, 3000)
+    )
+    expect(plan).toEqual({
+      kind: "ops",
+      ops: [
+        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1000, endMs: 3000 },
+        { command: "delete_rally", path: "b.mp4", rallyId: 8 },
+      ],
+    })
+  })
+
+  it("rejects a cross-recording merge", () => {
+    const first = sessionRally(7, 1000, 2000)
+    const second: SessionRally = { ...sessionRally(8, 500, 800), path: "c.mp4" }
+    expect(mergeRallyEdit(first, second)).toEqual({ kind: "reject" })
   })
 })

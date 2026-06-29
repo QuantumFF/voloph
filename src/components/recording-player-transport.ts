@@ -262,3 +262,131 @@ export function nextUncertainMs(
     uncertain.find((r) => r.globalStart > hereMs + 1) ?? uncertain[0]
   return target.globalStart
 }
+
+/**
+ * One persistence step of an inline correction — exactly the args of the
+ * `update_rally` / `add_rally` / `delete_rally` commands (issue #7). The
+ * component runs a plan's ops in order, so `command` is stripped off and the rest
+ * is the invoke payload.
+ */
+export type RallyOp =
+  | {
+      command: "update_rally"
+      path: string
+      rallyId: number
+      startMs: number
+      endMs: number
+    }
+  | { command: "add_rally"; path: string; startMs: number; endMs: number }
+  | { command: "delete_rally"; path: string; rallyId: number }
+
+/**
+ * The result of resolving an inline correction: `reject` when an integrity guard
+ * fails (nothing is written), or an ordered list of ops to run. The coordinate
+ * mapping and the guards that decide what reaches SQLite live here so they are
+ * unit-tested without mpv or Tauri — the component only dispatches the ops.
+ */
+export type EditPlan = { kind: "reject" } | { kind: "ops"; ops: RallyOp[] }
+
+/**
+ * Adjust a rally's boundaries from a drag over the session strip. `globalStart`
+ * and `globalEnd` are session-global and may arrive flipped (hence min/max);
+ * `offset` maps them to recording-local time and `durationMs` caps them to the
+ * recording (pass `Infinity` until the duration is known). Rejects a result of
+ * zero or negative length.
+ */
+export function adjustRallyEdit(
+  rally: Pick<SessionRally, "path" | "id">,
+  globalStart: number,
+  globalEnd: number,
+  offset: number,
+  durationMs: number
+): EditPlan {
+  const startMs = Math.round(
+    clamp(Math.min(globalStart, globalEnd) - offset, 0, durationMs)
+  )
+  const endMs = Math.round(
+    clamp(Math.max(globalStart, globalEnd) - offset, 0, durationMs)
+  )
+  if (endMs <= startMs) return { kind: "reject" }
+  return {
+    kind: "ops",
+    ops: [
+      { command: "update_rally", path: rally.path, rallyId: rally.id, startMs, endMs },
+    ],
+  }
+}
+
+/**
+ * Add a rally centred on the playhead, spanning `halfMs` each side, clamped into
+ * the recording (`durationMs` may be `Infinity` before it's known). `currentMs`
+ * is recording-local.
+ */
+export function addAtPlayheadEdit(
+  path: string,
+  currentMs: number,
+  durationMs: number,
+  halfMs: number
+): EditPlan {
+  const startMs = Math.max(0, Math.round(currentMs - halfMs))
+  const endMs = Math.round(clamp(currentMs + halfMs, startMs + 1, durationMs))
+  return { kind: "ops", ops: [{ command: "add_rally", path, startMs, endMs }] }
+}
+
+/**
+ * Split a rally at the session-global playhead `atGlobalMs`: shrink it to end at
+ * the cut, then add a new rally from the cut to the old end. `offset` maps the cut
+ * to recording-local time. Rejects a cut at or outside the rally's bounds.
+ */
+export function splitRallyEdit(
+  rally: Pick<SessionRally, "path" | "id" | "localStart" | "localEnd">,
+  atGlobalMs: number,
+  offset: number
+): EditPlan {
+  const atLocal = Math.round(atGlobalMs - offset)
+  if (atLocal <= rally.localStart || atLocal >= rally.localEnd) {
+    return { kind: "reject" }
+  }
+  return {
+    kind: "ops",
+    ops: [
+      {
+        command: "update_rally",
+        path: rally.path,
+        rallyId: rally.id,
+        startMs: rally.localStart,
+        endMs: atLocal,
+      },
+      {
+        command: "add_rally",
+        path: rally.path,
+        startMs: atLocal,
+        endMs: rally.localEnd,
+      },
+    ],
+  }
+}
+
+/**
+ * Merge a rally with the next one in the same recording: stretch the first to
+ * cover both, then delete the second. Rejects a cross-recording merge.
+ */
+export function mergeRallyEdit(
+  first: Pick<SessionRally, "path" | "id" | "localStart" | "localEnd">,
+  second: Pick<SessionRally, "path" | "id" | "localStart" | "localEnd">
+): EditPlan {
+  if (first.path !== second.path) return { kind: "reject" }
+  return {
+    kind: "ops",
+    ops: [
+      {
+        command: "update_rally",
+        path: first.path,
+        rallyId: first.id,
+        startMs: Math.min(first.localStart, second.localStart),
+        endMs: Math.max(first.localEnd, second.localEnd),
+      },
+      { command: "delete_rally", path: first.path, rallyId: second.id },
+    ],
+  }
+}

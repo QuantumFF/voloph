@@ -32,15 +32,20 @@ import { trackedInvoke } from "@/lib/tauri"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
+  addAtPlayheadEdit,
+  adjustRallyEdit,
   buildSessionModel,
   clamp,
   clampVolume,
   gapSkipAction,
+  mergeRallyEdit,
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
   seekTarget,
+  splitRallyEdit,
   stepSpeedIndex,
+  type EditPlan,
   type PlaylistRecording,
   type SessionModel,
   type SessionRally,
@@ -625,108 +630,84 @@ export function RecordingPlayer({
       .finally(() => setReanalyzing(false))
   }, [path])
 
-  // The five inline corrections (issue #7), resolved against the recording that
-  // owns the rally. Each persists immediately to SQLite and re-reads that
-  // recording's timeline so playback and the strip reflect it at once.
+  // The five inline corrections (issue #7). The boundary math and integrity
+  // guards that decide what reaches SQLite live behind the transport seam (so
+  // they're unit-tested without mpv); here each callback resolves a plan and
+  // hands it to `runEdit`, which persists its ops in order then re-reads the
+  // affected recording's timeline so playback and the strip reflect it at once.
+
+  // Recording-local duration of a recording, or +Infinity until it's segmented
+  // (the edit math leaves an unknown-duration recording uncapped).
+  const recordingDuration = useCallback(
+    (recordingIndex: number) =>
+      session.segments.find((s) => s.index === recordingIndex)?.durationMs ??
+      Number.POSITIVE_INFINITY,
+    [session]
+  )
+
+  const runEdit = useCallback(
+    (plan: EditPlan) => {
+      if (plan.kind !== "ops" || plan.ops.length === 0) return
+      const recordingPath = plan.ops[0].path
+      let chain: Promise<unknown> = Promise.resolve()
+      for (const op of plan.ops) {
+        const { command, ...args } = op
+        chain = chain.then(() => trackedInvoke(command, args))
+      }
+      void chain.then(() => refreshTimeline(recordingPath)).catch(() => {})
+    },
+    [refreshTimeline]
+  )
 
   const adjustRally = useCallback(
     (rally: SessionRally, globalStart: number, globalEnd: number) => {
-      const offset = segmentOffset(rally.recordingIndex)
-      const duration =
-        session.segments.find((s) => s.index === rally.recordingIndex)
-          ?.durationMs ?? Number.POSITIVE_INFINITY
-      const startMs = Math.round(
-        clamp(Math.min(globalStart, globalEnd) - offset, 0, duration)
+      runEdit(
+        adjustRallyEdit(
+          rally,
+          globalStart,
+          globalEnd,
+          segmentOffset(rally.recordingIndex),
+          recordingDuration(rally.recordingIndex)
+        )
       )
-      const endMs = Math.round(
-        clamp(Math.max(globalStart, globalEnd) - offset, 0, duration)
-      )
-      if (endMs <= startMs) return
-      void trackedInvoke("update_rally", {
-        path: rally.path,
-        rallyId: rally.id,
-        startMs,
-        endMs,
-      })
-        .then(() => refreshTimeline(rally.path))
-        .catch(() => {})
     },
-    [segmentOffset, session, refreshTimeline]
+    [segmentOffset, recordingDuration, runEdit]
   )
 
   const addAtPlayhead = useCallback(() => {
     if (!path) return
-    const duration =
-      session.segments.find((s) => s.index === index)?.durationMs ??
-      Number.POSITIVE_INFINITY
-    const start = Math.max(0, Math.round(currentMs - ADD_RALLY_HALF_MS))
-    const end = Math.round(
-      clamp(currentMs + ADD_RALLY_HALF_MS, start + 1, duration)
+    runEdit(
+      addAtPlayheadEdit(
+        path,
+        currentMs,
+        recordingDuration(index),
+        ADD_RALLY_HALF_MS
+      )
     )
-    void trackedInvoke("add_rally", { path, startMs: start, endMs: end })
-      .then(() => refreshTimeline(path))
-      .catch(() => {})
-  }, [path, index, currentMs, session, refreshTimeline])
+  }, [path, index, currentMs, recordingDuration, runEdit])
 
   const deleteRally = useCallback(
     (rally: SessionRally) => {
-      void trackedInvoke("delete_rally", {
-        path: rally.path,
-        rallyId: rally.id,
+      runEdit({
+        kind: "ops",
+        ops: [{ command: "delete_rally", path: rally.path, rallyId: rally.id }],
       })
-        .then(() => refreshTimeline(rally.path))
-        .catch(() => {})
     },
-    [refreshTimeline]
+    [runEdit]
   )
 
-  // Split a rally at the global playhead: shrink it to end at the cut, then add a
-  // new rally from the cut to the old end.
   const splitRally = useCallback(
     (rally: SessionRally, atGlobalMs: number) => {
-      const offset = segmentOffset(rally.recordingIndex)
-      const atLocal = Math.round(atGlobalMs - offset)
-      if (atLocal <= rally.localStart || atLocal >= rally.localEnd) return
-      void trackedInvoke("update_rally", {
-        path: rally.path,
-        rallyId: rally.id,
-        startMs: rally.localStart,
-        endMs: atLocal,
-      })
-        .then(() =>
-          trackedInvoke("add_rally", {
-            path: rally.path,
-            startMs: atLocal,
-            endMs: rally.localEnd,
-          })
-        )
-        .then(() => refreshTimeline(rally.path))
-        .catch(() => {})
+      runEdit(splitRallyEdit(rally, atGlobalMs, segmentOffset(rally.recordingIndex)))
     },
-    [segmentOffset, refreshTimeline]
+    [segmentOffset, runEdit]
   )
 
-  // Merge a rally with the next one in the same recording: stretch the first to
-  // cover both, then delete the second.
   const mergeRallies = useCallback(
     (first: SessionRally, second: SessionRally) => {
-      if (first.path !== second.path) return
-      void trackedInvoke("update_rally", {
-        path: first.path,
-        rallyId: first.id,
-        startMs: Math.min(first.localStart, second.localStart),
-        endMs: Math.max(first.localEnd, second.localEnd),
-      })
-        .then(() =>
-          trackedInvoke("delete_rally", {
-            path: first.path,
-            rallyId: second.id,
-          })
-        )
-        .then(() => refreshTimeline(first.path))
-        .catch(() => {})
+      runEdit(mergeRallyEdit(first, second))
     },
-    [refreshTimeline]
+    [runEdit]
   )
 
   // The single keymap definition: the one source of truth behind both the global
