@@ -317,11 +317,14 @@ export function resumeStartMs(resume: Resume, rallies: Rally[]): number | null {
 
 /**
  * Whether a `time-pos` tick at recording-local `ms` shows the playhead has
- * reached a boundary-crossing resume `target` (within `tolMs`). Until it has, the
- * freshly-loaded file's near-zero pre-seek ticks must be dropped so gap-skip
- * can't act on them and override the resume (a click landing in a later rally of
- * the crossed-into recording). The resume seek is exact, so the first post-seek
- * tick sits right at the target; the slack only clears the pre-seek ticks.
+ * reached a boundary-crossing resume `target` (within `tolMs`) — the *second*
+ * gate after a crossing. The first gate (`mpv:file-loaded`) drops every tick from
+ * the recording being left, so by the time this runs the tick is guaranteed to be
+ * from the freshly-loaded file; this only has to drop its near-0 pre-seek ticks
+ * (mpv's resume seek is async, so it lands a moment after the file opens). The
+ * seek is exact, so the first settled tick sits at the target; the slack clears
+ * the near-0 lead-in. One-sided (anything at/past the target counts as landed) so
+ * an overshooting first tick can't strand the gate.
  */
 export function resumeTickLanded(
   ms: number,

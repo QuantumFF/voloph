@@ -107,10 +107,11 @@ const SEEK_COARSE_MS = 10000 // Shift+←/→
 const VOLUME_STEP = 10
 
 /**
- * How close (ms) the playhead must get to a boundary-crossing resume target
- * before its `time-pos` ticks count as "landed" and normal playback resumes. The
- * `FILE_LOADED` resume seek is exact, so the first post-seek tick sits right at
- * the target; this slack only has to clear the near-zero pre-seek ticks.
+ * How close (ms) the playhead must get to a crossing's resume target before its
+ * `time-pos` ticks count as "landed" and normal playback resumes. mpv's resume
+ * seek is exact but async, so the first settled tick sits at the target; this
+ * slack only clears the near-0 pre-seek lead-in the freshly-loaded file emits
+ * before the seek takes hold.
  */
 const RESUME_TICK_TOL_MS = 250
 
@@ -201,14 +202,28 @@ export function RecordingPlayer({
   // Imperative handle on the timeline strip so the `F` key / button can recenter
   // it on the playhead (and re-arm follow) without lifting its scroll state.
   const timelineRef = useRef<SessionTimelineHandle>(null)
-  // Recording-local time a boundary crossing is resuming at, while it lands.
-  // mpv plays a freshly-loaded file from 0 until the resume seek (applied on
-  // `FILE_LOADED`) takes hold, emitting `time-pos` ticks near 0 in between; those
-  // are dropped until the playhead reaches the target so gap-skip doesn't act on
-  // a transient ~0 and yank the playhead to the first rally, overriding a click
-  // that landed in a *later* rally of the crossed-into recording. Null once the
-  // resume has landed (or when there's no pending resume). A ref, so the
-  // `time-pos` listener reads it synchronously without re-subscribing.
+  // True from the moment a load is initiated until mpv confirms the new file is
+  // open (the `mpv:file-loaded` event, fired after its baked-in resume seek has
+  // landed). While true the `time-pos` listener drops every tick, because a tick
+  // carries no file identity: the *outgoing* recording keeps emitting ticks at
+  // its own (often large) playhead position after a `loadfile`, and the
+  // freshly-loaded file emits near-0 pre-seek ticks before the resume takes hold.
+  // Acting on either runs gap-skip against the wrong position — a stale far-past
+  // tick reads as "past the last rally" and yanks the playhead into the *next*
+  // recording, overriding a click that crossed into this one. Set synchronously
+  // at the crossing (not in the load effect) so no tick slips through the
+  // render→effect gap; a ref so the listener reads it without re-subscribing.
+  // Starts true so the initial mount load is gated the same way.
+  const awaitingLoadRef = useRef(true)
+  // The second, position gate, working with `awaitingLoadRef`: the recording-local
+  // time the pending crossing resumes at, while the (async) resume seek lands. The
+  // identity gate above drops every tick until `mpv:file-loaded`, but mpv applies
+  // the seek a moment *after* the file opens, so the file's first ticks are still
+  // near 0 — this drops them until the playhead reaches the target, so gap-skip
+  // can't read a transient ~0 as "before the first rally" and yank there. Because
+  // the identity gate has already filtered out the outgoing recording's stale
+  // (often far-past) ticks, a plain "have we reached the target?" check is enough
+  // here. Null once landed, or when a crossing has no specific target yet.
   const resumeTargetRef = useRef<number | null>(null)
 
   // Every recording's draft timeline, keyed by path so it survives switching
@@ -332,6 +347,11 @@ export function RecordingPlayer({
   // Move the playlist to another recording, remembering where to resume once it
   // loads (and reset the optimistic playhead so the resume math is clean).
   const goToRecording = useCallback((next: number, resume: Resume) => {
+    // Gate the playhead immediately: stale ticks from the recording we're leaving
+    // must be dropped until the new file confirms loaded, or gap-skip acts on the
+    // old position and crosses on past where we meant to land. Set here (not in
+    // the load effect, which is deferred) so no tick slips through in between.
+    awaitingLoadRef.current = true
     setCurrentMs(0)
     setIndex(next)
     setPendingSeek(resume)
@@ -349,16 +369,19 @@ export function RecordingPlayer({
     if (!path) return
     const startMs =
       pendingSeek != null ? resumeStartMs(pendingSeek, rallies) : null
+    // Re-assert both gates (the mount load reaches here without a crossing, and
+    // re-running this effect means a fresh file is opening either way): drop every
+    // tick until `mpv:file-loaded`, then drop the new file's pre-seek ticks until
+    // the playhead reaches `startMs`. A null target means no specific resume (a
+    // deferred `start`/`end` whose rallies haven't arrived) — play from the top.
+    awaitingLoadRef.current = true
+    resumeTargetRef.current = startMs
     void trackedInvoke("mpv_load", { path, startMs })
       .then(() => {
         // `mpv_load` unpauses; `paused` reconciles from the `mpv:pause` event.
         setError(null)
       })
       .catch((e) => setError(String(e)))
-    // Gate the playhead handler until this load's resume seek lands, so the
-    // freshly-loaded file's near-zero ticks don't trip gap-skip (a non-null
-    // target arms it; null disarms a stale one from a prior crossing).
-    resumeTargetRef.current = startMs
     if (startMs != null) {
       // Resolved here → the deferred resume effect below has nothing left to do.
       /* eslint-disable-next-line react-hooks/set-state-in-effect -- carrying the resume into the load is the point of the effect */
@@ -479,10 +502,16 @@ export function RecordingPlayer({
   useEffect(() => {
     const unlisten: Array<() => void> = []
     void listen<number>("mpv:time-pos", (event) => {
+      // Identity gate: drop every tick until the new file confirms loaded. A tick
+      // carries no file identity, so before `mpv:file-loaded` it's a stale (often
+      // far-past) position from the recording we're leaving — acting on it runs
+      // gap-skip against the wrong position and crosses on past the resume target.
+      if (awaitingLoadRef.current) return
       const ms = event.payload
-      // While a boundary-crossing resume is landing, drop the freshly-loaded
-      // file's pre-seek ticks (near 0) so gap-skip can't override the resume;
-      // accept once the playhead reaches the target, then resume normally.
+      // Position gate: the file is open but mpv applies the resume seek a moment
+      // later, so its first ticks are still near 0. Drop them until the playhead
+      // reaches the target, then resume normally — otherwise gap-skip reads the
+      // transient ~0 as "before the first rally" and yanks the playhead there.
       const target = resumeTargetRef.current
       if (target != null) {
         if (!resumeTickLanded(ms, target, RESUME_TICK_TOL_MS)) return
@@ -491,12 +520,21 @@ export function RecordingPlayer({
       setCurrentMs(ms)
       handlersRef.current.skipGaps(ms)
     }).then((u) => unlisten.push(u))
+    // The new file is open and its baked-in resume seek has landed: the next
+    // `time-pos` reflects the resumed position, so reopen the playhead gate.
+    void listen("mpv:file-loaded", () => {
+      awaitingLoadRef.current = false
+    }).then((u) => unlisten.push(u))
     void listen("mpv:ended", () => handlersRef.current.handleEnded()).then(
       (u) => unlisten.push(u)
     )
-    void listen<string>("mpv:error", (event) =>
+    void listen<string>("mpv:error", (event) => {
+      // A load that errors never fires `mpv:file-loaded`; reopen both gates so a
+      // failed crossing can't leave the playhead frozen.
+      awaitingLoadRef.current = false
+      resumeTargetRef.current = null
       setError(event.payload ?? "playback failed")
-    ).then((u) => unlisten.push(u))
+    }).then((u) => unlisten.push(u))
     // Transport reconciliation (issue #42): mpv reports its own pause/speed/
     // volume/mute, so the controls reflect the player rather than a hopeful
     // optimistic write. mpv reports speed/volume as raw numbers; the UI tracks a

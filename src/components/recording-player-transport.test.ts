@@ -259,10 +259,12 @@ describe("resumeStartMs", () => {
 })
 
 describe("resumeTickLanded", () => {
-  // The regression seam for "crossing into a *rally* still starts at the
-  // beginning": a freshly-loaded file emits near-zero ticks before the resume
-  // seek lands; those must be dropped (not landed) so gap-skip can't yank the
-  // playhead to the first rally and override a click on a later rally.
+  // The second crossing gate (the position gate). The identity gate
+  // (`mpv:file-loaded`) has already dropped the outgoing recording's stale ticks,
+  // so this only decides when the freshly-loaded file's pre-seek near-0 ticks give
+  // way to its settled position — without this, gap-skip reads the transient ~0 as
+  // "before the first rally" and yanks the playhead there (always starts the
+  // crossed-into recording at its first rally instead of where the click landed).
   it("drops the pre-seek near-zero ticks of a deep resume", () => {
     expect(resumeTickLanded(0, 42_000, 250)).toBe(false)
     expect(resumeTickLanded(80, 42_000, 250)).toBe(false)
@@ -272,7 +274,8 @@ describe("resumeTickLanded", () => {
     expect(resumeTickLanded(42_000, 42_000, 250)).toBe(true)
     // A frame shy of the target still counts as landed (within tolerance).
     expect(resumeTickLanded(41_900, 42_000, 250)).toBe(true)
-    // And anything past it (playback advancing after the seek).
+    // And anything past it (an overshooting first tick, or playback advancing
+    // after the seek) — one-sided so an overshoot can't strand the gate.
     expect(resumeTickLanded(42_500, 42_000, 250)).toBe(true)
   })
 
