@@ -116,17 +116,6 @@ pub fn extract_motion(path: &str) -> Result<Vec<f64>, String> {
     Ok(energy)
 }
 
-/// What a probe tells the importer about a recording. libmpv plays any codec and
-/// seeks sparse GOPs (ADR 0008), so there is no longer a transcode decision — the
-/// only thing probed here is the frame rate the player frame-steps by.
-pub struct Probe {
-    /// Frames per second of the video stream, parsed from ffprobe's
-    /// `avg_frame_rate` rational (issue #19), so the player can frame-step
-    /// exactly. `None` when ffprobe reports no usable rate; the player then
-    /// defaults to 30 fps.
-    pub fps: Option<f64>,
-}
-
 /// Resolve a bundled sidecar binary. Tauri places `externalBin` next to the
 /// app executable (and copies them beside the dev binary), so we look there.
 fn sidecar_path(name: &str) -> PathBuf {
@@ -141,18 +130,19 @@ fn sidecar_path(name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(file))
 }
 
-/// Probe a recording with the `ffprobe` sidecar for the frame rate the player
-/// frame-steps by (issue #19). libmpv plays any codec (ADR 0008), so there is no
-/// transcode decision left to make. Returns an error string if the probe fails
-/// entirely (missing file, unreadable, sidecar not resolvable) so the caller can
-/// mark the recording rather than silently retry forever.
-pub fn probe(path: &str) -> Result<Probe, String> {
+/// Confirm a recording is readable so the importer can mark it `ready` (libmpv
+/// plays any codec and seeks sparse GOPs directly — ADR 0008 — so there is no
+/// transcode decision left to make, and no per-recording value left to capture).
+/// Returns an error string if the probe fails entirely (missing file, unreadable,
+/// sidecar not resolvable) so the caller can mark the recording `failed` rather
+/// than silently retry forever.
+pub fn probe(path: &str) -> Result<(), String> {
     let output = Command::new(sidecar_path("ffprobe"))
         .args([
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,avg_frame_rate",
+            "stream=codec_type",
             "-of",
             "default=noprint_wrappers=1:nokey=0",
             path,
@@ -165,32 +155,7 @@ pub fn probe(path: &str) -> Result<Probe, String> {
         return Err(format!("ffprobe could not read the file: {stderr}"));
     }
 
-    let report = String::from_utf8_lossy(&output.stdout);
-    Ok(Probe {
-        fps: parse_fps(&report),
-    })
-}
-
-/// Parse the video stream's frame rate from an ffprobe report (issue #19).
-/// ffprobe emits `avg_frame_rate` as a rational such as `30000/1001` (29.97) or
-/// `0/0` for a stream with no usable rate (e.g. an audio-only stream's line).
-/// Returns the first positive rate found, or `None` when no video stream
-/// reports one — the player then defaults to 30 fps.
-fn parse_fps(report: &str) -> Option<f64> {
-    for line in report.lines() {
-        let Some(("avg_frame_rate", value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        let (num, den) = value.split_once('/').unwrap_or((value, "1"));
-        let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>()) else {
-            continue;
-        };
-        if num > 0.0 && den > 0.0 {
-            return Some(num / den);
-        }
-    }
-    None
+    Ok(())
 }
 
 /// The capture date a recording carries in its container metadata. Both fields
@@ -264,7 +229,7 @@ fn parse_capture_date(report: &str) -> CaptureDate {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_capture_date, parse_fps, CaptureDate};
+    use super::{parse_capture_date, CaptureDate};
 
     /// ffprobe prints date tags as `TAG:<key>=<value>`; the parser must pull both
     /// the offset-bearing Apple tag (as real iPhone footage carries it) and the
@@ -291,27 +256,5 @@ TAG:encoder=Lavf62.12.102";
     fn parses_missing_capture_date_as_empty() {
         let report = "TAG:major_brand=isom\nTAG:encoder=Lavf62.12.102";
         assert_eq!(parse_capture_date(report), CaptureDate::default());
-    }
-
-    #[test]
-    fn parses_rational_frame_rate() {
-        let report = "\
-codec_name=h264
-codec_type=video
-avg_frame_rate=30000/1001
-codec_name=aac
-codec_type=audio
-avg_frame_rate=0/0";
-        let fps = parse_fps(report).unwrap();
-        assert!((fps - 29.97).abs() < 0.01, "fps was {fps}");
-    }
-
-    #[test]
-    fn missing_frame_rate_is_none() {
-        let report = "\
-codec_name=h264
-codec_type=video
-avg_frame_rate=0/0";
-        assert!(parse_fps(report).is_none());
     }
 }

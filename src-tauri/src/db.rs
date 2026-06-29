@@ -109,11 +109,6 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // as a JSON array of normalized `[0,1]` floats. Produced alongside the draft
     // timeline during segmentation; null until a recording is segmented.
     let _ = conn.execute("ALTER TABLE recordings ADD COLUMN waveform TEXT", []);
-    // Video frame rate captured at probe time (issue #19) so the player can
-    // frame-step exactly. Null until probed; the player defaults to 30 fps when
-    // unknown. The in-place transcode does not resample fps, so the probed value
-    // stays valid afterward.
-    let _ = conn.execute("ALTER TABLE recordings ADD COLUMN fps REAL", []);
     Ok(conn)
 }
 
@@ -453,18 +448,12 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     .optional()
 }
 
-/// Record a probe's outcome (issue #19): the playability state (`ready` once
-/// probed, since libmpv plays the original directly — ADR 0008 — or `failed`)
-/// and the captured frame rate, which the player frame-steps by.
-pub fn set_probe_result(
-    conn: &Connection,
-    id: i64,
-    state: &str,
-    fps: Option<f64>,
-) -> rusqlite::Result<()> {
+/// Record a probe's outcome (issue #19): the playability state — `ready` once
+/// probed, since libmpv plays the original directly (ADR 0008), or `failed`.
+pub fn set_probe_result(conn: &Connection, id: i64, state: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE recordings SET transcode_state = ?1, fps = ?2 WHERE id = ?3",
-        rusqlite::params![state, fps, id],
+        "UPDATE recordings SET transcode_state = ?1 WHERE id = ?2",
+        rusqlite::params![state, id],
     )?;
     Ok(())
 }

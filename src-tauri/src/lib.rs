@@ -68,12 +68,6 @@ struct Db(Arc<Mutex<Connection>>);
 /// up on the same pass; a scan that arrives after it exits starts a fresh worker.
 struct MediaWorker(Arc<AtomicBool>);
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
 /// Register the video files under `folder` as recordings, grouped into
 /// sessions by capture day. Idempotent across re-scans. Kicks off background
 /// media work (probe then segment) for any newly registered recordings.
@@ -246,18 +240,18 @@ fn run_media_worker(conn: &Mutex<Connection>) {
             db::MediaWork::CaptureDate(id, path) => refine_recording_date(conn, id, &path),
             db::MediaWork::Probe(id, path) => {
                 // libmpv plays any codec and seeks sparse GOPs (ADR 0008), so the
-                // recording is playable immediately — the probe only captures the
-                // frame rate the player frame-steps by (issue #19) and marks the
-                // recording `ready`. A probe failure marks it `failed` instead.
-                let (next, fps) = match media::probe(&path) {
-                    Ok(probe) => ("ready", probe.fps),
+                // recording is playable immediately — the probe only confirms the
+                // file is readable and marks the recording `ready`. A probe failure
+                // marks it `failed` instead.
+                let next = match media::probe(&path) {
+                    Ok(()) => "ready",
                     Err(e) => {
                         log::warn!("media worker: probe failed for {path}: {e}");
-                        ("failed", None)
+                        "failed"
                     }
                 };
                 if let Ok(c) = conn.lock() {
-                    if let Err(e) = db::set_probe_result(&c, id, next, fps) {
+                    if let Err(e) = db::set_probe_result(&c, id, next) {
                         log::error!("media worker: could not record probe for {path}: {e}");
                     }
                 }
@@ -416,7 +410,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             scan_folder,
             list_sessions,
             recording_timeline,
