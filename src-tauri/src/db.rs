@@ -16,15 +16,13 @@ pub struct Recording {
     pub file_size: i64,
     pub quick_hash: String,
     pub capture_day: String,
-    /// Playability lifecycle: `unknown` (not yet probed), `ready` (probed — the
-    /// frame rate is captured and libmpv can play the original directly, ADR
-    /// 0008), or `failed` (probe could not read the file). The column keeps its
-    /// historical `transcode_state` name; there is no longer a transcode step
-    /// (ADR 0005 superseded), so it never holds `pending`.
-    pub transcode_state: String,
+    /// Playability lifecycle: `unknown` (not yet probed), `ready` (probed —
+    /// libmpv can play the original directly, ADR 0008), or `failed` (probe could
+    /// not read the file).
+    pub probe_state: String,
     /// Segmentation lifecycle (ADR 0002): `unknown` (not yet segmented or
     /// queued), `ready` (draft timeline produced), or `failed` (audio
-    /// extraction / segmentation error). Only starts once `transcode_state` is
+    /// extraction / segmentation error). Only starts once `probe_state` is
     /// `ready` (i.e. the recording has been probed).
     pub segment_state: String,
     /// Recording duration in milliseconds, learned during segmentation. `None`
@@ -66,7 +64,7 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             file_size   INTEGER NOT NULL,
             quick_hash  TEXT NOT NULL,
             capture_day TEXT NOT NULL,
-            transcode_state TEXT NOT NULL DEFAULT 'unknown',
+            probe_state TEXT NOT NULL DEFAULT 'unknown',
             segment_state   TEXT NOT NULL DEFAULT 'unknown',
             date_state      TEXT NOT NULL DEFAULT 'unknown',
             duration_ms     INTEGER,
@@ -87,8 +85,17 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // Upgrade DBs created before later slices. The CREATE above is a no-op when
     // a table already exists, so add new columns here; ignore the
     // duplicate-column error when one is already present.
+    // The probe-state column was historically named `transcode_state` (ADR 0005,
+    // since superseded by ADR 0008 — there is no transcode step). Rename it in
+    // place where present so the value survives; the RENAME runs before the
+    // ADD COLUMN so a DB that already has `transcode_state` keeps its data, while
+    // a much older DB with neither column gains a fresh `probe_state`.
     let _ = conn.execute(
-        "ALTER TABLE recordings ADD COLUMN transcode_state TEXT NOT NULL DEFAULT 'unknown'",
+        "ALTER TABLE recordings RENAME COLUMN transcode_state TO probe_state",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE recordings ADD COLUMN probe_state TEXT NOT NULL DEFAULT 'unknown'",
         [],
     );
     let _ = conn.execute(
@@ -363,7 +370,7 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
     for (id, capture_day) in sessions {
         let mut rstmt = conn.prepare(
             "SELECT r.id, r.path, r.file_size, r.quick_hash, r.capture_day,
-                    r.transcode_state, r.segment_state, r.duration_ms,
+                    r.probe_state, r.segment_state, r.duration_ms,
                     (SELECT COUNT(*) FROM rallies WHERE recording_id = r.id)
              FROM recordings r WHERE r.session_id = ?1 ORDER BY r.path",
         )?;
@@ -375,7 +382,7 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
                     file_size: row.get(2)?,
                     quick_hash: row.get(3)?,
                     capture_day: row.get(4)?,
-                    transcode_state: row.get(5)?,
+                    probe_state: row.get(5)?,
                     segment_state: row.get(6)?,
                     duration_ms: row.get(7)?,
                     rally_count: row.get(8)?,
@@ -393,7 +400,7 @@ pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
 
 /// One unit of work for the background media worker, in priority order: probe a
 /// recording for its frame rate (which also marks it playable), then produce its
-/// draft timeline (segment). Segmentation is gated on `transcode_state = 'ready'`
+/// draft timeline (segment). Segmentation is gated on `probe_state = 'ready'`
 /// so it always runs after the probe.
 #[derive(Debug, PartialEq)]
 pub enum MediaWork {
@@ -429,7 +436,7 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     let probe = conn
         .query_row(
             "SELECT id, path FROM recordings
-             WHERE transcode_state = 'unknown' ORDER BY id LIMIT 1",
+             WHERE probe_state = 'unknown' ORDER BY id LIMIT 1",
             [],
             |row| Ok(MediaWork::Probe(row.get(0)?, row.get(1)?)),
         )
@@ -440,7 +447,7 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     // Phase 2: anything probed but not yet segmented.
     conn.query_row(
         "SELECT id, path FROM recordings
-         WHERE transcode_state = 'ready' AND segment_state = 'unknown'
+         WHERE probe_state = 'ready' AND segment_state = 'unknown'
          ORDER BY id LIMIT 1",
         [],
         |row| Ok(MediaWork::Segment(row.get(0)?, row.get(1)?)),
@@ -452,7 +459,7 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
 /// probed, since libmpv plays the original directly (ADR 0008), or `failed`.
 pub fn set_probe_result(conn: &Connection, id: i64, state: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE recordings SET transcode_state = ?1 WHERE id = ?2",
+        "UPDATE recordings SET probe_state = ?1 WHERE id = ?2",
         rusqlite::params![state, id],
     )?;
     Ok(())
@@ -735,7 +742,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, transcode_state, segment_state, duration_ms)
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, probe_state, segment_state, duration_ms)
              VALUES (1, ?1, 0, '', '2026-01-01', 'ready', 'ready', 100000)",
             [path],
         )
@@ -827,7 +834,7 @@ mod tests {
     fn edits_are_scoped_to_their_recording() {
         let (conn, _) = db_with_rallies("/a.mp4", &[(1000, 5000)]);
         conn.execute(
-            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, transcode_state, segment_state, duration_ms)
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, probe_state, segment_state, duration_ms)
              VALUES (1, '/b.mp4', 0, '', '2026-01-01', 'ready', 'ready', 100000)",
             [],
         )

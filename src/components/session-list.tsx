@@ -48,10 +48,9 @@ interface Recording {
   capture_day: string
   /**
    * Playability lifecycle: unknown (not yet probed) | ready | failed. libmpv
-   * plays originals directly (ADR 0008), so there is no transcode step; the
-   * column keeps its historical `transcode_state` name.
+   * plays originals directly (ADR 0008), so there is no transcode step.
    */
-  transcode_state: string
+  probe_state: string
   /** Segmentation lifecycle: unknown | ready | failed (ADR 0002). */
   segment_state: string
   /** Recording duration in ms; null until segmented. */
@@ -73,14 +72,14 @@ function isPreparing(state: string): boolean {
  */
 function isAnalyzing(recording: Recording): boolean {
   return (
-    recording.transcode_state === "ready" &&
+    recording.probe_state === "ready" &&
     recording.segment_state === "unknown"
   )
 }
 
 /** True while any background media work is still pending for this recording. */
 function isProcessing(recording: Recording): boolean {
-  return isPreparing(recording.transcode_state) || isAnalyzing(recording)
+  return isPreparing(recording.probe_state) || isAnalyzing(recording)
 }
 
 interface Session {
@@ -352,7 +351,7 @@ export function SessionList({ onPlay }: SessionListProps) {
                       >
                         {fileName(recording.path)}
                       </span>
-                      {isPreparing(recording.transcode_state) ? (
+                      {isPreparing(recording.probe_state) ? (
                         <span
                           className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
                           title="Preparing this recording for playback…"
@@ -360,7 +359,7 @@ export function SessionList({ onPlay }: SessionListProps) {
                           <Loader2Icon className="size-3.5 animate-spin" />
                           Preparing…
                         </span>
-                      ) : recording.transcode_state === "failed" ? (
+                      ) : recording.probe_state === "failed" ? (
                         <span
                           className="ml-auto flex shrink-0 items-center gap-1.5 text-destructive"
                           title="This recording could not be read for playback."
