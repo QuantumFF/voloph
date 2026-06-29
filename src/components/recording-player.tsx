@@ -51,12 +51,15 @@ import {
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
+  resumeStartMs,
+  resumeTickLanded,
   seekTarget,
   splitRallyEdit,
   stepSpeedIndex,
   stripScrollTarget,
   type EditPlan,
   type PlaylistRecording,
+  type Resume,
   type SessionModel,
   type SessionRally,
   type Timeline,
@@ -102,6 +105,14 @@ const SEEK_COARSE_MS = 10000 // Shift+←/→
 /** Volume step (0–100) for the up/down arrows. */
 const VOLUME_STEP = 10
 
+/**
+ * How close (ms) the playhead must get to a boundary-crossing resume target
+ * before its `time-pos` ticks count as "landed" and normal playback resumes. The
+ * `FILE_LOADED` resume seek is exact, so the first post-seek tick sits right at
+ * the target; this slack only has to clear the near-zero pre-seek ticks.
+ */
+const RESUME_TICK_TOL_MS = 250
+
 /** How much each Alt+scroll notch over the timeline zooms. */
 const ALT_SCROLL_ZOOM_FACTOR = 1.15
 
@@ -135,14 +146,6 @@ function fileName(path: string): string {
   const parts = path.split(/[\\/]/)
   return parts[parts.length - 1] || path
 }
-
-/**
- * Where to resume once the playlist crosses into a recording: its first rally
- * (advancing forward), its last rally (stepping back via Prev), or a specific
- * recording-local time (a click on the session strip that landed in another
- * recording).
- */
-type Resume = "start" | "end" | { atMs: number }
 
 /**
  * One entry in the single keymap definition: its display form (`keys`/`label`
@@ -197,6 +200,15 @@ export function RecordingPlayer({
   // Imperative handle on the timeline strip so the `F` key / button can recenter
   // it on the playhead (and re-arm follow) without lifting its scroll state.
   const timelineRef = useRef<SessionTimelineHandle>(null)
+  // Recording-local time a boundary crossing is resuming at, while it lands.
+  // mpv plays a freshly-loaded file from 0 until the resume seek (applied on
+  // `FILE_LOADED`) takes hold, emitting `time-pos` ticks near 0 in between; those
+  // are dropped until the playhead reaches the target so gap-skip doesn't act on
+  // a transient ~0 and yank the playhead to the first rally, overriding a click
+  // that landed in a *later* rally of the crossed-into recording. Null once the
+  // resume has landed (or when there's no pending resume). A ref, so the
+  // `time-pos` listener reads it synchronously without re-subscribing.
+  const resumeTargetRef = useRef<number | null>(null)
 
   // Every recording's draft timeline, keyed by path so it survives switching
   // recordings (and so the whole session can be stitched into one strip). Each
@@ -325,16 +337,34 @@ export function RecordingPlayer({
   }, [])
 
   // Load the current recording directly from disk and start playing it (ADR
-  // 0008). A boundary crossing re-runs this on the new `path`; the resume effect
-  // below seeks to the right rally once its timeline is known.
+  // 0008). A boundary crossing re-runs this on the new `path`, carrying the
+  // resume position *into the load*: mpv applies `startMs` on `FILE_LOADED`,
+  // atomic with opening the file, so a click that lands in another recording
+  // resumes where it landed instead of racing a separate seek against the
+  // still-loading file (which mpv drops, leaving playback at 0). `pendingSeek`
+  // and `rallies` are read from the crossing commit, not subscribed — re-running
+  // this on either would reload the file mid-playback — hence the deps lint-off.
   useEffect(() => {
     if (!path) return
-    void trackedInvoke("mpv_load", { path })
+    const startMs =
+      pendingSeek != null ? resumeStartMs(pendingSeek, rallies) : null
+    void trackedInvoke("mpv_load", { path, startMs })
       .then(() => {
         setError(null)
         setPaused(false)
       })
       .catch((e) => setError(String(e)))
+    // Gate the playhead handler until this load's resume seek lands, so the
+    // freshly-loaded file's near-zero ticks don't trip gap-skip (a non-null
+    // target arms it; null disarms a stale one from a prior crossing).
+    resumeTargetRef.current = startMs
+    if (startMs != null) {
+      // Resolved here → the deferred resume effect below has nothing left to do.
+      /* eslint-disable-next-line react-hooks/set-state-in-effect -- carrying the resume into the load is the point of the effect */
+      setCurrentMs(startMs)
+      setPendingSeek(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- resume/rallies are the crossing-commit values, deliberately not deps (they'd reload the file)
   }, [path])
 
   // Re-apply the user's speed/volume/mute after a load (mpv resets them when a
@@ -351,18 +381,15 @@ export function RecordingPlayer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path])
 
-  // After a boundary crossing, once the new recording's timeline is known, seek
-  // to the requested resume point. A specific time seeks straight there; the
-  // first/last rally waits for the timeline (with no rallies yet there is nothing
-  // to seek to, so the recording plays from the top until its draft arrives).
+  // The deferred half of a boundary crossing: a `start`/`end` resume whose
+  // recording wasn't segmented yet at load time (so `resumeStartMs` returned
+  // null and the load couldn't carry it). Once its draft arrives the file is
+  // already loaded, so a plain seek lands cleanly — no race. A specific `{ atMs }`
+  // and an already-segmented `start`/`end` are resolved by the load effect above,
+  // which clears `pendingSeek`, so they never reach here.
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect -- resuming a crossed-into recording seeks (which sets state), the whole point of the effect */
-    if (pendingSeek == null) return
-    if (typeof pendingSeek === "object") {
-      seekTo(pendingSeek.atMs)
-      setPendingSeek(null)
-      return
-    }
+    if (pendingSeek == null || typeof pendingSeek === "object") return
     if (rallies.length === 0) {
       // Wait for this recording's draft; until then it plays from the top.
       return
@@ -443,8 +470,17 @@ export function RecordingPlayer({
   useEffect(() => {
     const unlisten: Array<() => void> = []
     void listen<number>("mpv:time-pos", (event) => {
-      setCurrentMs(event.payload)
-      handlersRef.current.skipGaps(event.payload)
+      const ms = event.payload
+      // While a boundary-crossing resume is landing, drop the freshly-loaded
+      // file's pre-seek ticks (near 0) so gap-skip can't override the resume;
+      // accept once the playhead reaches the target, then resume normally.
+      const target = resumeTargetRef.current
+      if (target != null) {
+        if (!resumeTickLanded(ms, target, RESUME_TICK_TOL_MS)) return
+        resumeTargetRef.current = null
+      }
+      setCurrentMs(ms)
+      handlersRef.current.skipGaps(ms)
     }).then((u) => unlisten.push(u))
     void listen("mpv:ended", () => handlersRef.current.handleEnded()).then(
       (u) => unlisten.push(u)

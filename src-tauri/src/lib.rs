@@ -12,7 +12,7 @@ mod mpv {
         Ok(())
     }
     #[tauri::command]
-    pub fn mpv_load(_path: String) -> Result<(), String> {
+    pub fn mpv_load(_path: String, _start_ms: Option<f64>) -> Result<(), String> {
         Err("embedded playback is only available on Linux".into())
     }
     #[tauri::command]

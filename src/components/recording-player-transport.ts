@@ -273,6 +273,45 @@ export function prevRallyAction(
 }
 
 /**
+ * Where to resume once the playlist crosses into a recording: its first rally
+ * (advancing forward), its last rally (stepping back via Prev), or a specific
+ * recording-local time (a click on the session strip that landed in another
+ * recording).
+ */
+export type Resume = "start" | "end" | { atMs: number }
+
+/**
+ * The recording-local time a crossing should open the new recording at, resolved
+ * at load time so it can be baked into the load itself (mpv applies it on
+ * `FILE_LOADED`, atomic with opening the file — no load/seek race). A specific
+ * `{ atMs }` always resolves; `start`/`end` need the recording's rallies, so they
+ * return `null` until its timeline arrives (the recording then plays from the top
+ * until the deferred resume seeks). `end` resumes at the *last* rally's start.
+ */
+export function resumeStartMs(resume: Resume, rallies: Rally[]): number | null {
+  if (typeof resume === "object") return resume.atMs
+  if (rallies.length === 0) return null
+  const target = resume === "start" ? rallies[0] : rallies[rallies.length - 1]
+  return target.start_ms
+}
+
+/**
+ * Whether a `time-pos` tick at recording-local `ms` shows the playhead has
+ * reached a boundary-crossing resume `target` (within `tolMs`). Until it has, the
+ * freshly-loaded file's near-zero pre-seek ticks must be dropped so gap-skip
+ * can't act on them and override the resume (a click landing in a later rally of
+ * the crossed-into recording). The resume seek is exact, so the first post-seek
+ * tick sits right at the target; the slack only clears the pre-seek ticks.
+ */
+export function resumeTickLanded(
+  ms: number,
+  target: number,
+  tolMs: number
+): boolean {
+  return ms + tolMs >= target
+}
+
+/**
  * The next uncertain region's session-global start after `hereMs`, wrapping to
  * the first when none is left ahead, so repeated presses cycle through every
  * doubt in the session (ADR 0002). `null` when there are no uncertain regions.

@@ -11,6 +11,8 @@ import {
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
+  resumeStartMs,
+  resumeTickLanded,
   seekTarget,
   splitRallyEdit,
   stepSpeedIndex,
@@ -202,6 +204,61 @@ describe("nextUncertainMs", () => {
       "a.mp4": timeline(10000, [rally(1, 1000, 2000, 0.9)]),
     })
     expect(nextUncertainMs(model.rallies, 0)).toBeNull()
+  })
+})
+
+describe("resumeStartMs", () => {
+  const rallies = [rally(1, 1000, 2000), rally(2, 5000, 6000)]
+
+  // The regression seam for "jumping to the next recording starts from the
+  // beginning instead of where I clicked": a click that crosses a boundary
+  // carries `{ atMs }`, which must resolve to that exact local time so the load
+  // can bake it in (applied on FILE_LOADED) rather than race a dropped seek.
+  it("resolves a clicked local time straight through", () => {
+    expect(resumeStartMs({ atMs: 4200 }, rallies)).toBe(4200)
+    // Resolves even before the crossed-into recording is segmented.
+    expect(resumeStartMs({ atMs: 4200 }, [])).toBe(4200)
+    // Zero is a real target, not "no resume".
+    expect(resumeStartMs({ atMs: 0 }, rallies)).toBe(0)
+  })
+
+  it("resumes forward crossings at the first rally's start", () => {
+    expect(resumeStartMs("start", rallies)).toBe(1000)
+  })
+
+  it("resumes backward crossings at the last rally's start", () => {
+    expect(resumeStartMs("end", rallies)).toBe(5000)
+  })
+
+  it("defers a rally resume until the timeline arrives", () => {
+    // No rallies yet → null, so the load can't carry it and the recording plays
+    // from the top until the deferred resume seeks once its draft lands.
+    expect(resumeStartMs("start", [])).toBeNull()
+    expect(resumeStartMs("end", [])).toBeNull()
+  })
+})
+
+describe("resumeTickLanded", () => {
+  // The regression seam for "crossing into a *rally* still starts at the
+  // beginning": a freshly-loaded file emits near-zero ticks before the resume
+  // seek lands; those must be dropped (not landed) so gap-skip can't yank the
+  // playhead to the first rally and override a click on a later rally.
+  it("drops the pre-seek near-zero ticks of a deep resume", () => {
+    expect(resumeTickLanded(0, 42_000, 250)).toBe(false)
+    expect(resumeTickLanded(80, 42_000, 250)).toBe(false)
+  })
+
+  it("lands once the playhead reaches the target (exact seek)", () => {
+    expect(resumeTickLanded(42_000, 42_000, 250)).toBe(true)
+    // A frame shy of the target still counts as landed (within tolerance).
+    expect(resumeTickLanded(41_900, 42_000, 250)).toBe(true)
+    // And anything past it (playback advancing after the seek).
+    expect(resumeTickLanded(42_500, 42_000, 250)).toBe(true)
+  })
+
+  it("treats a near-start resume as immediately landed (no gating to strand)", () => {
+    expect(resumeTickLanded(0, 0, 250)).toBe(true)
+    expect(resumeTickLanded(0, 100, 250)).toBe(true)
   })
 })
 
