@@ -106,6 +106,7 @@ struct MpvEventEndFile {
 const MPV_FORMAT_DOUBLE: c_int = 5;
 
 const MPV_EVENT_SHUTDOWN: c_int = 1;
+const MPV_EVENT_FILE_LOADED: c_int = 8;
 const MPV_EVENT_END_FILE: c_int = 7;
 const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
 
@@ -117,6 +118,15 @@ const MPV_END_FILE_REASON_ERROR: c_int = 4;
 /// `reply_userdata` tag for the `time-pos` observation, distinguishing it from
 /// any other observed property in the event stream.
 const TIME_POS_USERDATA: u64 = 1;
+
+/// Recording-local position (ms) the *next* `loadfile` should resume at, applied
+/// by the event loop when mpv fires `FILE_LOADED`. Crossing into a recording at a
+/// specific point (a click on the session strip, or rally-to-rally navigation)
+/// sets this before loading; seeking *with* the load rather than as a separate
+/// command avoids racing the seek against the still-loading file (libmpv's
+/// `loadfile` is async and drops a seek issued before the file is ready, leaving
+/// playback at 0). `None` opens the file at its start. The last load wins.
+static PENDING_START_MS: Mutex<Option<f64>> = Mutex::new(None);
 
 // libmpv refuses to initialize unless `LC_NUMERIC` is the C locale (it parses
 // floats with `.` decimals); GTK sets a localized one, so we pin it before
@@ -528,6 +538,20 @@ fn event_loop(handle_addr: usize, app: AppHandle) {
         let event = unsafe { &*event };
         match event.event_id {
             MPV_EVENT_SHUTDOWN => break,
+            MPV_EVENT_FILE_LOADED => {
+                // The file is now open and seekable, so a resume position carried
+                // by the load lands cleanly here — atomic with the load, unlike a
+                // seek raced against the still-loading file (which mpv drops).
+                let start = PENDING_START_MS.lock().ok().and_then(|mut g| g.take());
+                if let Some(ms) = start {
+                    let secs = (ms / 1000.0).max(0.0);
+                    if let Err(e) =
+                        run_command(handle, &["seek", &secs.to_string(), "absolute+exact"])
+                    {
+                        log::warn!("mpv: resume seek on file-loaded failed: {e}");
+                    }
+                }
+            }
             MPV_EVENT_PROPERTY_CHANGE if event.reply_userdata == TIME_POS_USERDATA => {
                 if event.data.is_null() {
                     continue;
@@ -581,9 +605,22 @@ fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
 // ---------------------------------------------------------------------------
 
 /// Open a recording directly from disk and start playing it (ADR 0008 — no
-/// loopback HTTP). Replaces the current file if one is already loaded.
+/// loopback HTTP). Replaces the current file if one is already loaded. When
+/// `start_ms` is given the recording resumes there: it's recorded for the event
+/// loop to apply on `FILE_LOADED` (seeking *with* the load, not as a racing
+/// follow-up command — see [`PENDING_START_MS`]), so a click that crosses into
+/// another recording lands where it clicked instead of at the file's start.
 #[tauri::command]
-pub fn mpv_load(state: State<'_, MpvState>, path: String) -> Result<(), String> {
+pub fn mpv_load(
+    state: State<'_, MpvState>,
+    path: String,
+    start_ms: Option<f64>,
+) -> Result<(), String> {
+    // Record the resume position before issuing the load so the `FILE_LOADED`
+    // this load triggers sees it. A `None` clears any stale pending start.
+    if let Ok(mut pending) = PENDING_START_MS.lock() {
+        *pending = start_ms;
+    }
     let cmd = CString::new("loadfile").map_err(|e| e.to_string())?;
     let file = CString::new(path).map_err(|e| e.to_string())?;
     let args: [*const c_char; 3] = [cmd.as_ptr(), file.as_ptr(), ptr::null()];
