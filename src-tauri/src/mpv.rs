@@ -33,7 +33,7 @@ use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
 use gtk::prelude::*;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------------------------------------------------------------------------
 // libmpv FFI (client.h + render_gl.h). Only the handful of entry points this
@@ -75,6 +75,49 @@ const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 
+// --- Event API (client.h). Only what the playhead/end stream needs. ---
+
+/// `mpv_event` — what `mpv_wait_event` returns. `data` points at an event-specific
+/// struct (here either `mpv_event_property` or `mpv_event_end_file`).
+#[repr(C)]
+struct MpvEvent {
+    event_id: c_int,
+    error: c_int,
+    reply_userdata: u64,
+    data: *mut c_void,
+}
+
+/// `mpv_event_property` — the payload of a `PROPERTY_CHANGE` event. `data` points
+/// at the value in the requested format (a `f64` for `MPV_FORMAT_DOUBLE`).
+#[repr(C)]
+struct MpvEventProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
+}
+
+/// `mpv_event_end_file` — the payload of an `END_FILE` event.
+#[repr(C)]
+struct MpvEventEndFile {
+    reason: c_int,
+    error: c_int,
+}
+
+const MPV_FORMAT_DOUBLE: c_int = 5;
+
+const MPV_EVENT_SHUTDOWN: c_int = 1;
+const MPV_EVENT_END_FILE: c_int = 7;
+const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
+
+// `mpv_end_file_reason`: the playthrough reached the end of the file (vs. a
+// `stop`/`loadfile` replacing it, or a decode error).
+const MPV_END_FILE_REASON_EOF: c_int = 0;
+const MPV_END_FILE_REASON_ERROR: c_int = 4;
+
+/// `reply_userdata` tag for the `time-pos` observation, distinguishing it from
+/// any other observed property in the event stream.
+const TIME_POS_USERDATA: u64 = 1;
+
 // libmpv refuses to initialize unless `LC_NUMERIC` is the C locale (it parses
 // floats with `.` decimals); GTK sets a localized one, so we pin it before
 // creating the handle. `LC_NUMERIC` is 1 on glibc.
@@ -90,6 +133,14 @@ extern "C" {
     fn mpv_set_property_string(ctx: *mut MpvHandle, name: *const c_char, data: *const c_char) -> c_int;
     fn mpv_command(ctx: *mut MpvHandle, args: *const *const c_char) -> c_int;
     fn mpv_error_string(error: c_int) -> *const c_char;
+
+    fn mpv_observe_property(
+        ctx: *mut MpvHandle,
+        reply_userdata: u64,
+        name: *const c_char,
+        format: c_int,
+    ) -> c_int;
+    fn mpv_wait_event(ctx: *mut MpvHandle, timeout: f64) -> *mut MpvEvent;
 
     fn mpv_render_context_create(
         res: *mut *mut MpvRenderContext,
@@ -428,8 +479,89 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
 
     app.manage(MpvState { handle });
     app.manage(SurfaceTx(Mutex::new(tx)));
+
+    // Drive the playhead and end/error UI states from mpv's own event stream
+    // (ADR 0008): observe `time-pos` and forward each tick — plus end-of-file and
+    // decode errors — to the frontend as Tauri events, replacing the webview's
+    // `timeupdate` handler and the `seekBaseMs + currentTime` mapping.
+    let handle_addr = handle as usize;
+    let app_for_events = app.clone();
+    std::thread::spawn(move || event_loop(handle_addr, app_for_events));
+
     log::info!("mpv: embedded surface initialized");
     Ok(())
+}
+
+/// Names of the Tauri events the playback event loop emits.
+const EVENT_TIME_POS: &str = "mpv:time-pos";
+const EVENT_ENDED: &str = "mpv:ended";
+const EVENT_ERROR: &str = "mpv:error";
+
+/// Pump mpv's event stream on a dedicated thread for the whole process lifetime,
+/// translating mpv events into Tauri events the player listens to:
+///
+/// - `time-pos` property changes → `mpv:time-pos` carrying the playhead in ms.
+/// - end-of-file → `mpv:ended`; a decode error → `mpv:error`.
+///
+/// `mpv_wait_event` blocks up to the timeout, so this never busy-spins. The mpv
+/// client API is thread-safe, so reading the handle here is sound (the pointer is
+/// passed as a `usize` because raw pointers are not `Send`).
+fn event_loop(handle_addr: usize, app: AppHandle) {
+    let handle = handle_addr as *mut MpvHandle;
+
+    // Ask mpv to push `time-pos` changes into the event stream as doubles
+    // (seconds). mpv coalesces these to roughly its display rate.
+    if let Ok(name) = CString::new("time-pos") {
+        let rc =
+            unsafe { mpv_observe_property(handle, TIME_POS_USERDATA, name.as_ptr(), MPV_FORMAT_DOUBLE) };
+        if rc < 0 {
+            log::warn!("mpv: observe time-pos failed: {}", mpv_err(rc));
+        }
+    }
+
+    loop {
+        // Block until the next event (1s timeout just to re-check liveness).
+        let event = unsafe { mpv_wait_event(handle, 1.0) };
+        if event.is_null() {
+            continue;
+        }
+        let event = unsafe { &*event };
+        match event.event_id {
+            MPV_EVENT_SHUTDOWN => break,
+            MPV_EVENT_PROPERTY_CHANGE if event.reply_userdata == TIME_POS_USERDATA => {
+                if event.data.is_null() {
+                    continue;
+                }
+                let prop = unsafe { &*(event.data as *const MpvEventProperty) };
+                // A null payload means the property is currently unavailable
+                // (e.g. between files); skip it rather than emit a bogus 0.
+                if prop.format != MPV_FORMAT_DOUBLE || prop.data.is_null() {
+                    continue;
+                }
+                let secs = unsafe { *(prop.data as *const f64) };
+                let _ = app.emit(EVENT_TIME_POS, secs * 1000.0);
+            }
+            MPV_EVENT_END_FILE => {
+                let reason = if event.data.is_null() {
+                    MPV_END_FILE_REASON_EOF
+                } else {
+                    unsafe { (*(event.data as *const MpvEventEndFile)).reason }
+                };
+                match reason {
+                    MPV_END_FILE_REASON_EOF => {
+                        let _ = app.emit(EVENT_ENDED, ());
+                    }
+                    MPV_END_FILE_REASON_ERROR => {
+                        let _ = app.emit(EVENT_ERROR, "playback failed");
+                    }
+                    // STOP/QUIT/REDIRECT: a deliberate stop or a `loadfile`
+                    // replacing the file — not an end state the UI reacts to.
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Set an mpv option, logging (but not failing) on error — a missing option
@@ -469,6 +601,42 @@ pub fn mpv_set_pause(state: State<'_, MpvState>, paused: bool) -> Result<(), Str
     set_property(state.handle, "pause", if paused { "yes" } else { "no" })
 }
 
+/// Seek to an absolute position in the recording (ADR 0008 — native mpv seek, no
+/// stream reload). libmpv seeks sparse GOPs without a dense-keyframe requirement,
+/// so this works on HEVC originals untouched since import.
+#[tauri::command]
+pub fn mpv_seek(state: State<'_, MpvState>, ms: f64) -> Result<(), String> {
+    let secs = (ms / 1000.0).max(0.0);
+    run_command(state.handle, &["seek", &secs.to_string(), "absolute+exact"])
+}
+
+/// Step one frame forward (`true`) or back (`false`) using mpv's native
+/// frame-stepping — frame-accurate and in sync with the playhead, replacing the
+/// deleted JPEG-overlay path.
+#[tauri::command]
+pub fn mpv_frame_step(state: State<'_, MpvState>, forward: bool) -> Result<(), String> {
+    let cmd = if forward { "frame-step" } else { "frame-back-step" };
+    run_command(state.handle, &[cmd])
+}
+
+/// Set the playback speed multiplier (the speed ladder, e.g. 0.25–2.0).
+#[tauri::command]
+pub fn mpv_set_speed(state: State<'_, MpvState>, speed: f64) -> Result<(), String> {
+    set_property(state.handle, "speed", &speed.to_string())
+}
+
+/// Set the output volume (0–100).
+#[tauri::command]
+pub fn mpv_set_volume(state: State<'_, MpvState>, volume: f64) -> Result<(), String> {
+    set_property(state.handle, "volume", &volume.clamp(0.0, 100.0).to_string())
+}
+
+/// Mute or unmute the audio.
+#[tauri::command]
+pub fn mpv_set_mute(state: State<'_, MpvState>, muted: bool) -> Result<(), String> {
+    set_property(state.handle, "mute", if muted { "yes" } else { "no" })
+}
+
 /// Slave the native surface to the video pane's bounding rect (CSS px), reported
 /// by the frontend on mount and on resize.
 #[tauri::command]
@@ -476,10 +644,29 @@ pub fn mpv_set_rect(tx: State<'_, SurfaceTx>, x: i32, y: i32, w: i32, h: i32) {
     tx.send(SurfaceMsg::Rect { x, y, w, h });
 }
 
-/// Reveal the native surface (player view mounted).
+/// Reveal the native surface (player view mounted, or a full-area modal closed /
+/// the window restored — see [`mpv_suppress_surface`]). Playback is untouched.
 #[tauri::command]
 pub fn mpv_show(tx: State<'_, SurfaceTx>) {
     tx.send(SurfaceMsg::Show);
+}
+
+/// Hide the native surface *without* stopping playback, for the one constraint of
+/// the tiled surface (ADR 0008): the webview cannot draw over the video rect, so a
+/// full-area HTML overlay (the cheat-sheet) must hide the surface first, and a
+/// minimized window must not leave a stray surface. Restore with [`mpv_show`].
+///
+/// Distinct from [`mpv_hide`], which also `stop`s playback because it is the
+/// leave-the-player teardown — here playback continues underneath, paused or not.
+/// In-video HUD (e.g. an annotation verdict flash) belongs on mpv's OSD, never an
+/// HTML overlay over the video rect, precisely so it does not trip this hide.
+#[tauri::command]
+pub fn mpv_suppress_surface(tx: State<'_, SurfaceTx>, suppressed: bool) {
+    tx.send(if suppressed {
+        SurfaceMsg::Hide
+    } else {
+        SurfaceMsg::Show
+    });
 }
 
 /// Hide the native surface and stop playback (back to the session list — no
@@ -490,6 +677,22 @@ pub fn mpv_hide(tx: State<'_, SurfaceTx>, state: State<'_, MpvState>) {
     let cmd = c"stop";
     let args: [*const c_char; 2] = [cmd.as_ptr(), ptr::null()];
     unsafe { mpv_command(state.handle, args.as_ptr()) };
+}
+
+/// Issue an mpv command from string arguments (a NULL-terminated `argv`).
+fn run_command(handle: *mut MpvHandle, args: &[&str]) -> Result<(), String> {
+    let c_args: Vec<CString> = args
+        .iter()
+        .map(|a| CString::new(*a))
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut argv: Vec<*const c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+    argv.push(ptr::null());
+    let rc = unsafe { mpv_command(handle, argv.as_ptr()) };
+    if rc < 0 {
+        return Err(format!("mpv command {:?} failed: {}", args, mpv_err(rc)));
+    }
+    Ok(())
 }
 
 fn set_property(handle: *mut MpvHandle, name: &str, value: &str) -> Result<(), String> {
