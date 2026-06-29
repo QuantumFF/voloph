@@ -521,6 +521,12 @@ const EVENT_PAUSE: &str = "mpv:pause";
 const EVENT_SPEED: &str = "mpv:speed";
 const EVENT_VOLUME: &str = "mpv:volume";
 const EVENT_MUTE: &str = "mpv:mute";
+// A new file is open and any resume seek carried by its load has been applied,
+// so the next `time-pos` reflects the resumed position. The frontend drops every
+// tick between issuing a load and this event, because a tick carries no file
+// identity — without the signal a stale tick from the outgoing recording (or a
+// pre-seek near-0 from the new one) trips gap-skip against the wrong position.
+const EVENT_FILE_LOADED: &str = "mpv:file-loaded";
 
 /// Pump mpv's event stream on a dedicated thread for the whole process lifetime,
 /// translating mpv events into Tauri events the player listens to:
@@ -568,6 +574,11 @@ fn event_loop(handle_addr: usize, app: AppHandle) {
                         log::warn!("mpv: resume seek on file-loaded failed: {e}");
                     }
                 }
+                // Tell the frontend the file is up and its resume seek (if any)
+                // has landed, so it can reopen the playhead gate. Emitted after
+                // the seek and from this single event-loop thread, so it always
+                // reaches the frontend ahead of the new file's first `time-pos`.
+                let _ = app.emit(EVENT_FILE_LOADED, ());
             }
             MPV_EVENT_PROPERTY_CHANGE => {
                 if event.data.is_null() {
