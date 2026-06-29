@@ -469,34 +469,6 @@ pub fn set_probe_result(
     Ok(())
 }
 
-/// The probed frame rate of the recording at `path` (issue #19), surfaced to the
-/// player so frame-step is exact. `None` when the path is not registered or it
-/// has no captured fps yet; the player then defaults to 30 fps.
-pub fn recording_fps(conn: &Connection, path: &str) -> rusqlite::Result<Option<f64>> {
-    conn.query_row(
-        "SELECT fps FROM recordings WHERE path = ?1",
-        [path],
-        |row| row.get(0),
-    )
-    .optional()
-    .map(|opt| opt.flatten())
-}
-
-/// The playability state of the recording at `path` (`unknown` until probed,
-/// then `ready`; `failed` if the probe could not read it), used by the player.
-/// `None` when the path is not registered.
-pub fn recording_transcode_state(
-    conn: &Connection,
-    path: &str,
-) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT transcode_state FROM recordings WHERE path = ?1",
-        [path],
-        |row| row.get(0),
-    )
-    .optional()
-}
-
 /// Reset a recording's draft timeline so the media worker re-segments it on its
 /// next pass: drop its rallies and return it to `unknown`. Backs the Re-analyze
 /// action used while tuning the segmenter (ADR 0002). A no-op when `path` is not

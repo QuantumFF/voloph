@@ -53,7 +53,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
-use serde::Serialize;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
@@ -93,50 +92,6 @@ fn scan_folder(app: AppHandle, db: State<'_, Db>, folder: String) -> Result<db::
 fn list_sessions(db: State<'_, Db>) -> Result<Vec<db::Session>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     db::list_sessions(&conn).map_err(|e| e.to_string())
-}
-
-/// The loopback origin + token the player builds playback URLs from. The
-/// frontend requests `${origin}/play?path=…&token=…` for a ready recording.
-#[tauri::command]
-fn playback_endpoint(endpoint: State<'_, media::PlaybackEndpoint>) -> media::PlaybackEndpoint {
-    endpoint.inner().clone()
-}
-
-/// What the player needs to render a recording: the file to load (always the
-/// recording's own path — libmpv opens originals directly, ADR 0008) and its
-/// playability state.
-#[derive(Serialize)]
-struct PlaybackSource {
-    /// Absolute path to load. The recording's own path — originals are never
-    /// modified or proxied (ADR 0008).
-    path: String,
-    /// Playability state: `ready` is playable now (every recording becomes ready
-    /// as soon as it is probed, since libmpv decodes any codec); `unknown` is the
-    /// brief window before its probe runs; `failed` means the probe could not read
-    /// the file.
-    state: String,
-    /// Probed frame rate (issue #19) so the player can frame-step exactly, even
-    /// before segmentation. `null` when unknown; the player defaults to 30 fps.
-    fps: Option<f64>,
-}
-
-/// Resolve how to play the recording at `path`. libmpv opens the original
-/// directly and decodes any codec (ADR 0008), so a recording is playable as soon
-/// as it has been probed; the `state` only reflects whether the probe has run.
-#[tauri::command]
-fn resolve_playback(db: State<'_, Db>, path: String) -> Result<PlaybackSource, String> {
-    let (state, fps) = {
-        let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let state = db::recording_transcode_state(&conn, &path).map_err(|e| e.to_string())?;
-        let fps = db::recording_fps(&conn, &path).map_err(|e| e.to_string())?;
-        (state, fps)
-    };
-    Ok(PlaybackSource {
-        // Not registered (e.g. played straight from a dialog) — assume playable.
-        state: state.unwrap_or_else(|| "ready".to_string()),
-        fps,
-        path,
-    })
 }
 
 /// Resolve the draft timeline (rallies + per-region confidence) for the
@@ -449,10 +404,6 @@ pub fn run() {
             let conn = db::open(&dir.join("voloph.db"))?;
             app.manage(Db(Arc::new(Mutex::new(conn))));
             app.manage(MediaWorker(Arc::new(AtomicBool::new(false))));
-            // Loopback HTTP server the player streams recordings from (ADR 0005).
-            let endpoint = media::start()?;
-            log::info!("playback server listening at {}", endpoint.origin);
-            app.manage(endpoint);
             // Resume any media work left unfinished by a previous run (recordings
             // still needing a probe or segmentation) so every recording gets its
             // frame rate and draft timeline.
@@ -468,7 +419,6 @@ pub fn run() {
             greet,
             scan_folder,
             list_sessions,
-            resolve_playback,
             recording_timeline,
             reanalyze_recording,
             rescan_folders,
@@ -476,7 +426,6 @@ pub fn run() {
             update_rally,
             add_rally,
             delete_rally,
-            playback_endpoint,
             mpv::mpv_load,
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,
