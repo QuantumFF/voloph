@@ -14,6 +14,7 @@ import {
   seekTarget,
   splitRallyEdit,
   stepSpeedIndex,
+  stripScrollTarget,
   type Rally,
   type SessionRally,
   type Timeline,
@@ -372,5 +373,41 @@ describe("mergeRallyEdit", () => {
     const first = sessionRally(7, 1000, 2000)
     const second: SessionRally = { ...sessionRally(8, 500, 800), path: "c.mp4" }
     expect(mergeRallyEdit(first, second)).toEqual({ kind: "reject" })
+  })
+})
+
+describe("stripScrollTarget", () => {
+  // The regression seam for the "can't scroll past the playhead at a recording's
+  // start" bug: centring on a playhead at the far left clamps the target to 0,
+  // and the strip is already at 0, so the helper must report "skip" (null) — the
+  // caller then never arms its programmatic-scroll guard, so the next manual
+  // scroll is free to disarm follow.
+  it("returns null when centring on the far-left playhead is already a no-op", () => {
+    // target = playheadPx - clientWidth/2 = 0 - 400 = -400, clamps to 0 == current.
+    expect(stripScrollTarget(-400, 0, 800, 5000)).toBeNull()
+  })
+
+  it("returns null when the clamped target equals the current offset", () => {
+    expect(stripScrollTarget(100, 100, 800, 5000)).toBeNull()
+    // Past the max scroll, but already pinned to the max → still a no-op.
+    expect(stripScrollTarget(9000, 4200, 800, 5000)).toBeNull()
+  })
+
+  it("returns the clamped offset when a real move is needed", () => {
+    expect(stripScrollTarget(1200, 0, 800, 5000)).toBe(1200)
+    // Negative target clamps up to 0 (a real move away from a scrolled position).
+    expect(stripScrollTarget(-50, 300, 800, 5000)).toBe(0)
+    // Beyond the scrollable range clamps down to max (scrollWidth - clientWidth).
+    expect(stripScrollTarget(9000, 0, 800, 5000)).toBe(4200)
+  })
+
+  it("treats content narrower than the viewport as a single 0 position", () => {
+    expect(stripScrollTarget(500, 0, 800, 300)).toBeNull()
+    expect(stripScrollTarget(500, 10, 800, 300)).toBe(0)
+  })
+
+  it("rounds so sub-pixel scrollLeft drift doesn't force a spurious write", () => {
+    expect(stripScrollTarget(100.4, 100.1, 800, 5000)).toBeNull()
+    expect(stripScrollTarget(102, 100, 800, 5000)).toBe(102)
   })
 })
