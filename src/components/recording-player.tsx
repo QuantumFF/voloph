@@ -1,11 +1,21 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { listen } from "@tauri-apps/api/event"
 import {
   ArrowLeftIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  CrosshairIcon,
+  FastForwardIcon,
   KeyboardIcon,
   Loader2Icon,
   PauseIcon,
@@ -183,6 +193,9 @@ export function RecordingPlayer({
   const freePlayRef = useRef(false)
   // Focus host so the keymap's window handler is the only thing on keystrokes.
   const containerRef = useRef<HTMLDivElement>(null)
+  // Imperative handle on the timeline strip so the `F` key / button can recenter
+  // it on the playhead (and re-arm follow) without lifting its scroll state.
+  const timelineRef = useRef<SessionTimelineHandle>(null)
 
   // Every recording's draft timeline, keyed by path so it survives switching
   // recordings (and so the whole session can be stitched into one strip). Each
@@ -195,6 +208,10 @@ export function RecordingPlayer({
   const [volume, setVolume] = useState(100)
   const [speedIndex, setSpeedIndex] = useState(DEFAULT_SPEED_INDEX)
   const [looping, setLooping] = useState(false)
+  // Whether gap-free playback is on (the North Star default). When off, the
+  // playhead runs straight through the gaps between rallies — a manual "watch
+  // everything" mode toggled from the transport bar or the `G` key.
+  const [gapSkipEnabled, setGapSkipEnabled] = useState(true)
   const [editing, setEditing] = useState(false)
   const [showCheatSheet, setShowCheatSheet] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -363,6 +380,10 @@ export function RecordingPlayer({
   // a pure helper (issue #36) so it stays testable without mpv.
   const skipGaps = useCallback(
     (ms: number) => {
+      // Gap-skipping off → play straight through the gaps (mpv's `ended` event
+      // still crosses recordings at EOF). Looping a rally is independent of the
+      // toggle, so it's left to run.
+      if (!gapSkipEnabled && !looping) return
       const action = gapSkipAction(
         rallies,
         ms,
@@ -386,7 +407,15 @@ export function RecordingPlayer({
           break
       }
     },
-    [rallies, looping, atLastRecording, seekTo, goToRecording, index]
+    [
+      rallies,
+      looping,
+      gapSkipEnabled,
+      atLastRecording,
+      seekTo,
+      goToRecording,
+      index,
+    ]
   )
 
   // When the current recording ends naturally (its trailing gap was short enough
@@ -514,6 +543,15 @@ export function RecordingPlayer({
 
   const toggleLoop = useCallback(() => setLooping((l) => !l), [])
 
+  const toggleGapSkip = useCallback(() => setGapSkipEnabled((g) => !g), [])
+
+  // Recenter the timeline strip on the playhead and re-arm follow (the strip
+  // stops tracking the playhead once you scroll it away).
+  const jumpToPlayhead = useCallback(
+    () => timelineRef.current?.scrollToPlayhead(),
+    []
+  )
+
   const changeVolume = useCallback((delta: number) => {
     setVolume((prev) => {
       const next = clampVolume(prev + delta)
@@ -630,7 +668,9 @@ export function RecordingPlayer({
 
   const splitRally = useCallback(
     (rally: SessionRally, atGlobalMs: number) => {
-      runEdit(splitRallyEdit(rally, atGlobalMs, segmentOffset(rally.recordingIndex)))
+      runEdit(
+        splitRallyEdit(rally, atGlobalMs, segmentOffset(rally.recordingIndex))
+      )
     },
     [segmentOffset, runEdit]
   )
@@ -723,6 +763,18 @@ export function RecordingPlayer({
         run: toggleLoop,
       },
       {
+        keys: ["G"],
+        label: "Toggle skipping gaps",
+        match: (e) => plain(e) && e.key.toLowerCase() === "g",
+        run: toggleGapSkip,
+      },
+      {
+        keys: ["F"],
+        label: "Jump to playhead",
+        match: (e) => plain(e) && e.key.toLowerCase() === "f",
+        run: jumpToPlayhead,
+      },
+      {
         keys: ["M"],
         label: "Mute",
         match: (e) => plain(e) && e.key.toLowerCase() === "m",
@@ -750,6 +802,12 @@ export function RecordingPlayer({
         run: () => setShowCheatSheet((s) => !s),
       },
       {
+        keys: ["Scroll over timeline"],
+        label: "Scroll the timeline",
+        match: () => false,
+        run: () => {},
+      },
+      {
         keys: ["Alt + scroll over timeline"],
         label: "Zoom timeline at the cursor",
         match: () => false,
@@ -764,6 +822,8 @@ export function RecordingPlayer({
     goToRally,
     goToUncertain,
     toggleLoop,
+    toggleGapSkip,
+    jumpToPlayhead,
     toggleMute,
     stepSpeed,
     resetSpeed,
@@ -828,6 +888,7 @@ export function RecordingPlayer({
         paused={paused}
         muted={muted}
         looping={looping}
+        gapSkipEnabled={gapSkipEnabled}
         volume={volume}
         speed={SPEED_LADDER[speedIndex]}
         positionMs={globalPlayheadMs ?? currentMs}
@@ -836,11 +897,13 @@ export function RecordingPlayer({
         onFrameStep={frameStep}
         onToggleMute={toggleMute}
         onToggleLoop={toggleLoop}
+        onToggleGapSkip={toggleGapSkip}
         onStepSpeed={stepSpeed}
         onResetSpeed={resetSpeed}
         onShowKeys={() => setShowCheatSheet(true)}
       />
       <SessionTimeline
+        ref={timelineRef}
         session={session}
         recordingCount={recordings.length}
         globalPlayheadMs={globalPlayheadMs}
@@ -878,6 +941,7 @@ function TransportBar({
   paused,
   muted,
   looping,
+  gapSkipEnabled,
   volume,
   speed,
   positionMs,
@@ -886,6 +950,7 @@ function TransportBar({
   onFrameStep,
   onToggleMute,
   onToggleLoop,
+  onToggleGapSkip,
   onStepSpeed,
   onResetSpeed,
   onShowKeys,
@@ -893,6 +958,7 @@ function TransportBar({
   paused: boolean
   muted: boolean
   looping: boolean
+  gapSkipEnabled: boolean
   volume: number
   speed: number
   positionMs: number
@@ -901,6 +967,7 @@ function TransportBar({
   onFrameStep: (forward: boolean) => void
   onToggleMute: () => void
   onToggleLoop: () => void
+  onToggleGapSkip: () => void
   onStepSpeed: (dir: -1 | 1) => void
   onResetSpeed: () => void
   onShowKeys: () => void
@@ -968,6 +1035,18 @@ function TransportBar({
             <span className="text-sm">+</span>
           </Button>
         </div>
+        <Button
+          variant={gapSkipEnabled ? "default" : "outline"}
+          size="icon"
+          onClick={onToggleGapSkip}
+          title={
+            gapSkipEnabled
+              ? "Skipping gaps between rallies — click to play everything (G)"
+              : "Playing through gaps — click to skip to the next rally (G)"
+          }
+        >
+          <FastForwardIcon className="size-4" />
+        </Button>
         <Button
           variant={looping ? "default" : "outline"}
           size="icon"
@@ -1061,6 +1140,11 @@ function CheatSheet({
   )
 }
 
+/** Imperative surface of the timeline strip the player drives (jump-to-playhead). */
+interface SessionTimelineHandle {
+  scrollToPlayhead: () => void
+}
+
 /**
  * The session timeline strip beneath the player: every recording's draft
  * timeline stitched onto one continuous, horizontally-scrollable axis at a fixed
@@ -1075,49 +1159,55 @@ function CheatSheet({
  * owns the rally: drag an edge to adjust, split at the playhead, merge with the
  * next rally in the same recording, add around the playhead, or delete.
  */
-function SessionTimeline({
-  session,
-  recordingCount,
-  globalPlayheadMs,
-  reanalyzing,
-  canPrev,
-  canNext,
-  editing,
-  onSeekGlobal,
-  onPrevRally,
-  onNextRally,
-  onNextUncertain,
-  onReanalyze,
-  onToggleEditing,
-  onAdjustRally,
-  onAddAtPlayhead,
-  onDeleteRally,
-  onSplitRally,
-  onMergeRallies,
-}: {
-  session: SessionModel
-  recordingCount: number
-  globalPlayheadMs: number | null
-  reanalyzing: boolean
-  canPrev: boolean
-  canNext: boolean
-  editing: boolean
-  onSeekGlobal: (globalMs: number) => void
-  onPrevRally: () => void
-  onNextRally: () => void
-  onNextUncertain: () => void
-  onReanalyze: () => void
-  onToggleEditing: () => void
-  onAdjustRally: (
-    rally: SessionRally,
-    globalStart: number,
-    globalEnd: number
-  ) => void
-  onAddAtPlayhead: () => void
-  onDeleteRally: (rally: SessionRally) => void
-  onSplitRally: (rally: SessionRally, atGlobalMs: number) => void
-  onMergeRallies: (first: SessionRally, second: SessionRally) => void
-}) {
+const SessionTimeline = forwardRef<
+  SessionTimelineHandle,
+  {
+    session: SessionModel
+    recordingCount: number
+    globalPlayheadMs: number | null
+    reanalyzing: boolean
+    canPrev: boolean
+    canNext: boolean
+    editing: boolean
+    onSeekGlobal: (globalMs: number) => void
+    onPrevRally: () => void
+    onNextRally: () => void
+    onNextUncertain: () => void
+    onReanalyze: () => void
+    onToggleEditing: () => void
+    onAdjustRally: (
+      rally: SessionRally,
+      globalStart: number,
+      globalEnd: number
+    ) => void
+    onAddAtPlayhead: () => void
+    onDeleteRally: (rally: SessionRally) => void
+    onSplitRally: (rally: SessionRally, atGlobalMs: number) => void
+    onMergeRallies: (first: SessionRally, second: SessionRally) => void
+  }
+>(function SessionTimeline(
+  {
+    session,
+    recordingCount,
+    globalPlayheadMs,
+    reanalyzing,
+    canPrev,
+    canNext,
+    editing,
+    onSeekGlobal,
+    onPrevRally,
+    onNextRally,
+    onNextUncertain,
+    onReanalyze,
+    onToggleEditing,
+    onAdjustRally,
+    onAddAtPlayhead,
+    onDeleteRally,
+    onSplitRally,
+    onMergeRallies,
+  },
+  ref
+) {
   // The selected rally, by "path:id" so a row id shared across recordings can
   // never be ambiguous.
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
@@ -1132,10 +1222,19 @@ function SessionTimeline({
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   const [pxPerSec, setPxPerSec] = useState(SESSION_PX_PER_SEC_DEFAULT)
+  // Whether the strip auto-scrolls to keep the playhead in view. Scrolling the
+  // strip by hand (wheel or scrollbar) disarms it so you can look ahead; the
+  // jump-to-playhead control re-arms it. A ref guards our own programmatic
+  // scrollLeft writes so they don't read back as a manual scroll.
+  const [following, setFollowing] = useState(true)
+  const programmaticScrollRef = useRef(false)
 
   const totalMs = session.totalMs
   const totalPx = (totalMs / 1000) * pxPerSec
   const rallyKey = (r: SessionRally) => `${r.path}:${r.id}`
+  // The strip only renders once a recording has rallies; the wheel/scroll
+  // listeners below re-attach when it appears (deps include this).
+  const hasRallies = totalMs > 0 && session.rallies.length > 0
 
   const canZoomIn = pxPerSec < SESSION_PX_PER_SEC_MAX
   const canZoomOut = pxPerSec > SESSION_PX_PER_SEC_MIN
@@ -1189,45 +1288,88 @@ function SessionTimeline({
     }
   }, [drag, session, xToMs, onAdjustRally])
 
-  // Alt+scroll over the strip zooms centered on the cursor.
+  // The wheel over the strip: Alt+scroll zooms centered on the cursor; a plain
+  // scroll pans the strip horizontally (so a vertical mouse wheel scrubs the
+  // timeline without having to grab the scrollbar). Re-attaches when the strip
+  // mounts (`hasRallies`), and uses `passive: false` so it can preventDefault.
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
     const onWheel = (e: WheelEvent) => {
-      if (!e.altKey) return
+      if (e.altKey) {
+        e.preventDefault()
+        const factor =
+          e.deltaY < 0 ? ALT_SCROLL_ZOOM_FACTOR : 1 / ALT_SCROLL_ZOOM_FACTOR
+        const rect = el.getBoundingClientRect()
+        const cursorContentPx = e.clientX - rect.left + el.scrollLeft
+        setPxPerSec((p) => {
+          const nextPx = clamp(
+            p * factor,
+            SESSION_PX_PER_SEC_MIN,
+            SESSION_PX_PER_SEC_MAX
+          )
+          const scale = nextPx / p
+          programmaticScrollRef.current = true
+          el.scrollLeft = cursorContentPx * scale - (e.clientX - rect.left)
+          return nextPx
+        })
+        return
+      }
+      // Pan horizontally. Trackpads send horizontal intent as deltaX; a plain
+      // mouse wheel only has deltaY, so fold that in too.
+      const delta = e.deltaX !== 0 ? e.deltaX : e.deltaY
+      if (delta === 0) return
       e.preventDefault()
-      const factor =
-        e.deltaY < 0 ? ALT_SCROLL_ZOOM_FACTOR : 1 / ALT_SCROLL_ZOOM_FACTOR
-      const rect = el.getBoundingClientRect()
-      const cursorContentPx = e.clientX - rect.left + el.scrollLeft
-      setPxPerSec((p) => {
-        const nextPx = clamp(
-          p * factor,
-          SESSION_PX_PER_SEC_MIN,
-          SESSION_PX_PER_SEC_MAX
-        )
-        const scale = nextPx / p
-        el.scrollLeft = cursorContentPx * scale - (e.clientX - rect.left)
-        return nextPx
-      })
+      el.scrollLeft += delta
     }
     el.addEventListener("wheel", onWheel, { passive: false })
     return () => el.removeEventListener("wheel", onWheel)
-  }, [])
+  }, [hasRallies])
 
-  // Keep the playhead in view as playback advances, crosses recordings, or zooms.
+  // A hand scroll (wheel or scrollbar) stops the strip tracking the playhead, so
+  // you can look ahead without it snapping back. Our own programmatic writes are
+  // flagged so they don't count as a manual scroll.
   useEffect(() => {
     const el = scrollRef.current
+    if (!el) return
+    const onScroll = () => {
+      if (programmaticScrollRef.current) {
+        programmaticScrollRef.current = false
+        return
+      }
+      setFollowing(false)
+    }
+    el.addEventListener("scroll", onScroll, { passive: true })
+    return () => el.removeEventListener("scroll", onScroll)
+  }, [hasRallies])
+
+  // Recenter the strip on the playhead and re-arm follow — the jump-to-playhead
+  // control, also reached by the `F` key through this imperative handle.
+  const scrollToPlayhead = useCallback(() => {
+    const el = scrollRef.current
     if (!el || globalPlayheadMs == null || totalMs === 0) return
+    programmaticScrollRef.current = true
+    el.scrollLeft = (globalPlayheadMs / 1000) * pxPerSec - el.clientWidth / 2
+    setFollowing(true)
+  }, [globalPlayheadMs, totalMs, pxPerSec])
+  useImperativeHandle(ref, () => ({ scrollToPlayhead }), [scrollToPlayhead])
+
+  // While following, keep the playhead in view as playback advances, crosses
+  // recordings, or zooms. Once you scroll the strip away it stands down until
+  // jump-to-playhead re-arms it.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || !following || globalPlayheadMs == null || totalMs === 0) return
     const x = (globalPlayheadMs / 1000) * pxPerSec
     const margin = el.clientWidth * 0.15
     if (
       x < el.scrollLeft + margin ||
       x > el.scrollLeft + el.clientWidth - margin
     ) {
+      programmaticScrollRef.current = true
       el.scrollLeft = x - el.clientWidth / 2
     }
-  }, [globalPlayheadMs, totalMs, pxPerSec])
+  }, [globalPlayheadMs, totalMs, pxPerSec, following])
 
   const segmentingNow =
     reanalyzing ||
@@ -1240,7 +1382,6 @@ function SessionTimeline({
     (r) => r.confidence < UNCERTAIN_CONFIDENCE
   ).length
   const unprocessed = recordingCount - session.placedCount
-  const hasRallies = totalMs > 0 && rallyCount > 0
 
   let summary
   if (totalMs === 0 && segmentingNow) {
@@ -1583,6 +1724,17 @@ function SessionTimeline({
             >
               Reset
             </Button>
+            <Button
+              variant={following ? "outline" : "default"}
+              size="sm"
+              onClick={scrollToPlayhead}
+              disabled={globalPlayheadMs === null}
+              title="Scroll the timeline back to the playhead and follow it again (F)."
+              className="ml-auto"
+            >
+              <CrosshairIcon className="size-4" />
+              Playhead
+            </Button>
           </div>
           {unprocessed > 0 ? (
             <p className="text-xs text-muted-foreground">
@@ -1595,7 +1747,7 @@ function SessionTimeline({
       ) : null}
     </div>
   )
-}
+})
 
 /**
  * The audio waveform under the rally blocks: each downsampled peak is a vertical
