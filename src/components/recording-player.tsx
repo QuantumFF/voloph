@@ -54,6 +54,7 @@ import {
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
+  speedIndexForValue,
   splitRallyEdit,
   stepSpeedIndex,
   stripScrollTarget,
@@ -350,8 +351,8 @@ export function RecordingPlayer({
       pendingSeek != null ? resumeStartMs(pendingSeek, rallies) : null
     void trackedInvoke("mpv_load", { path, startMs })
       .then(() => {
+        // `mpv_load` unpauses; `paused` reconciles from the `mpv:pause` event.
         setError(null)
-        setPaused(false)
       })
       .catch((e) => setError(String(e)))
     // Gate the playhead handler until this load's resume seek lands, so the
@@ -367,8 +368,13 @@ export function RecordingPlayer({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resume/rallies are the crossing-commit values, deliberately not deps (they'd reload the file)
   }, [path])
 
-  // Re-apply the user's speed/volume/mute after a load (mpv resets them when a
-  // new file opens), so a boundary crossing inherits the current transport state.
+  // Re-apply the user's speed/volume/mute after a load. mpv resets these to its
+  // defaults when a new file opens and *reports those defaults* through the
+  // property events (issue #42) — reporting alone can't carry the user's
+  // session-wide preference across a recording boundary, so this re-push stays
+  // load-bearing. Its job is preference persistence, not UI sync (the events do
+  // that); the events then confirm the re-applied values. Reads the current
+  // transport state at the crossing commit, hence the path-only deps.
   useEffect(() => {
     if (!path) return
     void trackedInvoke("mpv_set_speed", {
@@ -377,7 +383,7 @@ export function RecordingPlayer({
     void trackedInvoke("mpv_set_volume", { volume }).catch(() => {})
     void trackedInvoke("mpv_set_mute", { muted }).catch(() => {})
     // Re-applied per recording (the `path` dep); changes within a recording are
-    // pushed by the transport actions themselves.
+    // commanded by the transport actions themselves.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path])
 
@@ -428,7 +434,7 @@ export function RecordingPlayer({
           goToRecording(index + 1, "start")
           break
         case "stop":
-          setPaused(true)
+          // `paused` reconciles from the `mpv:pause` event (issue #42).
           void trackedInvoke("mpv_set_pause", { paused: true }).catch(() => {})
           break
         case "none":
@@ -464,9 +470,12 @@ export function RecordingPlayer({
     handlersRef.current = { skipGaps, handleEnded }
   }, [skipGaps, handleEnded])
 
-  // The playhead, end, and error UI states come from mpv's event stream (ADR
-  // 0008, issue #35). Each `time-pos` tick drives the playhead and runs gap-skip
-  // (issue #36), where the old webview `timeUpdate` handler used to.
+  // The playhead, end, error, and transport UI states all come from mpv's event
+  // stream (ADR 0008, issue #35). Each `time-pos` tick drives the playhead and
+  // runs gap-skip (issue #36), where the old webview `timeUpdate` handler used
+  // to; the pause/speed/volume/mute events reconcile the transport controls from
+  // the player's real state, so a silently-failed `mpv_set_*` can't leave the UI
+  // out of sync (issue #42) — the controls are never set optimistically.
   useEffect(() => {
     const unlisten: Array<() => void> = []
     void listen<number>("mpv:time-pos", (event) => {
@@ -487,6 +496,22 @@ export function RecordingPlayer({
     )
     void listen<string>("mpv:error", (event) =>
       setError(event.payload ?? "playback failed")
+    ).then((u) => unlisten.push(u))
+    // Transport reconciliation (issue #42): mpv reports its own pause/speed/
+    // volume/mute, so the controls reflect the player rather than a hopeful
+    // optimistic write. mpv reports speed/volume as raw numbers; the UI tracks a
+    // speed *ladder index* and a rounded volume.
+    void listen<boolean>("mpv:pause", (event) =>
+      setPaused(event.payload)
+    ).then((u) => unlisten.push(u))
+    void listen<number>("mpv:speed", (event) =>
+      setSpeedIndex(speedIndexForValue(event.payload))
+    ).then((u) => unlisten.push(u))
+    void listen<number>("mpv:volume", (event) =>
+      setVolume(Math.round(event.payload))
+    ).then((u) => unlisten.push(u))
+    void listen<boolean>("mpv:mute", (event) =>
+      setMuted(event.payload)
     ).then((u) => unlisten.push(u))
     return () => {
       for (const u of unlisten) u()
@@ -562,21 +587,17 @@ export function RecordingPlayer({
 
   // --- Transport: the custom bar and keymap drive these via mpv (issue #35). ---
 
+  // The transport actions only *command* mpv; the resulting state lands via the
+  // `mpv:pause`/`speed`/`volume`/`mute` events above (issue #42), so a command
+  // that silently fails leaves no optimistic value the player never reached.
+
   const togglePlay = useCallback(() => {
-    setPaused((prev) => {
-      const next = !prev
-      void trackedInvoke("mpv_set_pause", { paused: next }).catch(() => {})
-      return next
-    })
-  }, [])
+    void trackedInvoke("mpv_set_pause", { paused: !paused }).catch(() => {})
+  }, [paused])
 
   const toggleMute = useCallback(() => {
-    setMuted((prev) => {
-      const next = !prev
-      void trackedInvoke("mpv_set_mute", { muted: next }).catch(() => {})
-      return next
-    })
-  }, [])
+    void trackedInvoke("mpv_set_mute", { muted: !muted }).catch(() => {})
+  }, [muted])
 
   const toggleLoop = useCallback(() => setLooping((l) => !l), [])
 
@@ -589,26 +610,25 @@ export function RecordingPlayer({
     []
   )
 
-  const changeVolume = useCallback((delta: number) => {
-    setVolume((prev) => {
-      const next = clampVolume(prev + delta)
-      void trackedInvoke("mpv_set_volume", { volume: next }).catch(() => {})
-      return next
-    })
-  }, [])
+  const changeVolume = useCallback(
+    (delta: number) => {
+      void trackedInvoke("mpv_set_volume", {
+        volume: clampVolume(volume + delta),
+      }).catch(() => {})
+    },
+    [volume]
+  )
 
-  const stepSpeed = useCallback((dir: 1 | -1) => {
-    setSpeedIndex((prev) => {
-      const next = stepSpeedIndex(prev, dir)
-      void trackedInvoke("mpv_set_speed", { speed: SPEED_LADDER[next] }).catch(
-        () => {}
-      )
-      return next
-    })
-  }, [])
+  const stepSpeed = useCallback(
+    (dir: 1 | -1) => {
+      void trackedInvoke("mpv_set_speed", {
+        speed: SPEED_LADDER[stepSpeedIndex(speedIndex, dir)],
+      }).catch(() => {})
+    },
+    [speedIndex]
+  )
 
   const resetSpeed = useCallback(() => {
-    setSpeedIndex(DEFAULT_SPEED_INDEX)
     void trackedInvoke("mpv_set_speed", { speed: 1 }).catch(() => {})
   }, [])
 

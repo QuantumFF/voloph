@@ -104,6 +104,8 @@ struct MpvEventEndFile {
 }
 
 const MPV_FORMAT_DOUBLE: c_int = 5;
+// `pause`/`mute` come back as a flag (a `c_int` 0/1), not a double.
+const MPV_FORMAT_FLAG: c_int = 3;
 
 const MPV_EVENT_SHUTDOWN: c_int = 1;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
@@ -115,9 +117,16 @@ const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
 const MPV_END_FILE_REASON_EOF: c_int = 0;
 const MPV_END_FILE_REASON_ERROR: c_int = 4;
 
-/// `reply_userdata` tag for the `time-pos` observation, distinguishing it from
-/// any other observed property in the event stream.
+/// `reply_userdata` tags identifying which observed property a `PROPERTY_CHANGE`
+/// event carries. `time-pos` drives the playhead; the other four reconcile the
+/// transport controls — the frontend sets `paused`/`speed`/`volume`/`mute` from
+/// these events rather than optimistically, so a silently-failed `mpv_set_*`
+/// leaves no UI/player divergence (issue #42). Mirrors the `time-pos` loop.
 const TIME_POS_USERDATA: u64 = 1;
+const PAUSE_USERDATA: u64 = 2;
+const SPEED_USERDATA: u64 = 3;
+const VOLUME_USERDATA: u64 = 4;
+const MUTE_USERDATA: u64 = 5;
 
 /// Recording-local position (ms) the *next* `loadfile` should resume at, applied
 /// by the event loop when mpv fires `FILE_LOADED`. Crossing into a recording at a
@@ -506,11 +515,20 @@ pub fn init(app: &AppHandle) -> Result<(), String> {
 const EVENT_TIME_POS: &str = "mpv:time-pos";
 const EVENT_ENDED: &str = "mpv:ended";
 const EVENT_ERROR: &str = "mpv:error";
+// Transport property-change events the frontend reconciles its controls from
+// (issue #42). `pause`/`mute` carry a bool; `speed`/`volume` carry a f64.
+const EVENT_PAUSE: &str = "mpv:pause";
+const EVENT_SPEED: &str = "mpv:speed";
+const EVENT_VOLUME: &str = "mpv:volume";
+const EVENT_MUTE: &str = "mpv:mute";
 
 /// Pump mpv's event stream on a dedicated thread for the whole process lifetime,
 /// translating mpv events into Tauri events the player listens to:
 ///
 /// - `time-pos` property changes → `mpv:time-pos` carrying the playhead in ms.
+/// - `pause`/`speed`/`volume`/`mute` changes → `mpv:pause`/`…`, so the frontend
+///   reconciles its transport controls from the player's real state rather than
+///   optimistically (issue #42).
 /// - end-of-file → `mpv:ended`; a decode error → `mpv:error`.
 ///
 /// `mpv_wait_event` blocks up to the timeout, so this never busy-spins. The mpv
@@ -519,15 +537,14 @@ const EVENT_ERROR: &str = "mpv:error";
 fn event_loop(handle_addr: usize, app: AppHandle) {
     let handle = handle_addr as *mut MpvHandle;
 
-    // Ask mpv to push `time-pos` changes into the event stream as doubles
-    // (seconds). mpv coalesces these to roughly its display rate.
-    if let Ok(name) = CString::new("time-pos") {
-        let rc =
-            unsafe { mpv_observe_property(handle, TIME_POS_USERDATA, name.as_ptr(), MPV_FORMAT_DOUBLE) };
-        if rc < 0 {
-            log::warn!("mpv: observe time-pos failed: {}", mpv_err(rc));
-        }
-    }
+    // Ask mpv to push these property changes into the event stream. mpv emits the
+    // current value once on observe and on every change after (coalesced to ~its
+    // display rate for `time-pos`). `pause`/`mute` are flags, the rest doubles.
+    observe(handle, TIME_POS_USERDATA, "time-pos", MPV_FORMAT_DOUBLE);
+    observe(handle, PAUSE_USERDATA, "pause", MPV_FORMAT_FLAG);
+    observe(handle, SPEED_USERDATA, "speed", MPV_FORMAT_DOUBLE);
+    observe(handle, VOLUME_USERDATA, "volume", MPV_FORMAT_DOUBLE);
+    observe(handle, MUTE_USERDATA, "mute", MPV_FORMAT_FLAG);
 
     loop {
         // Block until the next event (1s timeout just to re-check liveness).
@@ -552,18 +569,44 @@ fn event_loop(handle_addr: usize, app: AppHandle) {
                     }
                 }
             }
-            MPV_EVENT_PROPERTY_CHANGE if event.reply_userdata == TIME_POS_USERDATA => {
+            MPV_EVENT_PROPERTY_CHANGE => {
                 if event.data.is_null() {
                     continue;
                 }
                 let prop = unsafe { &*(event.data as *const MpvEventProperty) };
                 // A null payload means the property is currently unavailable
-                // (e.g. between files); skip it rather than emit a bogus 0.
-                if prop.format != MPV_FORMAT_DOUBLE || prop.data.is_null() {
+                // (e.g. between files); skip it rather than emit a bogus value.
+                if prop.data.is_null() {
                     continue;
                 }
-                let secs = unsafe { *(prop.data as *const f64) };
-                let _ = app.emit(EVENT_TIME_POS, secs * 1000.0);
+                match event.reply_userdata {
+                    TIME_POS_USERDATA => {
+                        if let Some(secs) = prop_f64(prop) {
+                            let _ = app.emit(EVENT_TIME_POS, secs * 1000.0);
+                        }
+                    }
+                    SPEED_USERDATA => {
+                        if let Some(speed) = prop_f64(prop) {
+                            let _ = app.emit(EVENT_SPEED, speed);
+                        }
+                    }
+                    VOLUME_USERDATA => {
+                        if let Some(volume) = prop_f64(prop) {
+                            let _ = app.emit(EVENT_VOLUME, volume);
+                        }
+                    }
+                    PAUSE_USERDATA => {
+                        if let Some(paused) = prop_flag(prop) {
+                            let _ = app.emit(EVENT_PAUSE, paused);
+                        }
+                    }
+                    MUTE_USERDATA => {
+                        if let Some(muted) = prop_flag(prop) {
+                            let _ = app.emit(EVENT_MUTE, muted);
+                        }
+                    }
+                    _ => {}
+                }
             }
             MPV_EVENT_END_FILE => {
                 let reason = if event.data.is_null() {
@@ -586,6 +629,28 @@ fn event_loop(handle_addr: usize, app: AppHandle) {
             _ => {}
         }
     }
+}
+
+/// Ask mpv to push a property's changes into the event stream under `userdata`,
+/// logging (but not failing) if the property can't be observed.
+fn observe(handle: *mut MpvHandle, userdata: u64, name: &str, format: c_int) {
+    let Ok(name_c) = CString::new(name) else {
+        return;
+    };
+    let rc = unsafe { mpv_observe_property(handle, userdata, name_c.as_ptr(), format) };
+    if rc < 0 {
+        log::warn!("mpv: observe {name} failed: {}", mpv_err(rc));
+    }
+}
+
+/// Read a `PROPERTY_CHANGE` payload as a `f64`, or `None` if it isn't a double.
+fn prop_f64(prop: &MpvEventProperty) -> Option<f64> {
+    (prop.format == MPV_FORMAT_DOUBLE).then(|| unsafe { *(prop.data as *const f64) })
+}
+
+/// Read a `PROPERTY_CHANGE` payload as a bool flag, or `None` if it isn't a flag.
+fn prop_flag(prop: &MpvEventProperty) -> Option<bool> {
+    (prop.format == MPV_FORMAT_FLAG).then(|| unsafe { *(prop.data as *const c_int) } != 0)
 }
 
 /// Set an mpv option, logging (but not failing) on error — a missing option

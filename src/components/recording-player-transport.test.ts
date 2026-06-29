@@ -14,6 +14,7 @@ import {
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
+  speedIndexForValue,
   splitRallyEdit,
   stepSpeedIndex,
   stripScrollTarget,
@@ -51,6 +52,25 @@ describe("stepSpeedIndex", () => {
     expect(stepSpeedIndex(SPEED_LADDER.length - 1, 1)).toBe(
       SPEED_LADDER.length - 1
     )
+  })
+})
+
+describe("speedIndexForValue", () => {
+  it("maps each ladder value back to its index", () => {
+    SPEED_LADDER.forEach((speed, i) => {
+      expect(speedIndexForValue(speed)).toBe(i)
+    })
+  })
+
+  it("snaps an off-ladder speed to the nearest index", () => {
+    expect(speedIndexForValue(0.6)).toBe(SPEED_LADDER.indexOf(0.5))
+    expect(speedIndexForValue(1.2)).toBe(SPEED_LADDER.indexOf(1))
+    expect(speedIndexForValue(1.4)).toBe(SPEED_LADDER.indexOf(1.5))
+  })
+
+  it("clamps beyond the ends of the ladder", () => {
+    expect(speedIndexForValue(0.1)).toBe(0)
+    expect(speedIndexForValue(4)).toBe(SPEED_LADDER.length - 1)
   })
 })
 

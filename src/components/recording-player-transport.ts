@@ -16,6 +16,26 @@ export function stepSpeedIndex(index: number, dir: 1 | -1): number {
 }
 
 /**
+ * The ladder index closest to a speed value mpv reports back (issue #42): the UI
+ * tracks an index into `SPEED_LADDER`, but mpv's `speed` property is a raw
+ * multiplier. We only ever set ladder values, so this normally hits one exactly;
+ * the nearest-match fallback keeps the indicator sane if mpv ever reports an
+ * off-ladder speed (e.g. a future external speed change).
+ */
+export function speedIndexForValue(speed: number): number {
+  let best = 0
+  let bestDiff = Infinity
+  for (let i = 0; i < SPEED_LADDER.length; i++) {
+    const diff = Math.abs(SPEED_LADDER[i] - speed)
+    if (diff < bestDiff) {
+      bestDiff = diff
+      best = i
+    }
+  }
+  return best
+}
+
+/**
  * The absolute playhead a relative seek lands on, never before zero. The clamp
  * to the recording's end is left to mpv (it caps a seek past EOF itself).
  */
