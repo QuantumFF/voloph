@@ -54,6 +54,7 @@ import {
   seekTarget,
   splitRallyEdit,
   stepSpeedIndex,
+  stripScrollTarget,
   type EditPlan,
   type PlaylistRecording,
   type SessionModel,
@@ -1255,6 +1256,26 @@ const SessionTimeline = forwardRef<
     [totalMs]
   )
 
+  // Programmatically scroll the strip to a target offset, arming the guard so
+  // the resulting `scroll` event isn't mistaken for a manual scroll. Skips the
+  // write when it wouldn't move `scrollLeft` (a no-op assignment fires no event,
+  // which would otherwise strand the guard true and eat the next manual scroll —
+  // the "can't scroll past the playhead at a recording's start" bug). The clamp
+  // lives in `stripScrollTarget` so the no-op case is unit-tested without a DOM.
+  const scrollStripTo = useCallback((targetPx: number) => {
+    const el = scrollRef.current
+    if (!el) return
+    const next = stripScrollTarget(
+      targetPx,
+      el.scrollLeft,
+      el.clientWidth,
+      el.scrollWidth
+    )
+    if (next === null) return
+    programmaticScrollRef.current = true
+    el.scrollLeft = next
+  }, [])
+
   // While dragging a rally edge, follow the pointer and persist on release.
   useEffect(() => {
     if (!drag) return
@@ -1309,8 +1330,7 @@ const SessionTimeline = forwardRef<
             SESSION_PX_PER_SEC_MAX
           )
           const scale = nextPx / p
-          programmaticScrollRef.current = true
-          el.scrollLeft = cursorContentPx * scale - (e.clientX - rect.left)
+          scrollStripTo(cursorContentPx * scale - (e.clientX - rect.left))
           return nextPx
         })
         return
@@ -1324,7 +1344,7 @@ const SessionTimeline = forwardRef<
     }
     el.addEventListener("wheel", onWheel, { passive: false })
     return () => el.removeEventListener("wheel", onWheel)
-  }, [hasRallies])
+  }, [hasRallies, scrollStripTo])
 
   // A hand scroll (wheel or scrollbar) stops the strip tracking the playhead, so
   // you can look ahead without it snapping back. Our own programmatic writes are
@@ -1348,10 +1368,9 @@ const SessionTimeline = forwardRef<
   const scrollToPlayhead = useCallback(() => {
     const el = scrollRef.current
     if (!el || globalPlayheadMs == null || totalMs === 0) return
-    programmaticScrollRef.current = true
-    el.scrollLeft = (globalPlayheadMs / 1000) * pxPerSec - el.clientWidth / 2
+    scrollStripTo((globalPlayheadMs / 1000) * pxPerSec - el.clientWidth / 2)
     setFollowing(true)
-  }, [globalPlayheadMs, totalMs, pxPerSec])
+  }, [globalPlayheadMs, totalMs, pxPerSec, scrollStripTo])
   useImperativeHandle(ref, () => ({ scrollToPlayhead }), [scrollToPlayhead])
 
   // While following, keep the playhead in view as playback advances, crosses
@@ -1366,10 +1385,9 @@ const SessionTimeline = forwardRef<
       x < el.scrollLeft + margin ||
       x > el.scrollLeft + el.clientWidth - margin
     ) {
-      programmaticScrollRef.current = true
-      el.scrollLeft = x - el.clientWidth / 2
+      scrollStripTo(x - el.clientWidth / 2)
     }
-  }, [globalPlayheadMs, totalMs, pxPerSec, following])
+  }, [globalPlayheadMs, totalMs, pxPerSec, following, scrollStripTo])
 
   const segmentingNow =
     reanalyzing ||

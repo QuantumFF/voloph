@@ -33,6 +33,31 @@ export function clamp(value: number, lo: number, hi: number): number {
 }
 
 /**
+ * The clamped `scrollLeft` a programmatic strip-scroll should land on, or `null`
+ * when it already equals the current offset and so must be skipped.
+ *
+ * Skipping the no-op is the whole point: a `scrollLeft` assignment that does not
+ * change the value fires **no `scroll` event**, so the "this scroll was ours"
+ * guard the caller arms before the write is never cleared and stays true — the
+ * next *manual* scroll then reads as programmatic and silently fails to disarm
+ * follow. This bites hardest near a recording's start, where centring on a
+ * playhead at the far left clamps the target to 0 while the strip is already at
+ * 0: every tick re-arms the guard and eats the user's attempt to scroll ahead.
+ * Clamping here to the same range the browser would lets the caller detect that
+ * no-op before arming the guard.
+ */
+export function stripScrollTarget(
+  targetPx: number,
+  currentScrollLeft: number,
+  clientWidth: number,
+  scrollWidth: number
+): number | null {
+  const max = Math.max(0, scrollWidth - clientWidth)
+  const next = clamp(Math.round(targetPx), 0, max)
+  return next === Math.round(currentScrollLeft) ? null : next
+}
+
+/**
  * Confidence below which a rally is shown as an "uncertain region" — a span the
  * segmenter doubts, surfaced as "check this" during review (ADR 0002).
  */
