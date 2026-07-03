@@ -4,9 +4,11 @@ import { useCallback, useEffect, useState } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
 import {
   AlertTriangleIcon,
+  ClapperboardIcon,
   FolderOpenIcon,
   Loader2Icon,
   MoreVerticalIcon,
+  PlayIcon,
   RefreshCwIcon,
   RotateCwIcon,
   VideoIcon,
@@ -24,14 +26,6 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Button, buttonVariants } from "@/components/ui/button"
 import {
-  Card,
-  CardAction,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -39,6 +33,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { trackedInvoke } from "@/lib/tauri"
+import { formatCaptureDay } from "@/lib/utils"
 
 interface Recording {
   id: number
@@ -108,15 +103,55 @@ function fileName(path: string): string {
   return parts[parts.length - 1] || path
 }
 
+function formatDuration(ms: number): string {
+  const total = Math.round(ms / 1000)
+  const h = Math.floor(total / 3600)
+  const m = Math.round((total % 3600) / 60)
+  if (h > 0) return `${h}h ${m.toString().padStart(2, "0")}m`
+  return `${m}m`
+}
+
+/** The stats line under a session's date: recordings, rallies, footage length. */
+function sessionSummary(session: Session): string {
+  const parts = [
+    `${session.recordings.length} recording${session.recordings.length === 1 ? "" : "s"}`,
+  ]
+  const segmented = session.recordings.filter(
+    (r) => r.segment_state === "ready"
+  )
+  if (segmented.length > 0) {
+    const rallies = segmented.reduce((sum, r) => sum + r.rally_count, 0)
+    parts.push(`${rallies} ${rallies === 1 ? "rally" : "rallies"}`)
+  }
+  const durationMs = session.recordings.reduce(
+    (sum, r) => sum + (r.duration_ms ?? 0),
+    0
+  )
+  if (durationMs > 0) parts.push(formatDuration(durationMs))
+  return parts.join(" · ")
+}
+
 interface SessionListProps {
   /**
    * Open a session in the player as one continuous playlist. `recordings` is the
    * session's recordings in capture-time order; `startIndex` is the one to open
-   * first (which recording the user clicked).
+   * first (which recording the user clicked); `day` is the session's capture day
+   * for the review top bar.
    */
-  onPlay: (recordings: { path: string }[], startIndex: number) => void
+  onPlay: (
+    recordings: { path: string }[],
+    startIndex: number,
+    day: string
+  ) => void
 }
 
+/**
+ * The homepage: the library of sessions in the studio shell (issue #48) — a
+ * thin top bar carrying the app identity and the library actions, over a
+ * centered column of session blocks. Each block is one session: its date and
+ * stats, a Review button that opens the whole session in the workstation, and
+ * the recordings it holds as dense rows.
+ */
 export function SessionList({ onPlay }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [scanning, setScanning] = useState(false)
@@ -230,7 +265,7 @@ export function SessionList({ onPlay }: SessionListProps) {
   const copy = confirmAction ? confirmCopy[confirmAction] : null
 
   return (
-    <Card>
+    <div className="flex h-full flex-col">
       <AlertDialog
         open={confirmAction !== null}
         onOpenChange={(o) => {
@@ -257,15 +292,17 @@ export function SessionList({ onPlay }: SessionListProps) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      <CardHeader>
-        <CardTitle>Sessions</CardTitle>
-        <CardDescription>
-          Recordings grouped by capture day, referenced in place. Originals play
-          directly and are never modified.
-        </CardDescription>
-        <CardAction className="flex items-center gap-2">
+
+      <header className="flex h-11 shrink-0 items-center gap-2.5 border-b px-4">
+        <ClapperboardIcon className="size-5" />
+        <span className="text-sm font-semibold">Voloph</span>
+        <span className="text-xs text-muted-foreground">
+          Every rally, no downtime
+        </span>
+        <div className="ml-auto flex items-center gap-2">
           <Button
             variant="outline"
+            size="sm"
             onClick={handleRefresh}
             disabled={refreshing}
             title="Re-scan known folders for newly added recordings."
@@ -275,7 +312,7 @@ export function SessionList({ onPlay }: SessionListProps) {
             />
             {refreshing ? "Refreshing…" : "Refresh"}
           </Button>
-          <Button onClick={handlePickFolder} disabled={scanning}>
+          <Button size="sm" onClick={handlePickFolder} disabled={scanning}>
             <FolderOpenIcon className="size-4" />
             {scanning ? "Scanning…" : "Scan folder"}
           </Button>
@@ -283,7 +320,7 @@ export function SessionList({ onPlay }: SessionListProps) {
             <DropdownMenuTrigger asChild>
               <Button
                 variant="outline"
-                size="icon"
+                size="icon-sm"
                 disabled={sessions.length === 0}
                 title="More library actions"
               >
@@ -303,129 +340,147 @@ export function SessionList({ onPlay }: SessionListProps) {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-        </CardAction>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        {sessions.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No sessions yet. Scan a folder of recordings to get started.
-          </p>
-        ) : (
-          sessions.map((session) => (
-            <div key={session.id} className="rounded-lg border">
-              <div className="flex items-center justify-between border-b px-4 py-2">
-                <h3 className="font-medium tabular-nums">
-                  {session.capture_day}
-                </h3>
-                <div className="flex items-center gap-3">
-                  <span className="text-sm text-muted-foreground">
-                    {session.recordings.length} recording
-                    {session.recordings.length === 1 ? "" : "s"}
-                  </span>
+        </div>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-4xl space-y-4 px-4 py-6">
+          {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          {sessions.length === 0 ? (
+            <div className="rounded-xl border border-dashed px-6 py-16 text-center">
+              <p className="font-medium">No sessions yet</p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Scan a folder of recordings to get started. Originals play in
+                place and are never modified.
+              </p>
+            </div>
+          ) : (
+            sessions.map((session) => (
+              <div key={session.id} className="rounded-xl border">
+                <div className="flex items-center gap-4 border-b px-4 py-3">
+                  <div className="min-w-0">
+                    <h3
+                      className="font-medium"
+                      title={session.capture_day}
+                    >
+                      {formatCaptureDay(session.capture_day)}
+                    </h3>
+                    <p className="text-sm text-muted-foreground tabular-nums">
+                      {sessionSummary(session)}
+                    </p>
+                  </div>
                   <Button
-                    variant="outline"
                     size="sm"
-                    onClick={() => onPlay(session.recordings, 0)}
-                    title="Play the whole session — every rally, back-to-back."
+                    className="ml-auto shrink-0"
+                    onClick={() =>
+                      onPlay(session.recordings, 0, session.capture_day)
+                    }
+                    title="Review the whole session — every rally, back-to-back."
                   >
-                    Play session
+                    <PlayIcon className="size-4" />
+                    Review session
                   </Button>
                 </div>
-              </div>
-              <ul className="divide-y">
-                {session.recordings.map((recording, recordingIndex) => (
-                  <li
-                    key={recording.id}
-                    className="flex items-center hover:bg-accent"
-                  >
-                    <button
-                      type="button"
-                      onClick={() => onPlay(session.recordings, recordingIndex)}
-                      className="flex min-w-0 flex-1 items-center gap-3 px-4 py-2 text-left text-sm"
+                <ul className="divide-y">
+                  {session.recordings.map((recording, recordingIndex) => (
+                    <li
+                      key={recording.id}
+                      className="flex items-center hover:bg-accent"
                     >
-                      <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
-                      <span
-                        className="truncate font-medium"
-                        title={recording.path}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onPlay(
+                            session.recordings,
+                            recordingIndex,
+                            session.capture_day
+                          )
+                        }
+                        className="flex min-w-0 flex-1 items-center gap-3 px-4 py-2 text-left text-sm"
                       >
-                        {fileName(recording.path)}
-                      </span>
-                      {isPreparing(recording.probe_state) ? (
+                        <VideoIcon className="size-4 shrink-0 text-muted-foreground" />
                         <span
-                          className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
-                          title="Preparing this recording for playback…"
+                          className="truncate font-medium"
+                          title={recording.path}
                         >
-                          <Loader2Icon className="size-3.5 animate-spin" />
-                          Preparing…
+                          {fileName(recording.path)}
                         </span>
-                      ) : recording.probe_state === "failed" ? (
-                        <span
-                          className="ml-auto flex shrink-0 items-center gap-1.5 text-destructive"
-                          title="This recording could not be read for playback."
-                        >
-                          <AlertTriangleIcon className="size-3.5" />
-                          Failed
-                        </span>
-                      ) : isAnalyzing(recording) ? (
-                        <span
-                          className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
-                          title="Detecting rallies in this recording…"
-                        >
-                          <Loader2Icon className="size-3.5 animate-spin" />
-                          Analyzing…
-                        </span>
-                      ) : (
-                        <span className="ml-auto flex shrink-0 items-center gap-3 text-muted-foreground tabular-nums">
-                          {recording.segment_state === "ready" ? (
-                            <span title="Rallies detected in the draft timeline">
-                              {recording.rally_count}{" "}
-                              {recording.rally_count === 1
-                                ? "rally"
-                                : "rallies"}
-                            </span>
-                          ) : recording.segment_state === "failed" ? (
-                            <span
-                              className="flex items-center gap-1.5 text-amber-600 dark:text-amber-500"
-                              title="Could not analyze this recording's audio for rallies."
-                            >
-                              <AlertTriangleIcon className="size-3.5" />
-                              No timeline
-                            </span>
-                          ) : null}
-                          {formatSize(recording.file_size)}
-                        </span>
-                      )}
-                    </button>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          className="mr-2 shrink-0 text-muted-foreground"
-                          title="Recording actions"
-                        >
-                          <MoreVerticalIcon className="size-4" />
-                          <span className="sr-only">Recording actions</span>
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-32">
-                        <DropdownMenuItem
-                          onClick={() => handleReanalyze(recording.path)}
-                          disabled={isProcessing(recording)}
-                        >
-                          <RotateCwIcon className="size-4" />
-                          Re-analyze
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))
-        )}
-      </CardContent>
-    </Card>
+                        {isPreparing(recording.probe_state) ? (
+                          <span
+                            className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
+                            title="Preparing this recording for playback…"
+                          >
+                            <Loader2Icon className="size-3.5 animate-spin" />
+                            Preparing…
+                          </span>
+                        ) : recording.probe_state === "failed" ? (
+                          <span
+                            className="ml-auto flex shrink-0 items-center gap-1.5 text-destructive"
+                            title="This recording could not be read for playback."
+                          >
+                            <AlertTriangleIcon className="size-3.5" />
+                            Failed
+                          </span>
+                        ) : isAnalyzing(recording) ? (
+                          <span
+                            className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
+                            title="Detecting rallies in this recording…"
+                          >
+                            <Loader2Icon className="size-3.5 animate-spin" />
+                            Analyzing…
+                          </span>
+                        ) : (
+                          <span className="ml-auto flex shrink-0 items-center gap-3 text-muted-foreground tabular-nums">
+                            {recording.segment_state === "ready" ? (
+                              <span title="Rallies detected in the draft timeline">
+                                {recording.rally_count}{" "}
+                                {recording.rally_count === 1
+                                  ? "rally"
+                                  : "rallies"}
+                              </span>
+                            ) : recording.segment_state === "failed" ? (
+                              <span
+                                className="flex items-center gap-1.5 text-amber-600 dark:text-amber-500"
+                                title="Could not analyze this recording's audio for rallies."
+                              >
+                                <AlertTriangleIcon className="size-3.5" />
+                                No timeline
+                              </span>
+                            ) : null}
+                            {formatSize(recording.file_size)}
+                          </span>
+                        )}
+                      </button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="mr-2 shrink-0 text-muted-foreground"
+                            title="Recording actions"
+                          >
+                            <MoreVerticalIcon className="size-4" />
+                            <span className="sr-only">Recording actions</span>
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-32">
+                          <DropdownMenuItem
+                            onClick={() => handleReanalyze(recording.path)}
+                            disabled={isProcessing(recording)}
+                          >
+                            <RotateCwIcon className="size-4" />
+                            Re-analyze
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
   )
 }
