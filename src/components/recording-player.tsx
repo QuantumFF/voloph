@@ -15,7 +15,9 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   CrosshairIcon,
+  DownloadIcon,
   FastForwardIcon,
+  FlagIcon,
   KeyboardIcon,
   Loader2Icon,
   PauseIcon,
@@ -27,6 +29,7 @@ import {
   ScissorsIcon,
   StepBackIcon,
   StepForwardIcon,
+  TimerIcon,
   Trash2Icon,
   TriangleAlertIcon,
   Volume2Icon,
@@ -37,7 +40,15 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { trackedInvoke } from "@/lib/tauri"
+import { formatCaptureDay } from "@/lib/utils"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
@@ -77,6 +88,8 @@ interface RecordingPlayerProps {
   recordings: PlaylistRecording[]
   /** Index of the recording to open first (defaults to the session's start). */
   startIndex?: number
+  /** The session's capture day, shown in the top bar. */
+  day?: string
   /** Return to the session list. */
   onBack: () => void
 }
@@ -117,6 +130,13 @@ const RESUME_TICK_TOL_MS = 250
 
 /** How much each Alt+scroll notch over the timeline zooms. */
 const ALT_SCROLL_ZOOM_FACTOR = 1.15
+
+/**
+ * Rally length threshold (CONTEXT.md: every rally is classified long or short
+ * by duration, objectively and automatically). UI-only until length filtering
+ * lands; 15s reads as a sustained exchange.
+ */
+const LONG_RALLY_MS = 15_000
 
 /** How wide a rally Add-at-playhead creates around the playhead (ms each side). */
 const ADD_RALLY_HALF_MS = 2000
@@ -188,6 +208,7 @@ interface Keybinding {
 export function RecordingPlayer({
   recordings,
   startIndex = 0,
+  day,
   onBack,
 }: RecordingPlayerProps) {
   // Gap-free playback is the default (the North Star), but a manual playhead move
@@ -949,79 +970,392 @@ export function RecordingPlayer({
       window.removeEventListener("keydown", onKeyDown, { capture: true })
   }, [keymap])
 
+  // The rally under the playhead (session-global), driving the rail highlight
+  // and the inspector; -1 while the playhead sits in a gap or before placement.
+  const currentRallyIndex =
+    globalPlayheadMs == null
+      ? -1
+      : session.rallies.findIndex(
+          (r) =>
+            globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
+        )
+
+  // The studio layout (issue #48): a thin top bar over three panes — the rally
+  // rail (the session's table of contents), the player column (video, transport,
+  // docked timeline), and the inspector for the rally under the playhead.
   return (
     <div
       ref={containerRef}
       tabIndex={-1}
-      className="flex h-full min-h-0 flex-col gap-4 outline-none"
+      className="flex h-full min-h-0 flex-col outline-none"
     >
-      <div className="flex shrink-0 items-center gap-3">
-        <Button variant="outline" size="sm" onClick={onBack}>
+      <header className="flex h-11 shrink-0 items-center gap-3 border-b px-3">
+        <Button variant="ghost" size="sm" onClick={onBack}>
           <ArrowLeftIcon className="size-4" />
           Sessions
         </Button>
-        <span className="truncate font-medium" title={path ?? undefined}>
-          {path ? fileName(path) : "No recordings"}
+        <span className="shrink-0 font-medium">
+          {day
+            ? formatCaptureDay(day)
+            : path
+              ? fileName(path)
+              : "No recordings"}
         </span>
-        {recordings.length > 1 ? (
-          <span className="shrink-0 text-sm text-muted-foreground tabular-nums">
-            Recording {index + 1} of {recordings.length}
-          </span>
-        ) : null}
-      </div>
-      {/* The video pane: an empty hole the native mpv surface composites over. */}
-      <div
-        ref={paneRef}
-        className="min-h-0 w-full flex-1 rounded-lg bg-black"
-      />
-      {error ? (
-        <div className="shrink-0 text-sm text-destructive" role="alert">
-          {error}
+        <span
+          className="min-w-0 truncate text-sm text-muted-foreground tabular-nums"
+          title={path ?? undefined}
+        >
+          {recordings.length > 1
+            ? `Recording ${index + 1} of ${recordings.length}`
+            : null}
+          {recordings.length > 1 && path ? " · " : null}
+          {day && path ? fileName(path) : null}
+        </span>
+        <div className="ml-auto shrink-0">
+          {/* Export stub: the selection-driven render (CONTEXT.md) isn't built
+              yet, but its entry point lives here in the studio design. */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                title="Render one new video from a selection of rallies."
+              >
+                <DownloadIcon className="size-4" />
+                Export
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuLabel>Export — coming soon</DropdownMenuLabel>
+              <DropdownMenuItem disabled>
+                Condensed session (gaps removed)
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled>Flagged rallies</DropdownMenuItem>
+              <DropdownMenuItem disabled>
+                Rallies with mistakes
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
-      ) : null}
-      <TransportBar
-        paused={paused}
-        muted={muted}
-        looping={looping}
-        gapSkipEnabled={gapSkipEnabled}
-        volume={volume}
-        speed={SPEED_LADDER[speedIndex]}
-        positionMs={globalPlayheadMs ?? currentMs}
-        durationMs={session.totalMs}
-        onTogglePlay={togglePlay}
-        onFrameStep={frameStep}
-        onToggleMute={toggleMute}
-        onToggleLoop={toggleLoop}
-        onToggleGapSkip={toggleGapSkip}
-        onStepSpeed={stepSpeed}
-        onResetSpeed={resetSpeed}
-        onShowKeys={() => setShowCheatSheet(true)}
-      />
-      <SessionTimeline
-        ref={timelineRef}
-        session={session}
-        recordingCount={recordings.length}
-        globalPlayheadMs={globalPlayheadMs}
-        reanalyzing={reanalyzing}
-        canPrev={!atFirstRecording}
-        canNext={!atLastRecording}
-        editing={editing}
-        onSeekGlobal={seekSession}
-        onPrevRally={() => goToRally("prev")}
-        onNextRally={() => goToRally("next")}
-        onNextUncertain={goToUncertain}
-        onReanalyze={handleReanalyze}
-        onToggleEditing={() => setEditing((e) => !e)}
-        onAdjustRally={adjustRally}
-        onAddAtPlayhead={addAtPlayhead}
-        onDeleteRally={deleteRally}
-        onSplitRally={splitRally}
-        onMergeRallies={mergeRallies}
-      />
+      </header>
+
+      <div className="flex min-h-0 flex-1">
+        <RallyRail
+          session={session}
+          recordings={recordings}
+          currentRallyIndex={currentRallyIndex}
+          onSelectRally={(rally) => seekSession(rally.globalStart)}
+        />
+
+        <main className="flex min-w-0 flex-1 flex-col">
+          {/* The video pane: an empty hole the native mpv surface composites over. */}
+          <div
+            ref={paneRef}
+            className="m-3 mb-0 min-h-0 flex-1 rounded-lg bg-black"
+          />
+          {error ? (
+            <div className="shrink-0 px-3 pt-2 text-sm text-destructive" role="alert">
+              {error}
+            </div>
+          ) : null}
+          <div className="shrink-0 px-3 py-2">
+            <TransportBar
+              paused={paused}
+              muted={muted}
+              looping={looping}
+              gapSkipEnabled={gapSkipEnabled}
+              volume={volume}
+              speed={SPEED_LADDER[speedIndex]}
+              positionMs={globalPlayheadMs ?? currentMs}
+              durationMs={session.totalMs}
+              onTogglePlay={togglePlay}
+              onFrameStep={frameStep}
+              onToggleMute={toggleMute}
+              onToggleLoop={toggleLoop}
+              onToggleGapSkip={toggleGapSkip}
+              onStepSpeed={stepSpeed}
+              onResetSpeed={resetSpeed}
+              onShowKeys={() => setShowCheatSheet(true)}
+            />
+          </div>
+          <div className="shrink-0 border-t px-3 py-2">
+            <SessionTimeline
+              ref={timelineRef}
+              session={session}
+              recordingCount={recordings.length}
+              globalPlayheadMs={globalPlayheadMs}
+              reanalyzing={reanalyzing}
+              canPrev={!atFirstRecording}
+              canNext={!atLastRecording}
+              editing={editing}
+              onSeekGlobal={seekSession}
+              onPrevRally={() => goToRally("prev")}
+              onNextRally={() => goToRally("next")}
+              onNextUncertain={goToUncertain}
+              onReanalyze={handleReanalyze}
+              onToggleEditing={() => setEditing((e) => !e)}
+              onAdjustRally={adjustRally}
+              onAddAtPlayhead={addAtPlayhead}
+              onDeleteRally={deleteRally}
+              onSplitRally={splitRally}
+              onMergeRallies={mergeRallies}
+            />
+          </div>
+        </main>
+
+        <RallyInspector
+          rally={
+            currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
+          }
+          rallyNumber={currentRallyIndex + 1}
+        />
+      </div>
       {showCheatSheet ? (
         <CheatSheet keymap={keymap} onClose={() => setShowCheatSheet(false)} />
       ) : null}
     </div>
+  )
+}
+
+/**
+ * The left rail of the studio layout (issue #48): the session's table of
+ * contents — every rally in play order, grouped by recording, with its
+ * duration, long-rally marker, and uncertain-region marker. Clicking a rally
+ * seeks the session to its start; the row under the playhead stays highlighted
+ * and scrolled into view.
+ */
+function RallyRail({
+  session,
+  recordings,
+  currentRallyIndex,
+  onSelectRally,
+}: {
+  session: SessionModel
+  recordings: PlaylistRecording[]
+  currentRallyIndex: number
+  onSelectRally: (rally: SessionRally) => void
+}) {
+  // Keep the playhead's rally visible as playback walks the session.
+  const activeRef = useRef<HTMLLIElement>(null)
+  useEffect(() => {
+    activeRef.current?.scrollIntoView({ block: "nearest" })
+  }, [currentRallyIndex])
+
+  // Session-wide rally numbers, matching the strip's and inspector's numbering.
+  const numbered = session.rallies.map((rally, number) => ({ rally, number }))
+
+  return (
+    <aside className="w-60 shrink-0 overflow-y-auto border-r">
+      {recordings.map((rec, recordingIndex) => {
+        const seg = session.segments.find((s) => s.index === recordingIndex)
+        const state = seg?.timeline?.segment_state
+        const rows = numbered.filter(
+          ({ rally }) => rally.recordingIndex === recordingIndex
+        )
+        return (
+          <div key={rec.path}>
+            <div
+              className="sticky top-0 z-10 truncate border-b bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground"
+              title={rec.path}
+            >
+              {fileName(rec.path)}
+            </div>
+            {rows.length > 0 ? (
+              <ul>
+                {rows.map(({ rally, number }) => {
+                  const active = number === currentRallyIndex
+                  const durationMs = rally.localEnd - rally.localStart
+                  return (
+                    <li
+                      key={`${rally.path}:${rally.id}`}
+                      ref={active ? activeRef : undefined}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => onSelectRally(rally)}
+                        className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${
+                          active ? "bg-accent" : "hover:bg-accent/50"
+                        }`}
+                        title={`Rally ${number + 1}: ${formatClock(rally.globalStart)}–${formatClock(rally.globalEnd)}`}
+                      >
+                        <span className="w-8 shrink-0 text-muted-foreground tabular-nums">
+                          {number + 1}
+                        </span>
+                        <span className="font-mono text-xs text-muted-foreground tabular-nums">
+                          {formatClock(durationMs)}
+                        </span>
+                        {durationMs >= LONG_RALLY_MS ? (
+                          <TimerIcon
+                            className="size-3.5 shrink-0 text-muted-foreground"
+                            aria-label="Long rally"
+                          />
+                        ) : null}
+                        {rally.confidence < UNCERTAIN_CONFIDENCE ? (
+                          <TriangleAlertIcon
+                            className="ml-auto size-3.5 shrink-0 text-amber-500"
+                            aria-label="Uncertain region — worth checking"
+                          />
+                        ) : null}
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            ) : state === "failed" ? (
+              <p className="flex items-center gap-1.5 px-3 py-2 text-sm text-amber-600 dark:text-amber-500">
+                <TriangleAlertIcon className="size-3.5 shrink-0" />
+                No timeline
+              </p>
+            ) : state === "ready" ? (
+              <p className="px-3 py-2 text-sm text-muted-foreground">
+                No rallies detected.
+              </p>
+            ) : (
+              <p className="flex items-center gap-1.5 px-3 py-2 text-sm text-muted-foreground">
+                <Loader2Icon className="size-3.5 shrink-0 animate-spin" />
+                Detecting rallies…
+              </p>
+            )}
+          </div>
+        )
+      })}
+    </aside>
+  )
+}
+
+/** Seeded aspect vocabulary (CONTEXT.md), previewed in the inspector stub. */
+const STUB_ASPECTS = [
+  "selection",
+  "execution",
+  "deception",
+  "footwork",
+  "positioning",
+]
+
+const VERDICT_DOT = {
+  good: "bg-emerald-500",
+  bad: "bg-amber-500",
+  mistake: "bg-red-500",
+} as const
+
+/**
+ * The right inspector of the studio layout (issue #48): everything about the
+ * rally under the playhead. Its identity, bounds, length class, and uncertainty
+ * are real; the capture surfaces — flag, verdict, aspect, note, annotation
+ * list — are visual stubs until annotations and flags are implemented.
+ */
+function RallyInspector({
+  rally,
+  rallyNumber,
+}: {
+  rally: SessionRally | null
+  rallyNumber: number
+}) {
+  return (
+    <aside className="flex w-72 shrink-0 flex-col overflow-y-auto border-l">
+      {rally === null ? (
+        <div className="p-4 text-sm text-muted-foreground">
+          <p className="font-medium text-foreground">
+            No rally at the playhead
+          </p>
+          <p className="mt-1">
+            You&apos;re in a gap, or this recording is still being analyzed.
+            Play into a rally to inspect it.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="border-b p-3">
+            <div className="flex items-center justify-between">
+              <h2 className="font-medium">Rally {rallyNumber}</h2>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled
+                title="Flags are coming soon — one keystroke to mark a rally for the export reel."
+              >
+                <FlagIcon className="size-4" />
+                Flag
+              </Button>
+            </div>
+            <p className="mt-1 text-sm text-muted-foreground tabular-nums">
+              {formatClock(rally.globalStart)}–{formatClock(rally.globalEnd)}
+              {" · "}
+              {formatClock(rally.globalEnd - rally.globalStart)}
+              {" · "}
+              {rally.globalEnd - rally.globalStart >= LONG_RALLY_MS
+                ? "long"
+                : "short"}
+            </p>
+            {rally.confidence < UNCERTAIN_CONFIDENCE ? (
+              <p className="mt-2 flex items-center gap-1.5 rounded-md bg-amber-500/10 px-2 py-1.5 text-xs text-amber-600 dark:text-amber-400">
+                <TriangleAlertIcon className="size-3.5 shrink-0" />
+                Uncertain boundaries — worth a check
+              </p>
+            ) : null}
+          </div>
+
+          {/* Annotation capture stub: verdict → aspect → note (CONTEXT.md). */}
+          <div className="border-b p-3">
+            <div className="mb-2 flex items-baseline justify-between">
+              <h3 className="text-xs font-medium text-muted-foreground">
+                Verdict at playhead
+              </h3>
+              <span className="text-xs text-muted-foreground/70">
+                coming soon
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5">
+              {(["good", "bad", "mistake"] as const).map((verdict) => (
+                <Button
+                  key={verdict}
+                  variant="outline"
+                  size="sm"
+                  disabled
+                  className="capitalize"
+                >
+                  <span
+                    className={`size-2 rounded-full ${VERDICT_DOT[verdict]}`}
+                  />
+                  {verdict}
+                </Button>
+              ))}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1">
+              {STUB_ASPECTS.map((aspect) => (
+                <span
+                  key={aspect}
+                  className="rounded-full border px-2 py-0.5 text-xs text-muted-foreground/70"
+                >
+                  {aspect}
+                </span>
+              ))}
+            </div>
+            <textarea
+              disabled
+              placeholder="Note (optional) — shot type goes here"
+              rows={2}
+              className="mt-2 w-full resize-none rounded-md border bg-transparent px-2 py-1.5 text-sm placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
+            />
+          </div>
+
+          <div className="p-3">
+            <div className="mb-2 flex items-baseline justify-between">
+              <h3 className="text-xs font-medium text-muted-foreground">
+                Annotations
+              </h3>
+              <span className="text-xs text-muted-foreground/70">
+                coming soon
+              </span>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Moments you mark during playback will collect here, pinned to
+              their timestamps.
+            </p>
+          </div>
+        </>
+      )}
+    </aside>
   )
 }
 
