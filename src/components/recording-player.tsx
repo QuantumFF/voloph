@@ -8,6 +8,8 @@ import {
   useMemo,
   useRef,
   useState,
+  type Dispatch,
+  type SetStateAction,
 } from "react"
 import { listen } from "@tauri-apps/api/event"
 import {
@@ -269,6 +271,11 @@ export function RecordingPlayer({
   // guards the button (ADR 0002, the tuning loop).
   const [reanalyzeNonce, setReanalyzeNonce] = useState(0)
   const [reanalyzing, setReanalyzing] = useState(false)
+  // Timeline zoom and playhead-follow are owned here rather than by the strip,
+  // so the status bar (which lives outside the strip) can drive them; the
+  // strip's own wheel/scroll handlers mutate them through the setters.
+  const [pxPerSec, setPxPerSec] = useState(SESSION_PX_PER_SEC_DEFAULT)
+  const [following, setFollowing] = useState(true)
 
   // Which recording in the playlist is loaded, and where to resume once its
   // timeline arrives after a boundary crossing.
@@ -669,6 +676,12 @@ export function RecordingPlayer({
     []
   )
 
+  const zoomTimeline = useCallback((factor: number) => {
+    setPxPerSec((p) =>
+      clamp(p * factor, SESSION_PX_PER_SEC_MIN, SESSION_PX_PER_SEC_MAX)
+    )
+  }, [])
+
   const changeVolume = useCallback(
     (delta: number) => {
       void trackedInvoke("mpv_set_volume", {
@@ -980,6 +993,19 @@ export function RecordingPlayer({
             globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
         )
 
+  // Status-bar readouts: how segmentation stands across the whole session.
+  const segmentingNow =
+    reanalyzing ||
+    session.segments.some((s) => s.timeline?.segment_state === "unknown")
+  const failedCount = session.segments.filter(
+    (s) => s.timeline?.segment_state === "failed"
+  ).length
+  const sessionRallyCount = session.rallies.length
+  const uncertainCount = session.rallies.filter(
+    (r) => r.confidence < UNCERTAIN_CONFIDENCE
+  ).length
+  const unprocessed = recordings.length - session.placedCount
+
   // The studio layout (issue #48): a thin top bar over three panes — the rally
   // rail (the session's table of contents), the player column (video, transport,
   // docked timeline), and the inspector for the rally under the playhead.
@@ -989,7 +1015,7 @@ export function RecordingPlayer({
       tabIndex={-1}
       className="flex h-full min-h-0 flex-col outline-none"
     >
-      <header className="flex h-11 shrink-0 items-center gap-3 border-b px-3">
+      <header className="flex h-11 shrink-0 items-center gap-3 border-b px-4">
         <Button variant="ghost" size="sm" onClick={onBack}>
           <ArrowLeftIcon className="size-4" />
           Sessions
@@ -1002,13 +1028,9 @@ export function RecordingPlayer({
               : "No recordings"}
         </span>
         <span
-          className="min-w-0 truncate text-sm text-muted-foreground tabular-nums"
+          className="min-w-0 truncate text-sm text-muted-foreground"
           title={path ?? undefined}
         >
-          {recordings.length > 1
-            ? `Recording ${index + 1} of ${recordings.length}`
-            : null}
-          {recordings.length > 1 && path ? " · " : null}
           {day && path ? fileName(path) : null}
         </span>
         <div className="ml-auto shrink-0">
@@ -1051,14 +1073,14 @@ export function RecordingPlayer({
           {/* The video pane: an empty hole the native mpv surface composites over. */}
           <div
             ref={paneRef}
-            className="m-3 mb-0 min-h-0 flex-1 rounded-lg bg-black"
+            className="mx-4 mt-3 mb-1 min-h-0 flex-1 rounded-lg bg-black"
           />
           {error ? (
-            <div className="shrink-0 px-3 pt-2 text-sm text-destructive" role="alert">
+            <div className="shrink-0 px-4 pt-2 text-sm text-destructive" role="alert">
               {error}
             </div>
           ) : null}
-          <div className="shrink-0 px-3 py-2">
+          <div className="shrink-0 px-4 py-3">
             <TransportBar
               paused={paused}
               muted={muted}
@@ -1075,16 +1097,17 @@ export function RecordingPlayer({
               onToggleGapSkip={toggleGapSkip}
               onStepSpeed={stepSpeed}
               onResetSpeed={resetSpeed}
-              onShowKeys={() => setShowCheatSheet(true)}
             />
           </div>
-          <div className="shrink-0 border-t px-3 py-2">
+          <div className="shrink-0 border-t px-4 py-3">
             <SessionTimeline
               ref={timelineRef}
               session={session}
-              recordingCount={recordings.length}
               globalPlayheadMs={globalPlayheadMs}
-              reanalyzing={reanalyzing}
+              pxPerSec={pxPerSec}
+              setPxPerSec={setPxPerSec}
+              following={following}
+              setFollowing={setFollowing}
               canPrev={!atFirstRecording}
               canNext={!atLastRecording}
               editing={editing}
@@ -1092,7 +1115,6 @@ export function RecordingPlayer({
               onPrevRally={() => goToRally("prev")}
               onNextRally={() => goToRally("next")}
               onNextUncertain={goToUncertain}
-              onReanalyze={handleReanalyze}
               onToggleEditing={() => setEditing((e) => !e)}
               onAdjustRally={adjustRally}
               onAddAtPlayhead={addAtPlayhead}
@@ -1110,6 +1132,113 @@ export function RecordingPlayer({
           rallyNumber={currentRallyIndex + 1}
         />
       </div>
+
+      {/* The status bar: less important info and actions, and a visual footer
+          so the timeline doesn't sit on the window edge. */}
+      <footer className="flex h-9 shrink-0 items-center gap-3 border-t px-4 text-xs text-muted-foreground">
+        {session.totalMs === 0 && segmentingNow ? (
+          <span className="flex items-center gap-1.5">
+            <Loader2Icon className="size-3.5 animate-spin" />
+            Detecting rallies…
+          </span>
+        ) : sessionRallyCount === 0 && failedCount > 0 ? (
+          <span>Couldn&apos;t detect rallies for this session.</span>
+        ) : sessionRallyCount === 0 ? (
+          <span>No rallies detected.</span>
+        ) : (
+          <span className="tabular-nums">
+            {sessionRallyCount}{" "}
+            {sessionRallyCount === 1 ? "rally" : "rallies"} across the session
+            {uncertainCount > 0 ? (
+              <>
+                {" · "}
+                <button
+                  type="button"
+                  onClick={goToUncertain}
+                  className="text-amber-600 hover:underline dark:text-amber-500"
+                  title="Low-confidence spans the segmenter is unsure about — click to jump to the next one (U)."
+                >
+                  {uncertainCount} uncertain
+                </button>
+              </>
+            ) : null}
+          </span>
+        )}
+        {unprocessed > 0 ? (
+          <span className="flex items-center gap-1.5">
+            <Loader2Icon className="size-3.5 animate-spin" />
+            {unprocessed} more{" "}
+            {unprocessed === 1 ? "recording" : "recordings"} preparing
+          </span>
+        ) : null}
+        {recordings.length > 1 ? (
+          <span className="tabular-nums">
+            Recording {index + 1} of {recordings.length}
+          </span>
+        ) : null}
+        <div className="ml-auto flex items-center gap-0.5">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => zoomTimeline(1 / SESSION_ZOOM_FACTOR)}
+            disabled={pxPerSec <= SESSION_PX_PER_SEC_MIN}
+            title="Zoom the timeline out — fit more of the session on screen."
+          >
+            <ZoomOutIcon className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => zoomTimeline(SESSION_ZOOM_FACTOR)}
+            disabled={pxPerSec >= SESSION_PX_PER_SEC_MAX}
+            title="Zoom the timeline in — see finer detail around the playhead."
+          >
+            <ZoomInIcon className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs"
+            onClick={() => setPxPerSec(SESSION_PX_PER_SEC_DEFAULT)}
+            disabled={pxPerSec === SESSION_PX_PER_SEC_DEFAULT}
+            title="Reset the timeline zoom."
+          >
+            Reset
+          </Button>
+          <Button
+            variant={following ? "ghost" : "outline"}
+            size="sm"
+            className="text-xs"
+            onClick={jumpToPlayhead}
+            disabled={globalPlayheadMs === null}
+            title="Scroll the timeline back to the playhead and follow it again (F)."
+          >
+            <CrosshairIcon className="size-3.5" />
+            Playhead
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs"
+            onClick={handleReanalyze}
+            disabled={segmentingNow}
+            title="Re-run rally detection for the current recording in place (for tuning the segmenter)."
+          >
+            <RotateCwIcon
+              className={`size-3.5 ${reanalyzing ? "animate-spin" : ""}`}
+            />
+            Re-analyze
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => setShowCheatSheet(true)}
+            title="Keyboard shortcuts (?)"
+          >
+            <KeyboardIcon className="size-3.5" />
+          </Button>
+        </div>
+      </footer>
       {showCheatSheet ? (
         <CheatSheet keymap={keymap} onClose={() => setShowCheatSheet(false)} />
       ) : null}
@@ -1178,7 +1307,7 @@ function RallyRail({
                         }`}
                         title={`Rally ${number + 1}: ${formatClock(rally.globalStart)}–${formatClock(rally.globalEnd)}`}
                       >
-                        <span className="w-8 shrink-0 text-muted-foreground tabular-nums">
+                        <span className="w-9 shrink-0 text-muted-foreground tabular-nums">
                           {number + 1}
                         </span>
                         <span className="font-mono text-xs text-muted-foreground tabular-nums">
@@ -1265,7 +1394,7 @@ function RallyInspector({
         </div>
       ) : (
         <>
-          <div className="border-b p-3">
+          <div className="border-b p-4">
             <div className="flex items-center justify-between">
               <h2 className="font-medium">Rally {rallyNumber}</h2>
               <Button
@@ -1296,7 +1425,7 @@ function RallyInspector({
           </div>
 
           {/* Annotation capture stub: verdict → aspect → note (CONTEXT.md). */}
-          <div className="border-b p-3">
+          <div className="border-b p-4">
             <div className="mb-2 flex items-baseline justify-between">
               <h3 className="text-xs font-medium text-muted-foreground">
                 Verdict at playhead
@@ -1339,7 +1468,7 @@ function RallyInspector({
             />
           </div>
 
-          <div className="p-3">
+          <div className="p-4">
             <div className="mb-2 flex items-baseline justify-between">
               <h3 className="text-xs font-medium text-muted-foreground">
                 Annotations
@@ -1364,7 +1493,7 @@ function RallyInspector({
  * frame-step, a session-global timecode mirroring the session playhead and total
  * duration, a playback-speed indicator, a loop toggle, mute, and a volume
  * readout. It deliberately has **no scrubber**: the session timeline strip below
- * remains the single scrub/seek surface. The `?` button opens the cheat-sheet.
+ * remains the single scrub/seek surface.
  */
 function TransportBar({
   paused,
@@ -1382,7 +1511,6 @@ function TransportBar({
   onToggleGapSkip,
   onStepSpeed,
   onResetSpeed,
-  onShowKeys,
 }: {
   paused: boolean
   muted: boolean
@@ -1399,7 +1527,6 @@ function TransportBar({
   onToggleGapSkip: () => void
   onStepSpeed: (dir: -1 | 1) => void
   onResetSpeed: () => void
-  onShowKeys: () => void
 }) {
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -1499,14 +1626,6 @@ function TransportBar({
         <span className="min-w-10 text-right font-mono text-sm text-muted-foreground tabular-nums">
           {muted ? "—" : `${volume}%`}
         </span>
-        <Button
-          variant="outline"
-          size="icon"
-          onClick={onShowKeys}
-          title="Keyboard shortcuts (?)"
-        >
-          <KeyboardIcon className="size-4" />
-        </Button>
       </div>
     </div>
   )
@@ -1592,9 +1711,16 @@ const SessionTimeline = forwardRef<
   SessionTimelineHandle,
   {
     session: SessionModel
-    recordingCount: number
     globalPlayheadMs: number | null
-    reanalyzing: boolean
+    /**
+     * Zoom and playhead-follow are owned by the player (the status bar drives
+     * them from outside the strip); the strip's wheel/scroll handlers mutate
+     * them through the setters.
+     */
+    pxPerSec: number
+    setPxPerSec: Dispatch<SetStateAction<number>>
+    following: boolean
+    setFollowing: Dispatch<SetStateAction<boolean>>
     canPrev: boolean
     canNext: boolean
     editing: boolean
@@ -1602,7 +1728,6 @@ const SessionTimeline = forwardRef<
     onPrevRally: () => void
     onNextRally: () => void
     onNextUncertain: () => void
-    onReanalyze: () => void
     onToggleEditing: () => void
     onAdjustRally: (
       rally: SessionRally,
@@ -1617,9 +1742,11 @@ const SessionTimeline = forwardRef<
 >(function SessionTimeline(
   {
     session,
-    recordingCount,
     globalPlayheadMs,
-    reanalyzing,
+    pxPerSec,
+    setPxPerSec,
+    following,
+    setFollowing,
     canPrev,
     canNext,
     editing,
@@ -1627,7 +1754,6 @@ const SessionTimeline = forwardRef<
     onPrevRally,
     onNextRally,
     onNextUncertain,
-    onReanalyze,
     onToggleEditing,
     onAdjustRally,
     onAddAtPlayhead,
@@ -1650,12 +1776,10 @@ const SessionTimeline = forwardRef<
   } | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
-  const [pxPerSec, setPxPerSec] = useState(SESSION_PX_PER_SEC_DEFAULT)
-  // Whether the strip auto-scrolls to keep the playhead in view. Scrolling the
-  // strip by hand (wheel or scrollbar) disarms it so you can look ahead; the
-  // jump-to-playhead control re-arms it. A ref guards our own programmatic
-  // scrollLeft writes so they don't read back as a manual scroll.
-  const [following, setFollowing] = useState(true)
+  // `following`: whether the strip auto-scrolls to keep the playhead in view.
+  // Scrolling the strip by hand (wheel or scrollbar) disarms it so you can look
+  // ahead; the jump-to-playhead control re-arms it. This ref guards our own
+  // programmatic scrollLeft writes so they don't read back as a manual scroll.
   const programmaticScrollRef = useRef(false)
 
   const totalMs = session.totalMs
@@ -1664,14 +1788,6 @@ const SessionTimeline = forwardRef<
   // The strip only renders once a recording has rallies; the wheel/scroll
   // listeners below re-attach when it appears (deps include this).
   const hasRallies = totalMs > 0 && session.rallies.length > 0
-
-  const canZoomIn = pxPerSec < SESSION_PX_PER_SEC_MAX
-  const canZoomOut = pxPerSec > SESSION_PX_PER_SEC_MIN
-  const zoomBy = useCallback((factor: number) => {
-    setPxPerSec((p) =>
-      clamp(p * factor, SESSION_PX_PER_SEC_MIN, SESSION_PX_PER_SEC_MAX)
-    )
-  }, [])
 
   // Map a client x over the strip content to a session-global time (ms, clamped).
   const xToMs = useCallback(
@@ -1772,7 +1888,7 @@ const SessionTimeline = forwardRef<
     }
     el.addEventListener("wheel", onWheel, { passive: false })
     return () => el.removeEventListener("wheel", onWheel)
-  }, [hasRallies, scrollStripTo])
+  }, [hasRallies, scrollStripTo, setPxPerSec])
 
   // A hand scroll (wheel or scrollbar) stops the strip tracking the playhead, so
   // you can look ahead without it snapping back. Our own programmatic writes are
@@ -1789,7 +1905,7 @@ const SessionTimeline = forwardRef<
     }
     el.addEventListener("scroll", onScroll, { passive: true })
     return () => el.removeEventListener("scroll", onScroll)
-  }, [hasRallies])
+  }, [hasRallies, setFollowing])
 
   // Recenter the strip on the playhead and re-arm follow — the jump-to-playhead
   // control, also reached by the `F` key through this imperative handle.
@@ -1798,7 +1914,7 @@ const SessionTimeline = forwardRef<
     if (!el || globalPlayheadMs == null || totalMs === 0) return
     scrollStripTo((globalPlayheadMs / 1000) * pxPerSec - el.clientWidth / 2)
     setFollowing(true)
-  }, [globalPlayheadMs, totalMs, pxPerSec, scrollStripTo])
+  }, [globalPlayheadMs, totalMs, pxPerSec, scrollStripTo, setFollowing])
   useImperativeHandle(ref, () => ({ scrollToPlayhead }), [scrollToPlayhead])
 
   // While following, keep the playhead in view as playback advances, crosses
@@ -1817,46 +1933,9 @@ const SessionTimeline = forwardRef<
     }
   }, [globalPlayheadMs, totalMs, pxPerSec, following, scrollStripTo])
 
-  const segmentingNow =
-    reanalyzing ||
-    session.segments.some((s) => s.timeline?.segment_state === "unknown")
-  const failedCount = session.segments.filter(
-    (s) => s.timeline?.segment_state === "failed"
-  ).length
-  const rallyCount = session.rallies.length
   const uncertainCount = session.rallies.filter(
     (r) => r.confidence < UNCERTAIN_CONFIDENCE
   ).length
-  const unprocessed = recordingCount - session.placedCount
-
-  let summary
-  if (totalMs === 0 && segmentingNow) {
-    summary = (
-      <span className="flex items-center gap-2">
-        <Loader2Icon className="size-4 animate-spin" />
-        Detecting rallies…
-      </span>
-    )
-  } else if (rallyCount === 0 && failedCount > 0) {
-    summary = <span>Couldn&apos;t detect rallies for this session.</span>
-  } else if (!hasRallies) {
-    summary = <span>No rallies detected.</span>
-  } else {
-    summary = (
-      <span>
-        {rallyCount} {rallyCount === 1 ? "rally" : "rallies"} across the session
-        {uncertainCount > 0 ? (
-          <span
-            className="text-amber-600 dark:text-amber-500"
-            title="Low-confidence spans the segmenter is unsure about — worth checking."
-          >
-            {" "}
-            · {uncertainCount} uncertain
-          </span>
-        ) : null}
-      </span>
-    )
-  }
 
   const selectedIndex = session.rallies.findIndex(
     (r) => rallyKey(r) === selectedKey
@@ -1880,8 +1959,7 @@ const SessionTimeline = forwardRef<
 
   return (
     <div className="shrink-0 space-y-2">
-      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground">
-        {summary}
+      <div className="flex flex-wrap items-center justify-end gap-2">
         <div className="flex items-center gap-2">
           <Button
             variant="outline"
@@ -1912,18 +1990,6 @@ const SessionTimeline = forwardRef<
           >
             <TriangleAlertIcon className="size-4" />
             Next uncertain
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onReanalyze}
-            disabled={segmentingNow}
-            title="Re-run rally detection for the current recording in place (for tuning the segmenter)."
-          >
-            <RotateCwIcon
-              className={`size-4 ${reanalyzing ? "animate-spin" : ""}`}
-            />
-            Re-analyze
           </Button>
           <Button
             variant={editing ? "default" : "outline"}
@@ -2007,7 +2073,7 @@ const SessionTimeline = forwardRef<
           >
             <div
               ref={contentRef}
-              className="relative h-16 cursor-pointer"
+              className="relative h-20 cursor-pointer"
               style={{ width: `${Math.max(totalPx, 1)}px` }}
               onClick={(e) => {
                 if (editing) {
@@ -2141,54 +2207,6 @@ const SessionTimeline = forwardRef<
               ) : null}
             </div>
           </div>
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <span className="mr-1">Zoom</span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => zoomBy(1 / SESSION_ZOOM_FACTOR)}
-              disabled={!canZoomOut}
-              title="Zoom out — fit more of the session on screen."
-            >
-              <ZoomOutIcon className="size-4" />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => zoomBy(SESSION_ZOOM_FACTOR)}
-              disabled={!canZoomIn}
-              title="Zoom in — see finer detail around the playhead."
-            >
-              <ZoomInIcon className="size-4" />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPxPerSec(SESSION_PX_PER_SEC_DEFAULT)}
-              disabled={pxPerSec === SESSION_PX_PER_SEC_DEFAULT}
-              title="Reset the timeline zoom."
-            >
-              Reset
-            </Button>
-            <Button
-              variant={following ? "outline" : "default"}
-              size="sm"
-              onClick={scrollToPlayhead}
-              disabled={globalPlayheadMs === null}
-              title="Scroll the timeline back to the playhead and follow it again (F)."
-              className="ml-auto"
-            >
-              <CrosshairIcon className="size-4" />
-              Playhead
-            </Button>
-          </div>
-          {unprocessed > 0 ? (
-            <p className="text-xs text-muted-foreground">
-              {unprocessed} more{" "}
-              {unprocessed === 1 ? "recording" : "recordings"} still being
-              prepared — they’ll join the timeline once segmented.
-            </p>
-          ) : null}
         </>
       ) : null}
     </div>
