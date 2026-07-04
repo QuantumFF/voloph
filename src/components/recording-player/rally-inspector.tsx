@@ -6,7 +6,10 @@ import { Button } from "@/components/ui/button"
 import { formatClock } from "@/lib/format"
 import {
   UNCERTAIN_CONFIDENCE,
+  VERDICTS,
+  type SessionAnnotation,
   type SessionRally,
+  type Verdict,
 } from "@/components/recording-player-transport"
 import { LONG_RALLY_MS } from "./index"
 
@@ -27,16 +30,22 @@ const VERDICT_DOT = {
 
 /**
  * The right inspector of the studio layout (issue #48): everything about the
- * rally under the playhead. Its identity, bounds, length class, and uncertainty
- * are real; the capture surfaces — flag, verdict, aspect, note, annotation
- * list — are visual stubs until annotations and flags are implemented.
+ * rally under the playhead. Verdict capture (issue #8) is live — a click drops
+ * a `good`/`bad`/`mistake` annotation at the playhead, and the ones inside this
+ * rally's span list below; flag, aspect, and note stay visual stubs for now.
  */
 export function RallyInspector({
   rally,
   rallyNumber,
+  annotations,
+  onAnnotate,
 }: {
   rally: SessionRally | null
   rallyNumber: number
+  /** Annotations whose timestamp falls inside this rally (glossary), ordered. */
+  annotations: SessionAnnotation[]
+  /** Drop a verdict at the playhead (same path as the 1/2/3 hotkeys). */
+  onAnnotate: (verdict: Verdict) => void
 }) {
   return (
     <aside className="flex w-72 shrink-0 flex-col overflow-y-auto border-l">
@@ -82,24 +91,24 @@ export function RallyInspector({
             ) : null}
           </div>
 
-          {/* Annotation capture stub: verdict → aspect → note (CONTEXT.md). */}
+          {/* Verdict capture (issue #8): one keystroke or click drops an
+              annotation at the playhead. Aspect + note come in a later slice. */}
           <div className="border-b p-4">
             <div className="mb-2 flex items-baseline justify-between">
               <h3 className="text-xs font-medium text-muted-foreground">
                 Verdict at playhead
               </h3>
-              <span className="text-xs text-muted-foreground/70">
-                coming soon
-              </span>
+              <span className="text-xs text-muted-foreground/70">1 · 2 · 3</span>
             </div>
             <div className="grid grid-cols-3 gap-1.5">
-              {(["good", "bad", "mistake"] as const).map((verdict) => (
+              {VERDICTS.map((verdict) => (
                 <Button
                   key={verdict}
                   variant="outline"
                   size="sm"
-                  disabled
                   className="capitalize"
+                  onClick={() => onAnnotate(verdict)}
+                  title={`Mark a ${verdict} at the playhead.`}
                 >
                   <span
                     className={`size-2 rounded-full ${VERDICT_DOT[verdict]}`}
@@ -127,18 +136,29 @@ export function RallyInspector({
           </div>
 
           <div className="p-4">
-            <div className="mb-2 flex items-baseline justify-between">
-              <h3 className="text-xs font-medium text-muted-foreground">
-                Annotations
-              </h3>
-              <span className="text-xs text-muted-foreground/70">
-                coming soon
-              </span>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              Moments you mark during playback will collect here, pinned to
-              their timestamps.
-            </p>
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground">
+              Annotations
+            </h3>
+            {annotations.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                Moments you mark during playback collect here, pinned to their
+                timestamps.
+              </p>
+            ) : (
+              <ul className="space-y-1 text-sm">
+                {annotations.map((a) => (
+                  <li key={a.id} className="flex items-center gap-2">
+                    <span
+                      className={`size-2 shrink-0 rounded-full ${VERDICT_DOT[a.verdict]}`}
+                    />
+                    <span className="capitalize">{a.verdict}</span>
+                    <span className="ml-auto tabular-nums text-muted-foreground">
+                      {formatClock(a.globalMs)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         </>
       )}

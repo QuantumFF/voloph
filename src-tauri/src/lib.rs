@@ -207,6 +207,32 @@ async fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<
     db::delete_rally(&conn, &path, rally_id).map_err(|e| e.to_string())
 }
 
+/// Drop a verdict annotation at `time_ms` (recording-local) on the recording at
+/// `path` (issue #8 — the fast capture path: `good`/`bad`/`mistake`, no pause).
+/// Persists immediately, pinned to absolute time so it survives restart; returns
+/// the new annotation's id, or `None` when `path` is not a registered recording.
+#[tauri::command]
+async fn add_annotation(
+    db: State<'_, Db>,
+    path: String,
+    time_ms: i64,
+    verdict: String,
+) -> Result<Option<i64>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::add_annotation(&conn, &path, time_ms, &verdict).map_err(|e| e.to_string())
+}
+
+/// Every verdict annotation on the recording at `path`, in timestamp order, so
+/// the player can lay their markers over the timeline strip (issue #8).
+#[tauri::command]
+async fn recording_annotations(
+    db: State<'_, Db>,
+    path: String,
+) -> Result<Vec<db::Annotation>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::recording_annotations(&conn, &path).map_err(|e| e.to_string())
+}
+
 /// Start the background media worker unless one is already running. It drains
 /// every pending unit of work — probe each `unknown` recording for its frame
 /// rate, then segment each unsegmented one (ADR 0002) — without holding the DB
@@ -432,6 +458,8 @@ pub fn run() {
             update_rally,
             add_rally,
             delete_rally,
+            add_annotation,
+            recording_annotations,
             mpv::mpv_load,
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,

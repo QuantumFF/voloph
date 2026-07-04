@@ -78,6 +78,13 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             confidence   REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_rallies_recording ON rallies(recording_id);
+        CREATE TABLE IF NOT EXISTS annotations (
+            id           INTEGER PRIMARY KEY,
+            recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+            time_ms      INTEGER NOT NULL,
+            verdict      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_annotations_recording ON annotations(recording_id);
         CREATE TABLE IF NOT EXISTS scanned_folders (
             path TEXT NOT NULL UNIQUE
         );",
@@ -712,6 +719,63 @@ pub fn delete_rally(conn: &Connection, path: &str, rally_id: i64) -> rusqlite::R
     Ok(changed > 0)
 }
 
+/// A verdict annotation as the player needs it (issue #8): its row `id`, the
+/// recording-local absolute timestamp it is pinned to, and its one-keystroke
+/// verdict. The rally it belongs to is *not* stored — it is implied by which
+/// rally's range contains `time_ms` (glossary), so moving a rally boundary never
+/// disturbs an annotation.
+#[derive(Debug, Serialize)]
+pub struct Annotation {
+    pub id: i64,
+    pub time_ms: i64,
+    pub verdict: String,
+}
+
+/// Drop a verdict annotation at `time_ms` (recording-local) on the recording at
+/// `path` (issue #8 — the fast capture path: verdict only, no pause). Scoped to
+/// the recording at `path` like the inline rally edits, so a stray path writes
+/// nothing. Returns the new annotation's id, or `None` when `path` is not a
+/// registered recording. Nothing prevents two annotations at the same timestamp:
+/// a moment with mixed verdicts is recorded as more than one (glossary).
+pub fn add_annotation(
+    conn: &Connection,
+    path: &str,
+    time_ms: i64,
+    verdict: &str,
+) -> rusqlite::Result<Option<i64>> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(None);
+    };
+    conn.execute(
+        "INSERT INTO annotations (recording_id, time_ms, verdict) VALUES (?1, ?2, ?3)",
+        rusqlite::params![rid, time_ms.max(0), verdict],
+    )?;
+    Ok(Some(conn.last_insert_rowid()))
+}
+
+/// Every verdict annotation on the recording at `path`, in timestamp order, so
+/// the player can lay their markers over the timeline strip (issue #8). Empty
+/// when the recording has none or `path` is not registered.
+pub fn recording_annotations(conn: &Connection, path: &str) -> rusqlite::Result<Vec<Annotation>> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, time_ms, verdict FROM annotations
+         WHERE recording_id = ?1 ORDER BY time_ms, id",
+    )?;
+    let annotations = stmt
+        .query_map([rid], |row| {
+            Ok(Annotation {
+                id: row.get(0)?,
+                time_ms: row.get(1)?,
+                verdict: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(annotations)
+}
+
 /// Parse the stored waveform JSON (a bare array of floats written by
 /// `save_rallies`) back into peaks. A null/absent or malformed value yields an
 /// empty waveform — the strip then just omits the waveform, harmless. Hand-parsed
@@ -987,5 +1051,78 @@ mod tests {
         refine_capture_day(&mut conn, id, "/r.mp4", &embedded).unwrap();
         assert_eq!(day_of(&conn, "/r.mp4"), "2024-03-15");
         assert_eq!(session_count(&conn), 1);
+    }
+
+    fn verdicts(conn: &Connection, path: &str) -> Vec<(i64, String)> {
+        recording_annotations(conn, path)
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.time_ms, a.verdict))
+            .collect()
+    }
+
+    /// A dropped verdict persists pinned to its timestamp and reads back in
+    /// timestamp order (issue #8, the fast capture path).
+    #[test]
+    fn annotation_persists_at_its_timestamp() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        add_annotation(&conn, "/r.mp4", 3200, "mistake").unwrap();
+        add_annotation(&conn, "/r.mp4", 1500, "good").unwrap();
+        assert_eq!(
+            verdicts(&conn, "/r.mp4"),
+            vec![
+                (1500, "good".to_string()),
+                (3200, "mistake".to_string()),
+            ]
+        );
+    }
+
+    /// Two annotations may sit at the same timestamp — a moment with mixed
+    /// verdicts is recorded as more than one (glossary).
+    #[test]
+    fn annotations_can_share_a_timestamp() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        add_annotation(&conn, "/r.mp4", 2000, "good").unwrap();
+        add_annotation(&conn, "/r.mp4", 2000, "mistake").unwrap();
+        assert_eq!(
+            verdicts(&conn, "/r.mp4"),
+            vec![
+                (2000, "good".to_string()),
+                (2000, "mistake".to_string()),
+            ]
+        );
+    }
+
+    /// Annotations are scoped to their recording: dropping one on `/a.mp4` never
+    /// shows up under `/b.mp4`, and an unregistered path is a no-op.
+    #[test]
+    fn annotations_are_scoped_to_their_recording() {
+        let (conn, _) = db_with_rallies("/a.mp4", &[(1000, 5000)]);
+        conn.execute(
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, probe_state, segment_state, duration_ms)
+             VALUES (1, '/b.mp4', 0, '', '2026-01-01', 'ready', 'ready', 100000)",
+            [],
+        )
+        .unwrap();
+        add_annotation(&conn, "/a.mp4", 2000, "bad").unwrap();
+        assert!(add_annotation(&conn, "/missing.mp4", 2000, "bad")
+            .unwrap()
+            .is_none());
+        assert_eq!(verdicts(&conn, "/a.mp4"), vec![(2000, "bad".to_string())]);
+        assert!(verdicts(&conn, "/b.mp4").is_empty());
+        assert!(recording_annotations(&conn, "/missing.mp4").unwrap().is_empty());
+    }
+
+    /// Deleting a recording cascades to its annotations (they key off the
+    /// recording, so they travel/vanish with it).
+    #[test]
+    fn deleting_a_recording_cascades_to_its_annotations() {
+        let (conn, id) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        add_annotation(&conn, "/r.mp4", 2000, "good").unwrap();
+        conn.execute("DELETE FROM recordings WHERE id = ?1", [id]).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM annotations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

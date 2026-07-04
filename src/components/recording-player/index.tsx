@@ -25,12 +25,15 @@ import { formatCaptureDay } from "@/lib/utils"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
+  buildSessionAnnotations,
   buildSessionModel,
   clamp,
   type PlaylistRecording,
   type SessionModel,
+  type Verdict,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
+import { useAnnotations } from "./use-annotations"
 import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
 import { useMpvTransport } from "./use-mpv-transport"
 import { useSessionPlayback } from "./use-session-playback"
@@ -218,6 +221,20 @@ export function RecordingPlayer({
       refreshTimeline,
     })
 
+  // Verdict annotations (issue #8): fetched per recording, dropped at the
+  // playhead by a hotkey, and stitched onto the session axis for the strip.
+  const { annotations, add: addAnnotation } = useAnnotations(recordings)
+  const sessionAnnotations = useMemo(
+    () => buildSessionAnnotations(session, annotations),
+    [session, annotations]
+  )
+  const annotate = useCallback(
+    (verdict: Verdict) => {
+      if (path) addAnnotation(path, currentMs, verdict)
+    },
+    [path, currentMs, addAnnotation]
+  )
+
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
   // The keymap array is rebuilt only when an action's closure changes; the
@@ -238,6 +255,7 @@ export function RecordingPlayer({
         toggleMute,
         stepSpeed,
         resetSpeed,
+        annotate,
         toggleCheatSheet,
       }),
     [
@@ -253,6 +271,7 @@ export function RecordingPlayer({
       toggleMute,
       stepSpeed,
       resetSpeed,
+      annotate,
       toggleCheatSheet,
     ]
   )
@@ -268,6 +287,17 @@ export function RecordingPlayer({
           (r) =>
             globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
         )
+
+  // Annotations whose timestamp falls inside the rally under the playhead
+  // (glossary: a rally owns the annotations in its span), for the inspector.
+  const rallyAnnotations = useMemo(() => {
+    const rally =
+      currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
+    if (!rally) return []
+    return sessionAnnotations.filter(
+      (a) => a.globalMs >= rally.globalStart && a.globalMs < rally.globalEnd
+    )
+  }, [currentRallyIndex, session, sessionAnnotations])
 
   // Status-bar readouts: how segmentation stands across the whole session.
   const segmentingNow =
@@ -379,6 +409,7 @@ export function RecordingPlayer({
             <SessionTimeline
               ref={timelineRef}
               session={session}
+              annotations={sessionAnnotations}
               globalPlayheadMs={globalPlayheadMs}
               pxPerSec={pxPerSec}
               setPxPerSec={setPxPerSec}
@@ -406,6 +437,8 @@ export function RecordingPlayer({
             currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
           }
           rallyNumber={currentRallyIndex + 1}
+          annotations={rallyAnnotations}
+          onAnnotate={annotate}
         />
       </div>
 

@@ -26,6 +26,7 @@ import {
   UNCERTAIN_CONFIDENCE,
   clamp,
   stripScrollTarget,
+  type SessionAnnotation,
   type SessionModel,
   type SessionRally,
 } from "@/components/recording-player-transport"
@@ -33,6 +34,13 @@ import { SESSION_PX_PER_SEC_MAX, SESSION_PX_PER_SEC_MIN } from "./index"
 
 /** How much each Alt+scroll notch over the timeline zooms. */
 const ALT_SCROLL_ZOOM_FACTOR = 1.15
+
+/** Marker colour per verdict (issue #8), matching the inspector's verdict dots. */
+const VERDICT_MARKER = {
+  good: "bg-emerald-500",
+  bad: "bg-amber-500",
+  mistake: "bg-red-500",
+} as const
 
 /** Imperative surface of the timeline strip the player drives (jump-to-playhead). */
 export interface SessionTimelineHandle {
@@ -57,6 +65,8 @@ export const SessionTimeline = forwardRef<
   SessionTimelineHandle,
   {
     session: SessionModel
+    /** Verdict annotations lifted onto the session axis, drawn as markers. */
+    annotations: SessionAnnotation[]
     globalPlayheadMs: number | null
     /**
      * Zoom and playhead-follow are owned by the player (the status bar drives
@@ -88,6 +98,7 @@ export const SessionTimeline = forwardRef<
 >(function SessionTimeline(
   {
     session,
+    annotations,
     globalPlayheadMs,
     pxPerSec,
     setPxPerSec,
@@ -543,6 +554,17 @@ export const SessionTimeline = forwardRef<
                       </>
                     ) : null}
                   </button>
+                )
+              })}
+              {annotations.map((a) => {
+                const left = (a.globalMs / 1000) * pxPerSec
+                return (
+                  <div
+                    key={a.id}
+                    className={`pointer-events-none absolute top-0 h-2.5 w-0.5 -translate-x-1/2 rounded-b ${VERDICT_MARKER[a.verdict]}`}
+                    style={{ left: `${left}px` }}
+                    title={`${a.verdict} at ${formatClock(a.globalMs)}`}
+                  />
                 )
               })}
               {playheadPx !== null ? (

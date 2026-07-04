@@ -115,6 +115,61 @@ export interface PlaylistRecording {
 }
 
 /**
+ * The three verdicts an annotation can carry (CONTEXT.md): the one-keystroke
+ * classification captured in the moment. `mistake` is an outright, point-ending
+ * unforced error; `bad` is suboptimal but not point-ending; `good` is well done.
+ */
+export const VERDICTS = ["good", "bad", "mistake"] as const
+export type Verdict = (typeof VERDICTS)[number]
+
+/**
+ * A verdict annotation pinned to a recording-local timestamp (issue #8, matching
+ * `Annotation` in `src-tauri/src/db.rs`). The rally it belongs to is implied by
+ * which rally's range contains `time_ms`, not stored.
+ */
+export interface Annotation {
+  id: number
+  time_ms: number
+  verdict: Verdict
+}
+
+/** An annotation lifted onto the session-global axis for the timeline strip. */
+export interface SessionAnnotation {
+  id: number
+  recordingIndex: number
+  path: string
+  verdict: Verdict
+  /** Session-global timestamp (what the strip draws). */
+  globalMs: number
+}
+
+/**
+ * Lift every placed recording's annotations onto the session-global axis (issue
+ * #8), so their markers sit at the right spot on the one continuous strip. A
+ * recording that isn't placed yet (unknown duration) contributes nothing, since
+ * it has no offset. Ordered by global timestamp.
+ */
+export function buildSessionAnnotations(
+  session: SessionModel,
+  annotations: Record<string, Annotation[]>
+): SessionAnnotation[] {
+  const out: SessionAnnotation[] = []
+  for (const seg of session.segments) {
+    if (seg.durationMs == null) continue
+    for (const a of annotations[seg.path] ?? []) {
+      out.push({
+        id: a.id,
+        recordingIndex: seg.index,
+        path: seg.path,
+        verdict: a.verdict,
+        globalMs: seg.offsetMs + a.time_ms,
+      })
+    }
+  }
+  return out.sort((a, b) => a.globalMs - b.globalMs)
+}
+
+/**
  * One recording placed on the session-global time axis. `offsetMs` is the sum of
  * the durations of every recording before it, so a recording-local time `t` maps
  * to the session position `offsetMs + t`. `durationMs` is null until the

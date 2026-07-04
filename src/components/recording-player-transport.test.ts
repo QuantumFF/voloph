@@ -4,6 +4,7 @@ import {
   SPEED_LADDER,
   addAtPlayheadEdit,
   adjustRallyEdit,
+  buildSessionAnnotations,
   buildSessionModel,
   clampVolume,
   gapSkipAction,
@@ -319,6 +320,43 @@ describe("buildSessionModel", () => {
     expect(model.totalMs).toBe(10000)
     expect(model.segments).toHaveLength(2) // a (placed) + b (the unknown one)
     expect(model.rallies).toHaveLength(1) // only a's rally is placed
+  })
+})
+
+describe("buildSessionAnnotations", () => {
+  it("lifts each recording's annotations onto the session axis, ordered", () => {
+    const session = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": timeline(10000, [rally(1, 1000, 2000)]),
+      "b.mp4": timeline(8000, [rally(2, 500, 1500)]),
+    })
+    const marks = buildSessionAnnotations(session, {
+      "b.mp4": [{ id: 3, time_ms: 700, verdict: "mistake" }],
+      "a.mp4": [{ id: 2, time_ms: 1500, verdict: "good" }],
+    })
+    // Ordered by global time: a's at 1500, b's lifted by a's 10000 → 10700.
+    expect(marks.map((m) => [m.id, m.globalMs, m.verdict])).toEqual([
+      [2, 1500, "good"],
+      [3, 10700, "mistake"],
+    ])
+    expect(marks[1].recordingIndex).toBe(1)
+  })
+
+  it("skips annotations on an unplaced recording", () => {
+    const session = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": {
+        segment_state: "unknown",
+        duration_ms: null,
+        rallies: [],
+        waveform: [],
+      },
+      "b.mp4": timeline(8000, []),
+    })
+    // a isn't placed (no duration) → b isn't either; both drop out.
+    const marks = buildSessionAnnotations(session, {
+      "a.mp4": [{ id: 1, time_ms: 100, verdict: "good" }],
+      "b.mp4": [{ id: 2, time_ms: 100, verdict: "bad" }],
+    })
+    expect(marks).toEqual([])
   })
 })
 
