@@ -272,6 +272,32 @@ async fn delete_annotation(db: State<'_, Db>, path: String, id: i64) -> Result<b
     db::delete_annotation(&conn, &path, id).map_err(|e| e.to_string())
 }
 
+/// Cross-session filter over rallies and their annotations (issue #11 — the
+/// payoff of the structured data). Every argument is optional and they combine
+/// with AND; `verdict`/`aspect` keep rallies containing a matching moment (and
+/// attach those moments), `length` (`Some(true)` = long, derived from duration)
+/// and `flagged` filter the rally itself. Returns the matching rallies newest
+/// session first, each carrying enough context to open the right recording at its
+/// timestamp.
+#[tauri::command]
+async fn filter_moments(
+    db: State<'_, Db>,
+    verdict: Option<String>,
+    aspect: Option<String>,
+    length: Option<bool>,
+    flagged: Option<bool>,
+) -> Result<Vec<db::FilteredRally>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::filter_moments(
+        &conn,
+        verdict.as_deref(),
+        aspect.as_deref(),
+        length,
+        flagged,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Start the background media worker unless one is already running. It drains
 /// every pending unit of work — probe each `unknown` recording for its frame
 /// rate, then segment each unsegmented one (ADR 0002) — without holding the DB
@@ -502,6 +528,7 @@ pub fn run() {
             recording_annotations,
             update_annotation,
             delete_annotation,
+            filter_moments,
             mpv::mpv_load,
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,

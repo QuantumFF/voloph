@@ -195,6 +195,27 @@ export function buildSessionAnnotations(
 }
 
 /**
+ * A rally returned by the cross-session filter (issue #11), matching
+ * `FilteredRally` in `src-tauri/src/db.rs`. Carries enough context to identify
+ * it and jump to it — the containing recording's `recording_path` opened at
+ * `start_ms`, named by `capture_day`. `annotations` holds the matching moments
+ * when the filter carried a verdict/aspect, empty for a length/flag-only filter.
+ */
+export interface FilteredRally {
+  session_id: number
+  capture_day: string
+  recording_id: number
+  recording_path: string
+  rally_id: number
+  start_ms: number
+  end_ms: number
+  /** Derived from duration (CONTEXT.md), never from quality. */
+  long: boolean
+  flagged: boolean
+  annotations: Annotation[]
+}
+
+/**
  * One recording placed on the session-global time axis. `offsetMs` is the sum of
  * the durations of every recording before it, so a recording-local time `t` maps
  * to the session position `offsetMs + t`. `durationMs` is null until the
@@ -351,9 +372,7 @@ export function nextRallyMs(rallies: Rally[], ms: number): number | null {
  * - `none`: no rallies at all.
  */
 export type PrevRallyAction =
-  | { kind: "seek"; ms: number }
-  | { kind: "prev-recording" }
-  | { kind: "none" }
+  { kind: "seek"; ms: number } | { kind: "prev-recording" } | { kind: "none" }
 
 export function prevRallyAction(
   rallies: Rally[],
@@ -482,7 +501,13 @@ export function adjustRallyEdit(
   return {
     kind: "ops",
     ops: [
-      { command: "update_rally", path: rally.path, rallyId: rally.id, startMs, endMs },
+      {
+        command: "update_rally",
+        path: rally.path,
+        rallyId: rally.id,
+        startMs,
+        endMs,
+      },
     ],
   }
 }

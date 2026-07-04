@@ -381,6 +381,7 @@ function sessionRally(
     globalStart: offset + localStart,
     globalEnd: offset + localEnd,
     confidence: 1,
+    flagged: false,
   }
 }
 

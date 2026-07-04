@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog"
 import {
   AlertTriangleIcon,
   ClapperboardIcon,
+  FilterIcon,
   FolderOpenIcon,
   Loader2Icon,
   MoreVerticalIcon,
@@ -68,8 +69,7 @@ function isPreparing(state: string): boolean {
  */
 function isAnalyzing(recording: Recording): boolean {
   return (
-    recording.probe_state === "ready" &&
-    recording.segment_state === "unknown"
+    recording.probe_state === "ready" && recording.segment_state === "unknown"
   )
 }
 
@@ -121,6 +121,8 @@ interface SessionListProps {
     startIndex: number,
     day: string
   ) => void
+  /** Open the cross-session moment browser (issue #11). */
+  onBrowse: () => void
 }
 
 /**
@@ -130,7 +132,7 @@ interface SessionListProps {
  * stats, a Review button that opens the whole session in the workstation, and
  * the recordings it holds as dense rows.
  */
-export function SessionList({ onPlay }: SessionListProps) {
+export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
   const [scanning, setScanning] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
@@ -283,6 +285,16 @@ export function SessionList({ onPlay }: SessionListProps) {
           <Button
             variant="outline"
             size="sm"
+            onClick={onBrowse}
+            disabled={sessions.length === 0}
+            title="Filter moments across every session by verdict, aspect, rally length, and flag."
+          >
+            <FilterIcon className="size-4" />
+            Browse moments
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
             onClick={handleRefresh}
             disabled={refreshing}
             title="Re-scan known folders for newly added recordings."
@@ -339,10 +351,7 @@ export function SessionList({ onPlay }: SessionListProps) {
               <div key={session.id} className="rounded-xl border">
                 <div className="flex items-center gap-4 border-b px-4 py-3">
                   <div className="min-w-0">
-                    <h3
-                      className="font-medium"
-                      title={session.capture_day}
-                    >
+                    <h3 className="font-medium" title={session.capture_day}>
                       {formatCaptureDay(session.capture_day)}
                     </h3>
                     <p className="text-sm text-muted-foreground tabular-nums">

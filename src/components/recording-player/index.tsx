@@ -55,6 +55,12 @@ interface RecordingPlayerProps {
   recordings: PlaylistRecording[]
   /** Index of the recording to open first (defaults to the session's start). */
   startIndex?: number
+  /**
+   * Recording-local time (ms) to open the first recording at — a jump from the
+   * cross-session filter to a specific moment (issue #11). Omitted for a normal
+   * session review, which starts from the first rally.
+   */
+  startMs?: number
   /** The session's capture day, shown in the top bar. */
   day?: string
   /** Return to the session list. */
@@ -105,6 +111,7 @@ export const LONG_RALLY_MS = 15_000
 export function RecordingPlayer({
   recordings,
   startIndex = 0,
+  startMs,
   day,
   onBack,
 }: RecordingPlayerProps) {
@@ -171,6 +178,7 @@ export function RecordingPlayer({
   } = useSessionPlayback({
     recordings,
     startIndex,
+    startMs,
     timelines,
     session,
     segmentOffset,
@@ -219,13 +227,13 @@ export function RecordingPlayer({
     mergeRallies,
     toggleFlag,
   } = useTimelineEdits({
-      session,
-      path,
-      index,
-      currentMs,
-      segmentOffset,
-      refreshTimeline,
-    })
+    session,
+    path,
+    index,
+    currentMs,
+    segmentOffset,
+    refreshTimeline,
+  })
 
   // Verdict annotations (issue #8): fetched per recording, dropped at the
   // playhead by a hotkey, and stitched onto the session axis for the strip.
@@ -403,7 +411,10 @@ export function RecordingPlayer({
             className="mx-4 mt-3 mb-1 min-h-0 flex-1 rounded-lg bg-black"
           />
           {error ? (
-            <div className="shrink-0 px-4 pt-2 text-sm text-destructive" role="alert">
+            <div
+              className="shrink-0 px-4 pt-2 text-sm text-destructive"
+              role="alert"
+            >
               {error}
             </div>
           ) : null}
@@ -480,8 +491,8 @@ export function RecordingPlayer({
           <span>No rallies detected.</span>
         ) : (
           <span className="tabular-nums">
-            {sessionRallyCount}{" "}
-            {sessionRallyCount === 1 ? "rally" : "rallies"} across the session
+            {sessionRallyCount} {sessionRallyCount === 1 ? "rally" : "rallies"}{" "}
+            across the session
             {uncertainCount > 0 ? (
               <>
                 {" · "}
@@ -500,8 +511,8 @@ export function RecordingPlayer({
         {unprocessed > 0 ? (
           <span className="flex items-center gap-1.5">
             <Loader2Icon className="size-3.5 animate-spin" />
-            {unprocessed} more{" "}
-            {unprocessed === 1 ? "recording" : "recordings"} preparing
+            {unprocessed} more {unprocessed === 1 ? "recording" : "recordings"}{" "}
+            preparing
           </span>
         ) : null}
         {recordings.length > 1 ? (

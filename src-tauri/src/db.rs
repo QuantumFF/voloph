@@ -858,6 +858,125 @@ pub fn delete_annotation(conn: &Connection, path: &str, id: i64) -> rusqlite::Re
     Ok(changed > 0)
 }
 
+/// Rally-length threshold in ms (CONTEXT.md: every rally is classified long or
+/// short by its duration against a threshold, objectively — never from quality).
+/// Mirrors `LONG_RALLY_MS` in the player frontend; kept here so the cross-session
+/// filter derives length in SQL without a round-trip.
+const LONG_RALLY_MS: i64 = 15_000;
+
+/// A rally matching a cross-session filter (issue #11), lifted with enough
+/// context to identify it and jump straight to it. The jump target is the
+/// containing recording's `path` opened at the rally's `start_ms`; `session_id`
+/// / `capture_day` name the outing, `recording_id` disambiguates within it. When
+/// the filter carries a verdict or aspect, `annotations` holds the rally's
+/// matching moments (so their notes/aspects show in the results); a length- or
+/// flag-only filter leaves it empty (the rally itself is the result).
+#[derive(Debug, Serialize)]
+pub struct FilteredRally {
+    pub session_id: i64,
+    pub capture_day: String,
+    pub recording_id: i64,
+    pub recording_path: String,
+    pub rally_id: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// Derived from duration against `LONG_RALLY_MS`, never from quality.
+    pub long: bool,
+    pub flagged: bool,
+    pub annotations: Vec<Annotation>,
+}
+
+/// Cross-session filter over rallies and their annotations (issue #11 — the
+/// payoff of the structured data). Every filter is optional and they combine with
+/// AND: a rally is returned when it satisfies every set filter. `verdict`/`aspect`
+/// filter on the rally's annotations (the rally must contain a moment matching
+/// them, and only the matching moments come back attached); `length`
+/// (`Some(true)` = long) and `flagged` filter the rally itself. With no filter
+/// set every rally is returned. Results are newest session first, then in
+/// recording/timeline order — the order the user reviews by.
+pub fn filter_moments(
+    conn: &Connection,
+    verdict: Option<&str>,
+    aspect: Option<&str>,
+    length: Option<bool>,
+    flagged: Option<bool>,
+) -> rusqlite::Result<Vec<FilteredRally>> {
+    // An annotation matches the moment filters (verdict/aspect); its timestamp is
+    // inside the rally's span (glossary — the rally owns the moment). The rally is
+    // kept only when at least one such annotation exists (when either is set).
+    let annotation_matches =
+        "a.recording_id = r.recording_id AND a.time_ms >= r.start_ms AND a.time_ms < r.end_ms
+         AND (?1 IS NULL OR a.verdict = ?1)
+         AND (?2 IS NULL OR a.aspect = ?2)";
+    let sql = format!(
+        "SELECT s.id, s.capture_day, rec.id, rec.path,
+                r.id, r.start_ms, r.end_ms, r.flagged
+         FROM rallies r
+         JOIN recordings rec ON rec.id = r.recording_id
+         JOIN sessions s ON s.id = rec.session_id
+         WHERE (?3 IS NULL OR (r.end_ms - r.start_ms >= {LONG_RALLY_MS}) = ?3)
+           AND (?4 IS NULL OR r.flagged = ?4)
+           AND ((?1 IS NULL AND ?2 IS NULL)
+                OR EXISTS (SELECT 1 FROM annotations a WHERE {annotation_matches}))
+         ORDER BY s.capture_day DESC, rec.path, r.start_ms"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let want_annotations = verdict.is_some() || aspect.is_some();
+    let rows: Vec<FilteredRally> = stmt
+        .query_map(
+            rusqlite::params![verdict, aspect, length, flagged],
+            |row| {
+                let start_ms: i64 = row.get(5)?;
+                let end_ms: i64 = row.get(6)?;
+                Ok(FilteredRally {
+                    session_id: row.get(0)?,
+                    capture_day: row.get(1)?,
+                    recording_id: row.get(2)?,
+                    recording_path: row.get(3)?,
+                    rally_id: row.get(4)?,
+                    start_ms,
+                    end_ms,
+                    long: end_ms - start_ms >= LONG_RALLY_MS,
+                    flagged: row.get::<_, i64>(7)? != 0,
+                    annotations: Vec::new(),
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Attach the matching moments only when a moment filter is active — a
+    // length/flag-only query is about the rally itself, so its annotations would
+    // just be noise in the results.
+    if !want_annotations {
+        return Ok(rows);
+    }
+    let mut astmt = conn.prepare(
+        "SELECT id, time_ms, verdict, aspect, note FROM annotations
+         WHERE recording_id = ?1 AND time_ms >= ?2 AND time_ms < ?3
+           AND (?4 IS NULL OR verdict = ?4)
+           AND (?5 IS NULL OR aspect = ?5)
+         ORDER BY time_ms, id",
+    )?;
+    let mut out = rows;
+    for r in &mut out {
+        r.annotations = astmt
+            .query_map(
+                rusqlite::params![r.recording_id, r.start_ms, r.end_ms, verdict, aspect],
+                |row| {
+                    Ok(Annotation {
+                        id: row.get(0)?,
+                        time_ms: row.get(1)?,
+                        verdict: row.get(2)?,
+                        aspect: row.get(3)?,
+                        note: row.get(4)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    Ok(out)
+}
+
 /// Parse the stored waveform JSON (a bare array of floats written by
 /// `save_rallies`) back into peaks. A null/absent or malformed value yields an
 /// empty waveform — the strip then just omits the waveform, harmless. Hand-parsed
@@ -1039,6 +1158,81 @@ mod tests {
         assert!(!set_rally_flag(&conn, "/missing.mp4", a_id, true).unwrap());
         assert!(!set_rally_flag(&conn, "/a.mp4", 9999, true).unwrap());
         assert_eq!(flags(&conn, "/a.mp4"), vec![false]);
+    }
+
+    /// Cross-session filtering (issue #11): filters combine with AND, verdict /
+    /// aspect select rallies containing a matching moment (and attach it), length
+    /// is derived from duration, flag filters the rally. Two sessions here so
+    /// "across all sessions" is actually exercised.
+    #[test]
+    fn filter_moments_combines_across_sessions() {
+        let (mut conn, _) = db_with_rallies("/a.mp4", &[(0, 20_000), (30_000, 33_000)]);
+        // A second session/recording so the query spans sessions.
+        conn.execute(
+            "INSERT INTO sessions (capture_day) VALUES ('2026-02-02')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, probe_state, segment_state, duration_ms)
+             VALUES (2, '/b.mp4', 0, '', '2026-02-02', 'ready', 'ready', 100000)",
+            [],
+        )
+        .unwrap();
+        save_rallies(
+            &mut conn,
+            2,
+            100_000,
+            &[crate::segment::Rally { start_ms: 0, end_ms: 5_000, confidence: 1.0 }],
+            &[],
+        )
+        .unwrap();
+
+        // Moment on the long rally in /a and the short rally in /b.
+        let a_long = recording_timeline(&conn, "/a.mp4").unwrap().unwrap().rallies[0].id;
+        let a_short = recording_timeline(&conn, "/a.mp4").unwrap().unwrap().rallies[1].id;
+        set_rally_flag(&conn, "/a.mp4", a_long, true).unwrap();
+        let m1 = add_annotation(&conn, "/a.mp4", 1_000, "mistake").unwrap().unwrap();
+        update_annotation(&conn, "/a.mp4", m1, "mistake", Some("execution"), None).unwrap();
+        add_annotation(&conn, "/a.mp4", 31_000, "good").unwrap(); // in the short rally
+        add_annotation(&conn, "/b.mp4", 500, "mistake").unwrap(); // execution left null
+
+        // No filter → every rally, newest session first, no attached annotations.
+        let all = filter_moments(&conn, None, None, None, None).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].capture_day, "2026-02-02"); // newest first
+        assert!(all.iter().all(|r| r.annotations.is_empty()));
+
+        // Length filter is derived from duration: one long rally (the 20s one).
+        let long = filter_moments(&conn, None, None, Some(true), None).unwrap();
+        assert_eq!(long.len(), 1);
+        assert_eq!(long[0].rally_id, a_long);
+        assert!(long[0].long && long[0].flagged);
+
+        // Flag filter: only the flagged rally.
+        let flagged = filter_moments(&conn, None, None, None, Some(true)).unwrap();
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].rally_id, a_long);
+
+        // verdict=mistake → two rallies (a_long, /b), each with its mistake attached.
+        let mistakes = filter_moments(&conn, Some("mistake"), None, None, None).unwrap();
+        assert_eq!(mistakes.len(), 2);
+        assert!(mistakes.iter().all(|r| r.annotations.len() == 1
+            && r.annotations[0].verdict == "mistake"));
+        assert_ne!(mistakes[0].rally_id, a_short);
+
+        // aspect=execution AND verdict=mistake → only /a's long rally.
+        let combo =
+            filter_moments(&conn, Some("mistake"), Some("execution"), None, None).unwrap();
+        assert_eq!(combo.len(), 1);
+        assert_eq!(combo[0].rally_id, a_long);
+        assert_eq!(combo[0].annotations[0].aspect.as_deref(), Some("execution"));
+
+        // Combined moment + rally filters: mistake in a *long* rally → still /a only.
+        let combo2 =
+            filter_moments(&conn, Some("mistake"), None, Some(true), None).unwrap();
+        assert_eq!(combo2.len(), 1);
+        assert_eq!(combo2[0].rally_id, a_long);
     }
 
     use crate::media::CaptureDate;
