@@ -98,6 +98,8 @@ export interface Rally {
   end_ms: number
   /** Per-region confidence in [0, 1]; low values are uncertain regions. */
   confidence: number
+  /** Whether the user flagged this rally as one that matters (issue #10). */
+  flagged: boolean
 }
 
 /** Result of the `recording_timeline` command (see `src-tauri/src/db.rs`). */
@@ -220,6 +222,8 @@ export interface SessionRally {
   globalStart: number
   globalEnd: number
   confidence: number
+  /** Whether the user flagged this rally as one that matters (issue #10). */
+  flagged: boolean
 }
 
 /** The whole session stitched onto one continuous axis. */
@@ -274,6 +278,7 @@ export function buildSessionModel(
         globalStart: seg.offsetMs + r.start_ms,
         globalEnd: seg.offsetMs + r.end_ms,
         confidence: r.confidence,
+        flagged: r.flagged,
       })
     }
   }

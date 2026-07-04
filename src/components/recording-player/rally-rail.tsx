@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useRef } from "react"
-import { Loader2Icon, TimerIcon, TriangleAlertIcon } from "lucide-react"
+import { FlagIcon, Loader2Icon, TimerIcon, TriangleAlertIcon } from "lucide-react"
 
 import { fileName, formatClock } from "@/lib/format"
 import {
@@ -85,9 +85,15 @@ export function RallyRail({
                             aria-label="Long rally"
                           />
                         ) : null}
+                        {rally.flagged ? (
+                          <FlagIcon
+                            className="ml-auto size-3.5 shrink-0 fill-sky-400 text-sky-500"
+                            aria-label="Flagged rally"
+                          />
+                        ) : null}
                         {rally.confidence < UNCERTAIN_CONFIDENCE ? (
                           <TriangleAlertIcon
-                            className="ml-auto size-3.5 shrink-0 text-amber-500"
+                            className={`size-3.5 shrink-0 text-amber-500 ${rally.flagged ? "" : "ml-auto"}`}
                             aria-label="Uncertain region — worth checking"
                           />
                         ) : null}

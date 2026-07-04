@@ -40,6 +40,7 @@ export interface KeymapActions {
   stepSpeed: (dir: 1 | -1) => void
   resetSpeed: () => void
   annotate: (verdict: Verdict) => void
+  flagCurrentRally: () => void
   toggleCheatSheet: () => void
 }
 
@@ -62,6 +63,7 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     stepSpeed,
     resetSpeed,
     annotate,
+    flagCurrentRally,
     toggleCheatSheet,
   } = actions
   const plain = (e: KeyboardEvent) =>
@@ -176,6 +178,12 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
       label: "Annotate: mistake at playhead",
       match: (e) => plain(e) && e.key === "3",
       run: () => annotate("mistake"),
+    },
+    {
+      keys: ["X"],
+      label: "Flag / unflag the current rally",
+      match: (e) => plain(e) && e.key.toLowerCase() === "x",
+      run: flagCurrentRally,
     },
     {
       keys: ["Ctrl+-", "Ctrl+="],

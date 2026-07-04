@@ -207,6 +207,20 @@ async fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<
     db::delete_rally(&conn, &path, rally_id).map_err(|e| e.to_string())
 }
 
+/// Set a rally's flag (issue #10 — "this rally matters", the source material for
+/// an export reel). Scoped to the recording at `path` like the inline edits;
+/// persists immediately so it survives restart. Returns whether a rally was found.
+#[tauri::command]
+async fn set_rally_flag(
+    db: State<'_, Db>,
+    path: String,
+    rally_id: i64,
+    flagged: bool,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::set_rally_flag(&conn, &path, rally_id, flagged).map_err(|e| e.to_string())
+}
+
 /// Drop a verdict annotation at `time_ms` (recording-local) on the recording at
 /// `path` (issue #8 — the fast capture path: `good`/`bad`/`mistake`, no pause).
 /// Persists immediately, pinned to absolute time so it survives restart; returns
@@ -483,6 +497,7 @@ pub fn run() {
             update_rally,
             add_rally,
             delete_rally,
+            set_rally_flag,
             add_annotation,
             recording_annotations,
             update_annotation,

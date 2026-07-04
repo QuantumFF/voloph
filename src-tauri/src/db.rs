@@ -75,7 +75,8 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
             start_ms     INTEGER NOT NULL,
             end_ms       INTEGER NOT NULL,
-            confidence   REAL NOT NULL
+            confidence   REAL NOT NULL,
+            flagged      INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_rallies_recording ON rallies(recording_id);
         CREATE TABLE IF NOT EXISTS annotations (
@@ -130,6 +131,11 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // only until it is enriched. Added here so DBs from issue #8 gain the columns.
     let _ = conn.execute("ALTER TABLE annotations ADD COLUMN aspect TEXT", []);
     let _ = conn.execute("ALTER TABLE annotations ADD COLUMN note TEXT", []);
+    // A rally-level flag meaning "this rally matters" (issue #10) — orthogonal to
+    // its annotations, the source material for an export reel. Added here so DBs
+    // from earlier slices gain the column. Cleared on re-analyze along with every
+    // other manual rally correction (the rally row is replaced; ADR 0002).
+    let _ = conn.execute("ALTER TABLE rallies ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0", []);
     Ok(conn)
 }
 
@@ -578,6 +584,9 @@ pub struct TimelineRally {
     pub start_ms: i64,
     pub end_ms: i64,
     pub confidence: f64,
+    /// Whether the user flagged this rally as one that matters (issue #10) — the
+    /// source material for an export reel, orthogonal to its annotations.
+    pub flagged: bool,
 }
 
 /// A recording's draft timeline as the player needs it: where the recording is
@@ -619,7 +628,7 @@ pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Opt
     let waveform = parse_waveform(waveform_json.as_deref());
 
     let mut stmt = conn.prepare(
-        "SELECT id, start_ms, end_ms, confidence FROM rallies
+        "SELECT id, start_ms, end_ms, confidence, flagged FROM rallies
          WHERE recording_id = ?1 ORDER BY start_ms",
     )?;
     let rallies = stmt
@@ -629,6 +638,7 @@ pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Opt
                 start_ms: row.get(1)?,
                 end_ms: row.get(2)?,
                 confidence: row.get(3)?,
+                flagged: row.get::<_, i64>(4)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -722,6 +732,27 @@ pub fn delete_rally(conn: &Connection, path: &str, rally_id: i64) -> rusqlite::R
     let changed = conn.execute(
         "DELETE FROM rallies WHERE id = ?1 AND recording_id = ?2",
         rusqlite::params![rally_id, rid],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Set a rally's flag (issue #10 — "this rally matters", the export-reel source).
+/// Scoped to the recording at `path` like the inline rally edits, so a stray id
+/// from another recording cannot be touched. Idempotent — setting the current
+/// value again is harmless. Returns `false` when the recording or rally is not
+/// found.
+pub fn set_rally_flag(
+    conn: &Connection,
+    path: &str,
+    rally_id: i64,
+    flagged: bool,
+) -> rusqlite::Result<bool> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(false);
+    };
+    let changed = conn.execute(
+        "UPDATE rallies SET flagged = ?1 WHERE id = ?2 AND recording_id = ?3",
+        rusqlite::params![flagged as i64, rally_id, rid],
     )?;
     Ok(changed > 0)
 }
@@ -967,6 +998,47 @@ mod tests {
         assert!(!update_rally(&conn, "/missing.mp4", 1, 0, 1).unwrap());
         assert!(add_rally(&conn, "/missing.mp4", 0, 1).unwrap().is_none());
         assert!(!delete_rally(&conn, "/missing.mp4", 1).unwrap());
+    }
+
+    fn flags(conn: &Connection, path: &str) -> Vec<bool> {
+        recording_timeline(conn, path)
+            .unwrap()
+            .unwrap()
+            .rallies
+            .into_iter()
+            .map(|r| r.flagged)
+            .collect()
+    }
+
+    /// A rally starts unflagged; flagging toggles it on and off and persists,
+    /// independent of any annotations (issue #10).
+    #[test]
+    fn flag_toggles_and_persists() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000), (8000, 12000)]);
+        let id = recording_timeline(&conn, "/r.mp4").unwrap().unwrap().rallies[0].id;
+        assert_eq!(flags(&conn, "/r.mp4"), vec![false, false]);
+        assert!(set_rally_flag(&conn, "/r.mp4", id, true).unwrap());
+        assert_eq!(flags(&conn, "/r.mp4"), vec![true, false]);
+        assert!(set_rally_flag(&conn, "/r.mp4", id, false).unwrap());
+        assert_eq!(flags(&conn, "/r.mp4"), vec![false, false]);
+    }
+
+    /// Flagging is scoped to the recording, and an unknown rally/path touches
+    /// nothing (issue #10).
+    #[test]
+    fn flag_is_scoped_to_its_recording() {
+        let (conn, _) = db_with_rallies("/a.mp4", &[(1000, 5000)]);
+        conn.execute(
+            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, probe_state, segment_state, duration_ms)
+             VALUES (1, '/b.mp4', 0, '', '2026-01-01', 'ready', 'ready', 100000)",
+            [],
+        )
+        .unwrap();
+        let a_id = recording_timeline(&conn, "/a.mp4").unwrap().unwrap().rallies[0].id;
+        assert!(!set_rally_flag(&conn, "/b.mp4", a_id, true).unwrap());
+        assert!(!set_rally_flag(&conn, "/missing.mp4", a_id, true).unwrap());
+        assert!(!set_rally_flag(&conn, "/a.mp4", 9999, true).unwrap());
+        assert_eq!(flags(&conn, "/a.mp4"), vec![false]);
     }
 
     use crate::media::CaptureDate;

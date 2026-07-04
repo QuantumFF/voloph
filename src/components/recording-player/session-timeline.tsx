@@ -13,6 +13,7 @@ import {
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  FlagIcon,
   PencilIcon,
   PlusIcon,
   ScissorsIcon,
@@ -500,17 +501,20 @@ export const SessionTimeline = forwardRef<
                       uncertain
                         ? "border border-amber-500/70 bg-amber-500/40"
                         : "bg-primary/70"
-                    } ${isSelected ? "ring-2 ring-foreground ring-offset-1 ring-offset-muted" : ""}`}
+                    } ${rally.flagged ? "ring-2 ring-sky-400" : ""} ${isSelected ? "ring-2 ring-foreground ring-offset-1 ring-offset-muted" : ""}`}
                     style={{
                       left: `${left}px`,
                       width: `${Math.max(width, 3)}px`,
                     }}
                     title={`Rally ${i + 1}: ${formatClock(rally.globalStart)}–${formatClock(
                       rally.globalEnd
-                    )}${uncertain ? " (uncertain)" : ""} · confidence ${Math.round(
+                    )}${uncertain ? " (uncertain)" : ""}${rally.flagged ? " · flagged" : ""} · confidence ${Math.round(
                       rally.confidence * 100
                     )}% · ${fileName(rally.path)}`}
                   >
+                    {rally.flagged ? (
+                      <FlagIcon className="pointer-events-none absolute top-0.5 left-0.5 size-2.5 fill-sky-400 text-sky-400" />
+                    ) : null}
                     {editing ? (
                       <>
                         <span

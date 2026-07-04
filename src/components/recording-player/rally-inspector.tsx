@@ -26,14 +26,15 @@ const VERDICT_DOT = {
  * rally under the playhead. Verdict capture (issue #8) is live — a click drops
  * a `good`/`bad`/`mistake` annotation at the playhead. Selecting one of the
  * listed annotations enriches it (issue #9): re-classify its verdict, pick an
- * aspect from the seeded vocabulary, type a note, or delete it. Flag stays a
- * visual stub for now.
+ * aspect from the seeded vocabulary, type a note, or delete it. Flag (issue #10)
+ * marks the rally as one that matters — the source material for an export reel.
  */
 export function RallyInspector({
   rally,
   rallyNumber,
   annotations,
   onAnnotate,
+  onToggleFlag,
   onUpdate,
   onDelete,
 }: {
@@ -43,6 +44,8 @@ export function RallyInspector({
   annotations: SessionAnnotation[]
   /** Drop a verdict at the playhead (same path as the 1/2/3 hotkeys). */
   onAnnotate: (verdict: Verdict) => void
+  /** Flag / unflag this rally (same path as the X hotkey). */
+  onToggleFlag: () => void
   /** Enrich/re-classify an annotation (issue #9). */
   onUpdate: (
     path: string,
@@ -74,13 +77,17 @@ export function RallyInspector({
             <div className="flex items-center justify-between">
               <h2 className="font-medium">Rally {rallyNumber}</h2>
               <Button
-                variant="outline"
+                variant={rally.flagged ? "default" : "outline"}
                 size="sm"
-                disabled
-                title="Flags are coming soon — one keystroke to mark a rally for the export reel."
+                onClick={onToggleFlag}
+                title={
+                  rally.flagged
+                    ? "Flagged — this rally is in the export reel. Click (or X) to unflag."
+                    : "Flag this rally as one that matters, for the export reel (X)."
+                }
               >
                 <FlagIcon className="size-4" />
-                Flag
+                {rally.flagged ? "Flagged" : "Flag"}
               </Button>
             </div>
             <p className="mt-1 text-sm text-muted-foreground tabular-nums">

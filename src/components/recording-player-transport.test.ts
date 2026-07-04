@@ -31,7 +31,7 @@ function rally(
   end_ms: number,
   confidence = 1
 ): Rally {
-  return { id, start_ms, end_ms, confidence }
+  return { id, start_ms, end_ms, confidence, flagged: false }
 }
 
 /** A ready timeline of the given duration and rallies. */

@@ -119,5 +119,28 @@ export function useTimelineEdits({
     [runEdit]
   )
 
-  return { adjustRally, addAtPlayhead, deleteRally, splitRally, mergeRallies }
+  // Toggle a rally's flag (issue #10). Not an inline correction, but it shares
+  // the same shape — a scoped write to a rally row followed by a timeline refresh
+  // so the strip and rail reflect the flag at once.
+  const toggleFlag = useCallback(
+    (rally: SessionRally) => {
+      void trackedInvoke("set_rally_flag", {
+        path: rally.path,
+        rallyId: rally.id,
+        flagged: !rally.flagged,
+      })
+        .then(() => refreshTimeline(rally.path))
+        .catch(() => {})
+    },
+    [refreshTimeline]
+  )
+
+  return {
+    adjustRally,
+    addAtPlayhead,
+    deleteRally,
+    splitRally,
+    mergeRallies,
+    toggleFlag,
+  }
 }

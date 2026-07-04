@@ -211,8 +211,14 @@ export function RecordingPlayer({
 
   // The five inline corrections (issue #7): boundary math behind the transport
   // seam, persistence + timeline refresh behind this hook.
-  const { adjustRally, addAtPlayhead, deleteRally, splitRally, mergeRallies } =
-    useTimelineEdits({
+  const {
+    adjustRally,
+    addAtPlayhead,
+    deleteRally,
+    splitRally,
+    mergeRallies,
+    toggleFlag,
+  } = useTimelineEdits({
       session,
       path,
       index,
@@ -240,6 +246,24 @@ export function RecordingPlayer({
     [path, currentMs, addAnnotation]
   )
 
+  // The rally under the playhead (session-global), driving the rail highlight,
+  // the inspector, and the flag hotkey; -1 while the playhead sits in a gap or
+  // before placement.
+  const currentRallyIndex =
+    globalPlayheadMs == null
+      ? -1
+      : session.rallies.findIndex(
+          (r) =>
+            globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
+        )
+  const currentRally =
+    currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
+
+  // Flag / unflag the rally under the playhead (issue #10); a no-op in a gap.
+  const flagCurrentRally = useCallback(() => {
+    if (currentRally) toggleFlag(currentRally)
+  }, [currentRally, toggleFlag])
+
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
   // The keymap array is rebuilt only when an action's closure changes; the
@@ -261,6 +285,7 @@ export function RecordingPlayer({
         stepSpeed,
         resetSpeed,
         annotate,
+        flagCurrentRally,
         toggleCheatSheet,
       }),
     [
@@ -277,21 +302,12 @@ export function RecordingPlayer({
       stepSpeed,
       resetSpeed,
       annotate,
+      flagCurrentRally,
       toggleCheatSheet,
     ]
   )
 
   useGlobalKeymap(keymap)
-
-  // The rally under the playhead (session-global), driving the rail highlight
-  // and the inspector; -1 while the playhead sits in a gap or before placement.
-  const currentRallyIndex =
-    globalPlayheadMs == null
-      ? -1
-      : session.rallies.findIndex(
-          (r) =>
-            globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
-        )
 
   // Annotations whose timestamp falls inside the rally under the playhead
   // (glossary: a rally owns the annotations in its span), for the inspector.
@@ -444,6 +460,7 @@ export function RecordingPlayer({
           rallyNumber={currentRallyIndex + 1}
           annotations={rallyAnnotations}
           onAnnotate={annotate}
+          onToggleFlag={flagCurrentRally}
           onUpdate={updateAnnotation}
           onDelete={removeAnnotation}
         />
