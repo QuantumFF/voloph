@@ -49,6 +49,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { fileName, formatClock, formatTimecode } from "@/lib/format"
 import { trackedInvoke } from "@/lib/tauri"
 import { formatCaptureDay } from "@/lib/utils"
 import {
@@ -142,34 +143,6 @@ const LONG_RALLY_MS = 15_000
 
 /** How wide a rally Add-at-playhead creates around the playhead (ms each side). */
 const ADD_RALLY_HALF_MS = 2000
-
-function formatClock(ms: number): string {
-  const total = Math.round(ms / 1000)
-  const m = Math.floor(total / 60)
-  const s = total % 60
-  return `${m}:${s.toString().padStart(2, "0")}`
-}
-
-/**
- * Session-global timecode for the transport bar: `mm:ss` under an hour,
- * `h:mm:ss` past it, so the position display reads naturally for both a short
- * clip and a long session.
- */
-function formatTimecode(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const h = Math.floor(total / 3600)
-  const m = Math.floor((total % 3600) / 60)
-  const s = total % 60
-  if (h > 0) {
-    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`
-  }
-  return `${m}:${s.toString().padStart(2, "0")}`
-}
-
-function fileName(path: string): string {
-  const parts = path.split(/[\\/]/)
-  return parts[parts.length - 1] || path
-}
 
 /**
  * One entry in the single keymap definition: its display form (`keys`/`label`

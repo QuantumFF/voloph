@@ -32,6 +32,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { fileName, formatDuration, formatSize } from "@/lib/format"
 import { trackedInvoke } from "@/lib/tauri"
 import { formatCaptureDay } from "@/lib/utils"
 
@@ -86,31 +87,6 @@ interface Session {
 interface ScanResult {
   registered: number
   skipped: number
-}
-
-function formatSize(bytes: number): string {
-  if (bytes <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB"]
-  const i = Math.min(
-    Math.floor(Math.log(bytes) / Math.log(1024)),
-    units.length - 1
-  )
-  return `${(bytes / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
-}
-
-function fileName(path: string): string {
-  const parts = path.split(/[\\/]/)
-  return parts[parts.length - 1] || path
-}
-
-function formatDuration(ms: number): string {
-  // Round to whole minutes first so 59m30s carries into the hour instead of
-  // rendering as "60m" / "1h 60m".
-  const totalMinutes = Math.round(ms / 60000)
-  const h = Math.floor(totalMinutes / 60)
-  const m = totalMinutes % 60
-  if (h > 0) return `${h}h ${m.toString().padStart(2, "0")}m`
-  return `${m}m`
 }
 
 /** The stats line under a session's date: recordings, rallies, footage length. */
