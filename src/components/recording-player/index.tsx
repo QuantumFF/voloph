@@ -27,13 +27,10 @@ import { formatCaptureDay } from "@/lib/utils"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
-  addAtPlayheadEdit,
-  adjustRallyEdit,
   buildSessionModel,
   clamp,
   clampVolume,
   gapSkipAction,
-  mergeRallyEdit,
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
@@ -41,17 +38,15 @@ import {
   resumeTickLanded,
   seekTarget,
   speedIndexForValue,
-  splitRallyEdit,
   stepSpeedIndex,
-  type EditPlan,
   type PlaylistRecording,
   type Resume,
   type SessionModel,
-  type SessionRally,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
 import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
 import { useSessionTimelines } from "./use-session-timelines"
+import { useTimelineEdits } from "./use-timeline-edits"
 import { CheatSheet } from "./cheat-sheet"
 import { RallyInspector } from "./rally-inspector"
 import { RallyRail } from "./rally-rail"
@@ -103,9 +98,6 @@ const RESUME_TICK_TOL_MS = 250
  * lands; 15s reads as a sustained exchange.
  */
 export const LONG_RALLY_MS = 15_000
-
-/** How wide a rally Add-at-playhead creates around the playhead (ms each side). */
-const ADD_RALLY_HALF_MS = 2000
 
 /**
  * Plays a whole **session** as one continuous playlist (the North Star) on
@@ -605,87 +597,17 @@ export function RecordingPlayer({
     reanalyze(path)
   }, [path, reanalyze])
 
-  // The five inline corrections (issue #7). The boundary math and integrity
-  // guards that decide what reaches SQLite live behind the transport seam (so
-  // they're unit-tested without mpv); here each callback resolves a plan and
-  // hands it to `runEdit`, which persists its ops in order then re-reads the
-  // affected recording's timeline so playback and the strip reflect it at once.
-
-  // Recording-local duration of a recording, or +Infinity until it's segmented
-  // (the edit math leaves an unknown-duration recording uncapped).
-  const recordingDuration = useCallback(
-    (recordingIndex: number) =>
-      session.segments.find((s) => s.index === recordingIndex)?.durationMs ??
-      Number.POSITIVE_INFINITY,
-    [session]
-  )
-
-  const runEdit = useCallback(
-    (plan: EditPlan) => {
-      if (plan.kind !== "ops" || plan.ops.length === 0) return
-      const recordingPath = plan.ops[0].path
-      let chain: Promise<unknown> = Promise.resolve()
-      for (const op of plan.ops) {
-        const { command, ...args } = op
-        chain = chain.then(() => trackedInvoke(command, args))
-      }
-      void chain.then(() => refreshTimeline(recordingPath)).catch(() => {})
-    },
-    [refreshTimeline]
-  )
-
-  const adjustRally = useCallback(
-    (rally: SessionRally, globalStart: number, globalEnd: number) => {
-      runEdit(
-        adjustRallyEdit(
-          rally,
-          globalStart,
-          globalEnd,
-          segmentOffset(rally.recordingIndex),
-          recordingDuration(rally.recordingIndex)
-        )
-      )
-    },
-    [segmentOffset, recordingDuration, runEdit]
-  )
-
-  const addAtPlayhead = useCallback(() => {
-    if (!path) return
-    runEdit(
-      addAtPlayheadEdit(
-        path,
-        currentMs,
-        recordingDuration(index),
-        ADD_RALLY_HALF_MS
-      )
-    )
-  }, [path, index, currentMs, recordingDuration, runEdit])
-
-  const deleteRally = useCallback(
-    (rally: SessionRally) => {
-      runEdit({
-        kind: "ops",
-        ops: [{ command: "delete_rally", path: rally.path, rallyId: rally.id }],
-      })
-    },
-    [runEdit]
-  )
-
-  const splitRally = useCallback(
-    (rally: SessionRally, atGlobalMs: number) => {
-      runEdit(
-        splitRallyEdit(rally, atGlobalMs, segmentOffset(rally.recordingIndex))
-      )
-    },
-    [segmentOffset, runEdit]
-  )
-
-  const mergeRallies = useCallback(
-    (first: SessionRally, second: SessionRally) => {
-      runEdit(mergeRallyEdit(first, second))
-    },
-    [runEdit]
-  )
+  // The five inline corrections (issue #7): boundary math behind the transport
+  // seam, persistence + timeline refresh behind this hook.
+  const { adjustRally, addAtPlayhead, deleteRally, splitRally, mergeRallies } =
+    useTimelineEdits({
+      session,
+      path,
+      index,
+      currentMs,
+      segmentOffset,
+      refreshTimeline,
+    })
 
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
