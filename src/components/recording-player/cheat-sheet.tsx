@@ -3,7 +3,7 @@
 import { XIcon } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import type { Keybinding } from "./index"
+import type { Keybinding } from "./keymap"
 
 /**
  * The `?` cheat-sheet overlay: a modal listing every keybinding, rendered

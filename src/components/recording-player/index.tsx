@@ -1,7 +1,6 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { listen } from "@tauri-apps/api/event"
 import {
   ArrowLeftIcon,
   CrosshairIcon,
@@ -22,35 +21,21 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { fileName } from "@/lib/format"
-import { trackedInvoke } from "@/lib/tauri"
 import { formatCaptureDay } from "@/lib/utils"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
-  addAtPlayheadEdit,
-  adjustRallyEdit,
   buildSessionModel,
   clamp,
-  clampVolume,
-  gapSkipAction,
-  mergeRallyEdit,
-  nextRallyMs,
-  nextUncertainMs,
-  prevRallyAction,
-  resumeStartMs,
-  resumeTickLanded,
-  seekTarget,
-  speedIndexForValue,
-  splitRallyEdit,
-  stepSpeedIndex,
-  type EditPlan,
   type PlaylistRecording,
-  type Resume,
   type SessionModel,
-  type SessionRally,
-  type Timeline,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
+import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
+import { useMpvTransport } from "./use-mpv-transport"
+import { useSessionPlayback } from "./use-session-playback"
+import { useSessionTimelines } from "./use-session-timelines"
+import { useTimelineEdits } from "./use-timeline-edits"
 import { CheatSheet } from "./cheat-sheet"
 import { RallyInspector } from "./rally-inspector"
 import { RallyRail } from "./rally-rail"
@@ -73,12 +58,6 @@ interface RecordingPlayerProps {
   onBack: () => void
 }
 
-/** How long to wait before re-checking a recording whose timeline is still being produced. */
-const SEGMENT_POLL_MS = 2000
-
-/** Index of `1×` on the speed ladder — the default and the `Ctrl+0` reset target. */
-const DEFAULT_SPEED_INDEX = SPEED_LADDER.indexOf(1)
-
 /**
  * Horizontal scale of the session timeline strip in pixels-per-second, so the
  * whole session is one long, horizontally-scrollable strip. The zoom buttons
@@ -90,45 +69,12 @@ export const SESSION_PX_PER_SEC_MIN = 1
 export const SESSION_PX_PER_SEC_MAX = 240
 const SESSION_ZOOM_FACTOR = 1.5
 
-/** Arrow-seek step sizes in ms (session-global), by modifier. */
-const SEEK_FINE_MS = 2500 // Ctrl+←/→
-const SEEK_DEFAULT_MS = 5000 // ←/→
-const SEEK_COARSE_MS = 10000 // Shift+←/→
-
-/** Volume step (0–100) for the up/down arrows. */
-const VOLUME_STEP = 10
-
-/**
- * How close (ms) the playhead must get to a crossing's resume target before its
- * `time-pos` ticks count as "landed" and normal playback resumes. mpv's resume
- * seek is exact but async, so the first settled tick sits at the target; this
- * slack only clears the near-0 pre-seek lead-in the freshly-loaded file emits
- * before the seek takes hold.
- */
-const RESUME_TICK_TOL_MS = 250
-
 /**
  * Rally length threshold (CONTEXT.md: every rally is classified long or short
  * by duration, objectively and automatically). UI-only until length filtering
  * lands; 15s reads as a sustained exchange.
  */
 export const LONG_RALLY_MS = 15_000
-
-/** How wide a rally Add-at-playhead creates around the playhead (ms each side). */
-const ADD_RALLY_HALF_MS = 2000
-
-/**
- * One entry in the single keymap definition: its display form (`keys`/`label`
- * for the cheat-sheet), the predicate that decides whether a keydown matches it,
- * and the action to run. One array backs both the live key handler and the `?`
- * cheat-sheet, so they cannot drift.
- */
-export interface Keybinding {
-  keys: string[]
-  label: string
-  match: (e: KeyboardEvent) => boolean
-  run: (e: KeyboardEvent) => void
-}
 
 /**
  * Plays a whole **session** as one continuous playlist (the North Star) on
@@ -159,81 +105,19 @@ export function RecordingPlayer({
   day,
   onBack,
 }: RecordingPlayerProps) {
-  // Gap-free playback is the default (the North Star), but a manual playhead move
-  // opts out: dragging into a gap, or clicking an empty part of the session
-  // strip, flips `freePlayRef` true and gap-skipping stands down so footage
-  // between rallies can be watched. A rally-targeted action restores gap-free
-  // playback. It's a ref, not state, so the `time-pos` listener reads the latest
-  // value synchronously without re-subscribing on every change.
-  const freePlayRef = useRef(false)
   // Focus host so the keymap's window handler is the only thing on keystrokes.
   const containerRef = useRef<HTMLDivElement>(null)
   // Imperative handle on the timeline strip so the `F` key / button can recenter
   // it on the playhead (and re-arm follow) without lifting its scroll state.
   const timelineRef = useRef<SessionTimelineHandle>(null)
-  // True from the moment a load is initiated until mpv confirms the new file is
-  // open (the `mpv:file-loaded` event, fired after its baked-in resume seek has
-  // landed). While true the `time-pos` listener drops every tick, because a tick
-  // carries no file identity: the *outgoing* recording keeps emitting ticks at
-  // its own (often large) playhead position after a `loadfile`, and the
-  // freshly-loaded file emits near-0 pre-seek ticks before the resume takes hold.
-  // Acting on either runs gap-skip against the wrong position — a stale far-past
-  // tick reads as "past the last rally" and yanks the playhead into the *next*
-  // recording, overriding a click that crossed into this one. Set synchronously
-  // at the crossing (not in the load effect) so no tick slips through the
-  // render→effect gap; a ref so the listener reads it without re-subscribing.
-  // Starts true so the initial mount load is gated the same way.
-  const awaitingLoadRef = useRef(true)
-  // The second, position gate, working with `awaitingLoadRef`: the recording-local
-  // time the pending crossing resumes at, while the (async) resume seek lands. The
-  // identity gate above drops every tick until `mpv:file-loaded`, but mpv applies
-  // the seek a moment *after* the file opens, so the file's first ticks are still
-  // near 0 — this drops them until the playhead reaches the target, so gap-skip
-  // can't read a transient ~0 as "before the first rally" and yank there. Because
-  // the identity gate has already filtered out the outgoing recording's stale
-  // (often far-past) ticks, a plain "have we reached the target?" check is enough
-  // here. Null once landed, or when a crossing has no specific target yet.
-  const resumeTargetRef = useRef<number | null>(null)
 
-  // Every recording's draft timeline, keyed by path so it survives switching
-  // recordings (and so the whole session can be stitched into one strip). Each
-  // unsegmented recording is polled until its rallies arrive (ADR 0002).
-  const [timelines, setTimelines] = useState<Record<string, Timeline>>({})
-  // The playhead within the current recording (ms), from mpv's `time-pos`.
-  const [currentMs, setCurrentMs] = useState(0)
-  const [paused, setPaused] = useState(false)
-  const [muted, setMuted] = useState(false)
-  const [volume, setVolume] = useState(100)
-  const [speedIndex, setSpeedIndex] = useState(DEFAULT_SPEED_INDEX)
-  const [looping, setLooping] = useState(false)
-  // Whether gap-free playback is on (the North Star default). When off, the
-  // playhead runs straight through the gaps between rallies — a manual "watch
-  // everything" mode toggled from the transport bar or the `G` key.
-  const [gapSkipEnabled, setGapSkipEnabled] = useState(true)
   const [editing, setEditing] = useState(false)
   const [showCheatSheet, setShowCheatSheet] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  // Bumped by Re-analyze to re-trigger the timeline fetch/poll; `reanalyzing`
-  // guards the button (ADR 0002, the tuning loop).
-  const [reanalyzeNonce, setReanalyzeNonce] = useState(0)
-  const [reanalyzing, setReanalyzing] = useState(false)
   // Timeline zoom and playhead-follow are owned here rather than by the strip,
   // so the status bar (which lives outside the strip) can drive them; the
   // strip's own wheel/scroll handlers mutate them through the setters.
   const [pxPerSec, setPxPerSec] = useState(SESSION_PX_PER_SEC_DEFAULT)
   const [following, setFollowing] = useState(true)
-
-  // Which recording in the playlist is loaded, and where to resume once its
-  // timeline arrives after a boundary crossing.
-  const [index, setIndex] = useState(() =>
-    Math.min(Math.max(startIndex, 0), Math.max(recordings.length - 1, 0))
-  )
-  const [pendingSeek, setPendingSeek] = useState<Resume | null>(null)
-  const path = recordings[index]?.path ?? null
-  const timeline = path ? (timelines[path] ?? null) : null
-
-  const atFirstRecording = index <= 0
-  const atLastRecording = index >= recordings.length - 1
 
   // Take focus on mount so the keymap acts immediately, without a click first.
   useEffect(() => {
@@ -246,49 +130,9 @@ export function RecordingPlayer({
   // the surface is slaved to.
   const paneRef = useMpvSurface(showCheatSheet)
 
-  // Fetch every recording's draft timeline so the whole session can be stitched
-  // into one strip, polling the recordings still being segmented so their
-  // rallies appear as soon as the worker finishes (ADR 0002). Re-runs on
-  // Re-analyze so the re-segmented recording is re-polled to ready.
-  useEffect(() => {
-    let cancelled = false
-    const timers: ReturnType<typeof setTimeout>[] = []
-    const loadOne = (recordingPath: string) => {
-      trackedInvoke<Timeline>("recording_timeline", { path: recordingPath })
-        .then((result) => {
-          if (cancelled) return
-          setTimelines((prev) => ({ ...prev, [recordingPath]: result }))
-          if (result.segment_state === "unknown") {
-            timers.push(
-              setTimeout(() => loadOne(recordingPath), SEGMENT_POLL_MS)
-            )
-          }
-        })
-        .catch(() => {
-          // A timeline failure is non-fatal — playback still works without it.
-        })
-    }
-    recordings.forEach((rec) => loadOne(rec.path))
-    return () => {
-      cancelled = true
-      timers.forEach(clearTimeout)
-    }
-  }, [recordings, reanalyzeNonce])
-
-  // Re-fetch a single recording's saved timeline after an inline correction
-  // (issue #7) without disturbing the rest of the session.
-  const refreshTimeline = useCallback((recordingPath: string) => {
-    trackedInvoke<Timeline>("recording_timeline", { path: recordingPath })
-      .then((result) =>
-        setTimelines((prev) => ({ ...prev, [recordingPath]: result }))
-      )
-      .catch(() => {})
-  }, [])
-
-  // Rallies for the current recording, ascending by start (sorted in segment.rs).
-  // The empty list when there's no timeline means the recording plays straight
-  // through until its draft arrives.
-  const rallies = useMemo(() => timeline?.rallies ?? [], [timeline])
+  // Draft timelines for the whole session, polled until segmented (ADR 0002).
+  const { timelines, refreshTimeline, reanalyzing, reanalyze } =
+    useSessionTimelines(recordings)
 
   // The whole session stitched onto one continuous axis.
   const session = useMemo<SessionModel>(
@@ -303,317 +147,45 @@ export function RecordingPlayer({
     [session]
   )
 
-  // Session-global playhead: the current recording's offset plus the local time.
-  // Null until the current recording is placed (its predecessors are segmented).
-  const globalPlayheadMs =
-    index < session.placedCount ? segmentOffset(index) + currentMs : null
+  // The playback machinery: which recording is loaded, the playhead, gap-free
+  // playback, boundary crossings, and session-global seeking/navigation.
+  const {
+    index,
+    path,
+    currentMs,
+    globalPlayheadMs,
+    error,
+    looping,
+    gapSkipEnabled,
+    atFirstRecording,
+    atLastRecording,
+    toggleLoop,
+    toggleGapSkip,
+    seekSession,
+    goToRally,
+    goToUncertain,
+    seekRelative,
+  } = useSessionPlayback({
+    recordings,
+    startIndex,
+    timelines,
+    session,
+    segmentOffset,
+  })
 
-  // Seek the current recording to a local position via mpv's native absolute
-  // seek (ADR 0008). `currentMs` is set optimistically so rally-to-rally math
-  // (e.g. Prev twice) chains off the target immediately rather than waiting on
-  // the next `time-pos` tick.
-  const seekTo = useCallback((ms: number) => {
-    const target = Math.max(0, Math.round(ms))
-    setCurrentMs(target)
-    void trackedInvoke("mpv_seek", { ms: target }).catch(() => {})
-  }, [])
-
-  // Move the playlist to another recording, remembering where to resume once it
-  // loads (and reset the optimistic playhead so the resume math is clean).
-  const goToRecording = useCallback((next: number, resume: Resume) => {
-    // Gate the playhead immediately: stale ticks from the recording we're leaving
-    // must be dropped until the new file confirms loaded, or gap-skip acts on the
-    // old position and crosses on past where we meant to land. Set here (not in
-    // the load effect, which is deferred) so no tick slips through in between.
-    awaitingLoadRef.current = true
-    setCurrentMs(0)
-    setIndex(next)
-    setPendingSeek(resume)
-  }, [])
-
-  // Load the current recording directly from disk and start playing it (ADR
-  // 0008). A boundary crossing re-runs this on the new `path`, carrying the
-  // resume position *into the load*: mpv applies `startMs` on `FILE_LOADED`,
-  // atomic with opening the file, so a click that lands in another recording
-  // resumes where it landed instead of racing a separate seek against the
-  // still-loading file (which mpv drops, leaving playback at 0). `pendingSeek`
-  // and `rallies` are read from the crossing commit, not subscribed — re-running
-  // this on either would reload the file mid-playback — hence the deps lint-off.
-  useEffect(() => {
-    if (!path) return
-    const startMs =
-      pendingSeek != null ? resumeStartMs(pendingSeek, rallies) : null
-    // Re-assert both gates (the mount load reaches here without a crossing, and
-    // re-running this effect means a fresh file is opening either way): drop every
-    // tick until `mpv:file-loaded`, then drop the new file's pre-seek ticks until
-    // the playhead reaches `startMs`. A null target means no specific resume (a
-    // deferred `start`/`end` whose rallies haven't arrived) — play from the top.
-    awaitingLoadRef.current = true
-    resumeTargetRef.current = startMs
-    void trackedInvoke("mpv_load", { path, startMs })
-      .then(() => {
-        // `mpv_load` unpauses; `paused` reconciles from the `mpv:pause` event.
-        setError(null)
-      })
-      .catch((e) => setError(String(e)))
-    if (startMs != null) {
-      // Resolved here → the deferred resume effect below has nothing left to do.
-      /* eslint-disable-next-line react-hooks/set-state-in-effect -- carrying the resume into the load is the point of the effect */
-      setCurrentMs(startMs)
-      setPendingSeek(null)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- resume/rallies are the crossing-commit values, deliberately not deps (they'd reload the file)
-  }, [path])
-
-  // Re-apply the user's speed/volume/mute after a load. mpv resets these to its
-  // defaults when a new file opens and *reports those defaults* through the
-  // property events (issue #42) — reporting alone can't carry the user's
-  // session-wide preference across a recording boundary, so this re-push stays
-  // load-bearing. Its job is preference persistence, not UI sync (the events do
-  // that); the events then confirm the re-applied values. Reads the current
-  // transport state at the crossing commit, hence the path-only deps.
-  useEffect(() => {
-    if (!path) return
-    void trackedInvoke("mpv_set_speed", {
-      speed: SPEED_LADDER[speedIndex],
-    }).catch(() => {})
-    void trackedInvoke("mpv_set_volume", { volume }).catch(() => {})
-    void trackedInvoke("mpv_set_mute", { muted }).catch(() => {})
-    // Re-applied per recording (the `path` dep); changes within a recording are
-    // commanded by the transport actions themselves.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path])
-
-  // The deferred half of a boundary crossing: a `start`/`end` resume whose
-  // recording wasn't segmented yet at load time (so `resumeStartMs` returned
-  // null and the load couldn't carry it). Once its draft arrives the file is
-  // already loaded, so a plain seek lands cleanly — no race. A specific `{ atMs }`
-  // and an already-segmented `start`/`end` are resolved by the load effect above,
-  // which clears `pendingSeek`, so they never reach here.
-  useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect -- resuming a crossed-into recording seeks (which sets state), the whole point of the effect */
-    if (pendingSeek == null || typeof pendingSeek === "object") return
-    if (rallies.length === 0) {
-      // Wait for this recording's draft; until then it plays from the top.
-      return
-    }
-    const target =
-      pendingSeek === "start" ? rallies[0] : rallies[rallies.length - 1]
-    seekTo(target.start_ms)
-    setPendingSeek(null)
-    /* eslint-enable react-hooks/set-state-in-effect */
-  }, [pendingSeek, rallies, seekTo])
-
-  // Gap-free playback (the North Star): as the playhead crosses out of a rally
-  // into a gap, jump straight to the next rally's start so only play is watched
-  // (ADR 0001). Past the final rally of this recording, advance into the next
-  // recording; only the session's very last rally ends playback. The decision is
-  // a pure helper (issue #36) so it stays testable without mpv.
-  const skipGaps = useCallback(
-    (ms: number) => {
-      // Gap-skipping off → play straight through the gaps (mpv's `ended` event
-      // still crosses recordings at EOF). Looping a rally is independent of the
-      // toggle, so it's left to run.
-      if (!gapSkipEnabled && !looping) return
-      const action = gapSkipAction(
-        rallies,
-        ms,
-        looping,
-        freePlayRef.current,
-        atLastRecording
-      )
-      switch (action.kind) {
-        case "seek":
-          seekTo(action.ms)
-          break
-        case "next-recording":
-          freePlayRef.current = false
-          goToRecording(index + 1, "start")
-          break
-        case "stop":
-          // `paused` reconciles from the `mpv:pause` event (issue #42).
-          void trackedInvoke("mpv_set_pause", { paused: true }).catch(() => {})
-          break
-        case "none":
-          break
-      }
-    },
-    [
-      rallies,
-      looping,
-      gapSkipEnabled,
-      atLastRecording,
-      seekTo,
-      goToRecording,
-      index,
-    ]
-  )
-
-  // When the current recording ends naturally (its trailing gap was short enough
-  // that no later rally triggered a skip), cross into the next so the playlist
-  // keeps flowing; the session's last recording just stops.
-  const handleEnded = useCallback(() => {
-    freePlayRef.current = false
-    if (!atLastRecording) goToRecording(index + 1, "start")
-  }, [atLastRecording, goToRecording, index])
-
-  // The mpv-event handlers, mirrored into a ref so the listeners below subscribe
-  // once yet always run the latest closures (which capture the current rallies,
-  // loop/free-play state, and crossing index) — without re-subscribing the
-  // `time-pos` stream on every playhead tick. Synced in an effect, not during
-  // render (the codebase forbids writing a ref while rendering).
-  const handlersRef = useRef({ skipGaps, handleEnded })
-  useEffect(() => {
-    handlersRef.current = { skipGaps, handleEnded }
-  }, [skipGaps, handleEnded])
-
-  // The playhead, end, error, and transport UI states all come from mpv's event
-  // stream (ADR 0008, issue #35). Each `time-pos` tick drives the playhead and
-  // runs gap-skip (issue #36), where the old webview `timeUpdate` handler used
-  // to; the pause/speed/volume/mute events reconcile the transport controls from
-  // the player's real state, so a silently-failed `mpv_set_*` can't leave the UI
-  // out of sync (issue #42) — the controls are never set optimistically.
-  useEffect(() => {
-    const unlisten: Array<() => void> = []
-    void listen<number>("mpv:time-pos", (event) => {
-      // Identity gate: drop every tick until the new file confirms loaded. A tick
-      // carries no file identity, so before `mpv:file-loaded` it's a stale (often
-      // far-past) position from the recording we're leaving — acting on it runs
-      // gap-skip against the wrong position and crosses on past the resume target.
-      if (awaitingLoadRef.current) return
-      const ms = event.payload
-      // Position gate: the file is open but mpv applies the resume seek a moment
-      // later, so its first ticks are still near 0. Drop them until the playhead
-      // reaches the target, then resume normally — otherwise gap-skip reads the
-      // transient ~0 as "before the first rally" and yanks the playhead there.
-      const target = resumeTargetRef.current
-      if (target != null) {
-        if (!resumeTickLanded(ms, target, RESUME_TICK_TOL_MS)) return
-        resumeTargetRef.current = null
-      }
-      setCurrentMs(ms)
-      handlersRef.current.skipGaps(ms)
-    }).then((u) => unlisten.push(u))
-    // The new file is open and its baked-in resume seek has landed: the next
-    // `time-pos` reflects the resumed position, so reopen the playhead gate.
-    void listen("mpv:file-loaded", () => {
-      awaitingLoadRef.current = false
-    }).then((u) => unlisten.push(u))
-    void listen("mpv:ended", () => handlersRef.current.handleEnded()).then(
-      (u) => unlisten.push(u)
-    )
-    void listen<string>("mpv:error", (event) => {
-      // A load that errors never fires `mpv:file-loaded`; reopen both gates so a
-      // failed crossing can't leave the playhead frozen.
-      awaitingLoadRef.current = false
-      resumeTargetRef.current = null
-      setError(event.payload ?? "playback failed")
-    }).then((u) => unlisten.push(u))
-    // Transport reconciliation (issue #42): mpv reports its own pause/speed/
-    // volume/mute, so the controls reflect the player rather than a hopeful
-    // optimistic write. mpv reports speed/volume as raw numbers; the UI tracks a
-    // speed *ladder index* and a rounded volume.
-    void listen<boolean>("mpv:pause", (event) =>
-      setPaused(event.payload)
-    ).then((u) => unlisten.push(u))
-    void listen<number>("mpv:speed", (event) =>
-      setSpeedIndex(speedIndexForValue(event.payload))
-    ).then((u) => unlisten.push(u))
-    void listen<number>("mpv:volume", (event) =>
-      setVolume(Math.round(event.payload))
-    ).then((u) => unlisten.push(u))
-    void listen<boolean>("mpv:mute", (event) =>
-      setMuted(event.payload)
-    ).then((u) => unlisten.push(u))
-    return () => {
-      for (const u of unlisten) u()
-    }
-  }, [])
-
-  // Seek the session to a global position: find the recording that owns it and
-  // either seek within the current recording or cross into it. A seek landing in
-  // a gap means "let me watch from here" → free play; one landing inside a rally
-  // keeps gap-free.
-  const seekSession = useCallback(
-    (globalMs: number) => {
-      const target = clamp(globalMs, 0, session.totalMs)
-      const seg =
-        session.segments.find(
-          (s) =>
-            s.durationMs != null &&
-            target >= s.offsetMs &&
-            target < s.offsetMs + s.durationMs
-        ) ?? session.segments[session.placedCount - 1]
-      if (!seg) return
-      const localMs = clamp(target - seg.offsetMs, 0, seg.durationMs ?? target)
-      freePlayRef.current = !session.rallies.some(
-        (r) => target >= r.globalStart && target < r.globalEnd
-      )
-      if (seg.index === index) {
-        seekTo(localMs)
-      } else {
-        goToRecording(seg.index, { atMs: localMs })
-      }
-    },
-    [session, index, seekTo, goToRecording]
-  )
-
-  // Manual rally-to-rally navigation, across recording boundaries. A jump is an
-  // explicit gap-free intent — it leaves free play (issue #36).
-  const goToRally = useCallback(
-    (direction: "next" | "prev") => {
-      freePlayRef.current = false
-      const ms = currentMs
-      if (direction === "next") {
-        const target = nextRallyMs(rallies, ms)
-        if (target != null) {
-          seekTo(target)
-        } else if (!atLastRecording) {
-          goToRecording(index + 1, "start")
-        }
-      } else {
-        const action = prevRallyAction(rallies, ms, atFirstRecording)
-        if (action.kind === "seek") {
-          seekTo(action.ms)
-        } else if (action.kind === "prev-recording") {
-          goToRecording(index - 1, "end")
-        }
-      }
-    },
-    [
-      currentMs,
-      rallies,
-      seekTo,
-      atFirstRecording,
-      atLastRecording,
-      goToRecording,
-      index,
-    ]
-  )
-
-  // Jump to the next uncertain region across the whole session (ADR 0002).
-  const goToUncertain = useCallback(() => {
-    const target = nextUncertainMs(session.rallies, globalPlayheadMs ?? 0)
-    if (target != null) seekSession(target)
-  }, [session, globalPlayheadMs, seekSession])
-
-  // --- Transport: the custom bar and keymap drive these via mpv (issue #35). ---
-
-  // The transport actions only *command* mpv; the resulting state lands via the
-  // `mpv:pause`/`speed`/`volume`/`mute` events above (issue #42), so a command
-  // that silently fails leaves no optimistic value the player never reached.
-
-  const togglePlay = useCallback(() => {
-    void trackedInvoke("mpv_set_pause", { paused: !paused }).catch(() => {})
-  }, [paused])
-
-  const toggleMute = useCallback(() => {
-    void trackedInvoke("mpv_set_mute", { muted: !muted }).catch(() => {})
-  }, [muted])
-
-  const toggleLoop = useCallback(() => setLooping((l) => !l), [])
-
-  const toggleGapSkip = useCallback(() => setGapSkipEnabled((g) => !g), [])
+  // mpv's transport state (reconciled from its events) and commands.
+  const {
+    paused,
+    muted,
+    volume,
+    speedIndex,
+    togglePlay,
+    toggleMute,
+    changeVolume,
+    stepSpeed,
+    resetSpeed,
+    frameStep,
+  } = useMpvTransport(path)
 
   // Recenter the timeline strip on the playhead and re-arm follow (the strip
   // stops tracking the playhead once you scroll it away).
@@ -628,306 +200,64 @@ export function RecordingPlayer({
     )
   }, [])
 
-  const changeVolume = useCallback(
-    (delta: number) => {
-      void trackedInvoke("mpv_set_volume", {
-        volume: clampVolume(volume + delta),
-      }).catch(() => {})
-    },
-    [volume]
-  )
-
-  const stepSpeed = useCallback(
-    (dir: 1 | -1) => {
-      void trackedInvoke("mpv_set_speed", {
-        speed: SPEED_LADDER[stepSpeedIndex(speedIndex, dir)],
-      }).catch(() => {})
-    },
-    [speedIndex]
-  )
-
-  const resetSpeed = useCallback(() => {
-    void trackedInvoke("mpv_set_speed", { speed: 1 }).catch(() => {})
-  }, [])
-
-  const frameStep = useCallback((forward: boolean) => {
-    void trackedInvoke("mpv_frame_step", { forward }).catch(() => {})
-  }, [])
-
-  // Seek the session by a signed offset (session-global, so it crosses recording
-  // boundaries). A relative seek is a manual move, so `seekSession` opts it out
-  // of gap-free playback like a scrubber drag. Inert until placed on the axis.
-  const seekRelative = useCallback(
-    (deltaMs: number) => {
-      if (globalPlayheadMs == null) return
-      seekSession(seekTarget(globalPlayheadMs, deltaMs))
-    },
-    [globalPlayheadMs, seekSession]
-  )
-
   // Re-run segmentation for the current recording, then re-fetch timelines.
   const handleReanalyze = useCallback(() => {
     if (!path) return
-    setReanalyzing(true)
-    trackedInvoke("reanalyze_recording", { path })
-      .then(() => setReanalyzeNonce((n) => n + 1))
-      .catch(() => {})
-      .finally(() => setReanalyzing(false))
-  }, [path])
+    reanalyze(path)
+  }, [path, reanalyze])
 
-  // The five inline corrections (issue #7). The boundary math and integrity
-  // guards that decide what reaches SQLite live behind the transport seam (so
-  // they're unit-tested without mpv); here each callback resolves a plan and
-  // hands it to `runEdit`, which persists its ops in order then re-reads the
-  // affected recording's timeline so playback and the strip reflect it at once.
+  // The five inline corrections (issue #7): boundary math behind the transport
+  // seam, persistence + timeline refresh behind this hook.
+  const { adjustRally, addAtPlayhead, deleteRally, splitRally, mergeRallies } =
+    useTimelineEdits({
+      session,
+      path,
+      index,
+      currentMs,
+      segmentOffset,
+      refreshTimeline,
+    })
 
-  // Recording-local duration of a recording, or +Infinity until it's segmented
-  // (the edit math leaves an unknown-duration recording uncapped).
-  const recordingDuration = useCallback(
-    (recordingIndex: number) =>
-      session.segments.find((s) => s.index === recordingIndex)?.durationMs ??
-      Number.POSITIVE_INFINITY,
-    [session]
-  )
+  const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
-  const runEdit = useCallback(
-    (plan: EditPlan) => {
-      if (plan.kind !== "ops" || plan.ops.length === 0) return
-      const recordingPath = plan.ops[0].path
-      let chain: Promise<unknown> = Promise.resolve()
-      for (const op of plan.ops) {
-        const { command, ...args } = op
-        chain = chain.then(() => trackedInvoke(command, args))
-      }
-      void chain.then(() => refreshTimeline(recordingPath)).catch(() => {})
-    },
-    [refreshTimeline]
-  )
-
-  const adjustRally = useCallback(
-    (rally: SessionRally, globalStart: number, globalEnd: number) => {
-      runEdit(
-        adjustRallyEdit(
-          rally,
-          globalStart,
-          globalEnd,
-          segmentOffset(rally.recordingIndex),
-          recordingDuration(rally.recordingIndex)
-        )
-      )
-    },
-    [segmentOffset, recordingDuration, runEdit]
-  )
-
-  const addAtPlayhead = useCallback(() => {
-    if (!path) return
-    runEdit(
-      addAtPlayheadEdit(
-        path,
-        currentMs,
-        recordingDuration(index),
-        ADD_RALLY_HALF_MS
-      )
-    )
-  }, [path, index, currentMs, recordingDuration, runEdit])
-
-  const deleteRally = useCallback(
-    (rally: SessionRally) => {
-      runEdit({
-        kind: "ops",
-        ops: [{ command: "delete_rally", path: rally.path, rallyId: rally.id }],
-      })
-    },
-    [runEdit]
-  )
-
-  const splitRally = useCallback(
-    (rally: SessionRally, atGlobalMs: number) => {
-      runEdit(
-        splitRallyEdit(rally, atGlobalMs, segmentOffset(rally.recordingIndex))
-      )
-    },
-    [segmentOffset, runEdit]
-  )
-
-  const mergeRallies = useCallback(
-    (first: SessionRally, second: SessionRally) => {
-      runEdit(mergeRallyEdit(first, second))
-    },
-    [runEdit]
-  )
-
-  // The single keymap definition: the one source of truth behind both the global
-  // key handler and the `?` cheat-sheet, so the two can never drift.
-  const keymap = useMemo<Keybinding[]>(() => {
-    const plain = (e: KeyboardEvent) =>
-      !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey
-    return [
-      {
-        keys: ["Space", "K"],
-        label: "Play / pause",
-        match: (e) =>
-          plain(e) && (e.code === "Space" || e.key.toLowerCase() === "k"),
-        run: togglePlay,
-      },
-      {
-        keys: ["Ctrl+←", "Ctrl+→"],
-        label: "Seek ∓ 2.5s",
-        match: (e) =>
-          (e.ctrlKey || e.metaKey) &&
-          !e.shiftKey &&
-          !e.altKey &&
-          (e.key === "ArrowLeft" || e.key === "ArrowRight"),
-        run: (e) =>
-          seekRelative(e.key === "ArrowLeft" ? -SEEK_FINE_MS : SEEK_FINE_MS),
-      },
-      {
-        keys: ["←", "→"],
-        label: "Seek ∓ 5s",
-        match: (e) =>
-          plain(e) && (e.key === "ArrowLeft" || e.key === "ArrowRight"),
-        run: (e) =>
-          seekRelative(
-            e.key === "ArrowLeft" ? -SEEK_DEFAULT_MS : SEEK_DEFAULT_MS
-          ),
-      },
-      {
-        keys: ["Shift+←", "Shift+→"],
-        label: "Seek ∓ 10s",
-        match: (e) =>
-          e.shiftKey &&
-          !e.ctrlKey &&
-          !e.metaKey &&
-          !e.altKey &&
-          (e.key === "ArrowLeft" || e.key === "ArrowRight"),
-        run: (e) =>
-          seekRelative(
-            e.key === "ArrowLeft" ? -SEEK_COARSE_MS : SEEK_COARSE_MS
-          ),
-      },
-      {
-        keys: ["↑", "↓"],
-        label: "Volume up / down",
-        match: (e) =>
-          plain(e) && (e.key === "ArrowUp" || e.key === "ArrowDown"),
-        run: (e) =>
-          changeVolume(e.key === "ArrowUp" ? VOLUME_STEP : -VOLUME_STEP),
-      },
-      {
-        keys: [",", "."],
-        label: "Frame step back / forward",
-        match: (e) => plain(e) && (e.key === "," || e.key === "."),
-        run: (e) => frameStep(e.key === "."),
-      },
-      {
-        keys: ["[", "]"],
-        label: "Prev / Next rally",
-        match: (e) => plain(e) && (e.key === "[" || e.key === "]"),
-        run: (e) => goToRally(e.key === "[" ? "prev" : "next"),
-      },
-      {
-        keys: ["U"],
-        label: "Next uncertain region",
-        match: (e) => plain(e) && e.key.toLowerCase() === "u",
-        run: goToUncertain,
-      },
-      {
-        keys: ["L"],
-        label: "Loop current rally",
-        match: (e) => plain(e) && e.key.toLowerCase() === "l",
-        run: toggleLoop,
-      },
-      {
-        keys: ["G"],
-        label: "Toggle skipping gaps",
-        match: (e) => plain(e) && e.key.toLowerCase() === "g",
-        run: toggleGapSkip,
-      },
-      {
-        keys: ["F"],
-        label: "Jump to playhead",
-        match: (e) => plain(e) && e.key.toLowerCase() === "f",
-        run: jumpToPlayhead,
-      },
-      {
-        keys: ["M"],
-        label: "Mute",
-        match: (e) => plain(e) && e.key.toLowerCase() === "m",
-        run: toggleMute,
-      },
-      {
-        keys: ["Ctrl+-", "Ctrl+="],
-        label: "Playback speed down / up",
-        match: (e) =>
-          (e.ctrlKey || e.metaKey) &&
-          !e.altKey &&
-          (e.key === "-" || e.key === "=" || e.key === "+" || e.key === "_"),
-        run: (e) => stepSpeed(e.key === "-" || e.key === "_" ? -1 : 1),
-      },
-      {
-        keys: ["Ctrl+0"],
-        label: "Reset speed to 1×",
-        match: (e) => (e.ctrlKey || e.metaKey) && !e.altKey && e.key === "0",
-        run: resetSpeed,
-      },
-      {
-        keys: ["?"],
-        label: "Toggle this cheat-sheet",
-        match: (e) => e.key === "?",
-        run: () => setShowCheatSheet((s) => !s),
-      },
-      {
-        keys: ["Scroll over timeline"],
-        label: "Scroll the timeline",
-        match: () => false,
-        run: () => {},
-      },
-      {
-        keys: ["Alt + scroll over timeline"],
-        label: "Zoom timeline at the cursor",
-        match: () => false,
-        run: () => {},
-      },
+  // The keymap array is rebuilt only when an action's closure changes; the
+  // window key handler lives in `useGlobalKeymap`.
+  const keymap = useMemo<Keybinding[]>(
+    () =>
+      // eslint-disable-next-line react-hooks/refs -- buildKeymap only stores these callbacks in the keymap array; none of them run during render
+      buildKeymap({
+        togglePlay,
+        seekRelative,
+        changeVolume,
+        frameStep,
+        goToRally,
+        goToUncertain,
+        toggleLoop,
+        toggleGapSkip,
+        jumpToPlayhead,
+        toggleMute,
+        stepSpeed,
+        resetSpeed,
+        toggleCheatSheet,
+      }),
+    [
+      togglePlay,
+      seekRelative,
+      changeVolume,
+      frameStep,
+      goToRally,
+      goToUncertain,
+      toggleLoop,
+      toggleGapSkip,
+      jumpToPlayhead,
+      toggleMute,
+      stepSpeed,
+      resetSpeed,
+      toggleCheatSheet,
     ]
-  }, [
-    togglePlay,
-    seekRelative,
-    changeVolume,
-    frameStep,
-    goToRally,
-    goToUncertain,
-    toggleLoop,
-    toggleGapSkip,
-    jumpToPlayhead,
-    toggleMute,
-    stepSpeed,
-    resetSpeed,
-  ])
+  )
 
-  // The one global key handler, at window capture so it can `preventDefault`
-  // page-zoom. Ignores keystrokes while typing in an input/textarea.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null
-      if (
-        target &&
-        (target.isContentEditable ||
-          target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.tagName === "SELECT")
-      ) {
-        return
-      }
-      const binding = keymap.find((b) => b.match(e))
-      if (!binding) return
-      e.preventDefault()
-      e.stopPropagation()
-      binding.run(e)
-    }
-    window.addEventListener("keydown", onKeyDown, { capture: true })
-    return () =>
-      window.removeEventListener("keydown", onKeyDown, { capture: true })
-  }, [keymap])
+  useGlobalKeymap(keymap)
 
   // The rally under the playhead (session-global), driving the rail highlight
   // and the inspector; -1 while the playhead sits in a gap or before placement.
