@@ -596,10 +596,20 @@ function EntryHighlight() {
 
 export function DebugPanel() {
   const [open, setOpen] = React.useState(false)
-  const [panelSide, setPanelSide] = React.useState<DebugPanelSide>("right")
-  const [activeTab, setActiveTab] = React.useState<DebugPanelTab>("overview")
-  const [attached, setAttached] = React.useState(false)
-  const [tauriReady, setTauriReady] = React.useState(false)
+  // Persisted panel prefs hydrate via lazy initializers rather than a mount
+  // effect, so the first render already has them (and no setState-in-effect).
+  const [panelSide, setPanelSide] = React.useState<DebugPanelSide>(() => {
+    const saved = window.sessionStorage.getItem(DEBUG_PANEL_SIDE_KEY)
+    return saved && isDebugPanelSide(saved) ? saved : "right"
+  })
+  const [activeTab, setActiveTab] = React.useState<DebugPanelTab>(() => {
+    const saved = window.sessionStorage.getItem(DEBUG_PANEL_TAB_KEY)
+    return saved && isDebugPanelTab(saved) ? saved : "overview"
+  })
+  const [attached, setAttached] = React.useState(
+    () => window.sessionStorage.getItem(DEBUG_PANEL_ATTACH_KEY) === "true"
+  )
+  const [tauriReady] = React.useState(() => isTauri())
   const [appInfo, setAppInfo] = React.useState<AppDiagnostics>({
     name: null,
     version: null,
@@ -698,37 +708,15 @@ export function DebugPanel() {
     hash: "",
   })
   const highlightTimeoutsRef = React.useRef<number[]>([])
-
-  React.useEffect(() => {
-    setTauriReady(isTauri())
-  }, [])
+  const copiedTimeoutRef = React.useRef<number | undefined>(undefined)
 
   React.useEffect(() => {
     return () => {
       for (const timeoutId of highlightTimeoutsRef.current) {
         window.clearTimeout(timeoutId)
       }
+      window.clearTimeout(copiedTimeoutRef.current)
     }
-  }, [])
-
-  React.useEffect(() => {
-    if (typeof window === "undefined") {
-      return
-    }
-
-    const savedSide = window.sessionStorage.getItem(DEBUG_PANEL_SIDE_KEY)
-
-    if (savedSide && isDebugPanelSide(savedSide)) {
-      setPanelSide(savedSide)
-    }
-
-    const savedTab = window.sessionStorage.getItem(DEBUG_PANEL_TAB_KEY)
-
-    if (savedTab && isDebugPanelTab(savedTab)) {
-      setActiveTab(savedTab)
-    }
-
-    setAttached(window.sessionStorage.getItem(DEBUG_PANEL_ATTACH_KEY) === "true")
   }, [])
 
   React.useEffect(() => {
@@ -839,7 +827,7 @@ export function DebugPanel() {
     function refreshSystemDefaults() {
       const resolved = new Intl.DateTimeFormat().resolvedOptions()
       const localeChain = getLocaleChain()
-      let region: string | null = null
+      let region: string | null
 
       try {
         region = new Intl.Locale(resolved.locale).region ?? null
@@ -1018,12 +1006,12 @@ export function DebugPanel() {
 
     updateLocationState()
 
-    const intervalId = window.setInterval(updateLocationState, 250)
+    // No router in this app, so nothing calls pushState — hashchange/popstate
+    // cover every location change without a polling interval.
     window.addEventListener("hashchange", updateLocationState)
     window.addEventListener("popstate", updateLocationState)
 
     return () => {
-      window.clearInterval(intervalId)
       window.removeEventListener("hashchange", updateLocationState)
       window.removeEventListener("popstate", updateLocationState)
     }
@@ -1150,7 +1138,7 @@ export function DebugPanel() {
       unlistenResize?.()
       unlistenMove?.()
     }
-  }, [locationState.pathname, tauriReady])
+  }, [tauriReady])
 
   React.useEffect(() => {
     function queueHighlight(
@@ -1287,14 +1275,22 @@ export function DebugPanel() {
     }
 
     let detachConsole: (() => void) | undefined
+    let cancelled = false
 
     if (tauriReady) {
       void attachConsole().then((detach) => {
-        detachConsole = detach
+        // The effect may have cleaned up while attachConsole was in flight;
+        // detach immediately instead of leaking the attachment.
+        if (cancelled) {
+          detach()
+        } else {
+          detachConsole = detach
+        }
       })
     }
 
     return () => {
+      cancelled = true
       detachConsole?.()
       window.console.log = originalConsole.log
       window.console.info = originalConsole.info
@@ -1389,7 +1385,8 @@ export function DebugPanel() {
 
     await navigator.clipboard.writeText(JSON.stringify(snapshot, null, 2))
     setCopied(true)
-    window.setTimeout(() => {
+    window.clearTimeout(copiedTimeoutRef.current)
+    copiedTimeoutRef.current = window.setTimeout(() => {
       setCopied(false)
     }, 1200)
   }
@@ -1411,7 +1408,8 @@ export function DebugPanel() {
       ? DEBUG_PANEL_THEME_STYLE_LIGHT
       : DEBUG_PANEL_THEME_STYLE_DARK
 
-  const panelContent = (
+  // Only build the (large) panel tree while the panel is actually open.
+  const panelContent = open ? (
     <>
       <div className="border-b px-3 py-2">
         <div className="flex items-center justify-between gap-3">
@@ -2000,7 +1998,7 @@ export function DebugPanel() {
 
       </Tabs>
     </>
-  )
+  ) : null
 
   const panelFrameClassName = cn(
     "ui-selectable fixed z-50 flex overflow-hidden border border-border/25 bg-background text-[12px] text-foreground",

@@ -71,8 +71,17 @@ struct MediaWorker(Arc<AtomicBool>);
 /// Register the video files under `folder` as recordings, grouped into
 /// sessions by capture day. Idempotent across re-scans. Kicks off background
 /// media work (probe then segment) for any newly registered recordings.
+///
+/// This and every other DB command below is `async` so Tauri runs it on the
+/// async runtime's thread pool rather than inline on the GTK main thread —
+/// a library scan (tree walk + per-file content hashing under the DB lock)
+/// would otherwise freeze the webview and queue every other command behind it.
 #[tauri::command]
-fn scan_folder(app: AppHandle, db: State<'_, Db>, folder: String) -> Result<db::ScanResult, String> {
+async fn scan_folder(
+    app: AppHandle,
+    db: State<'_, Db>,
+    folder: String,
+) -> Result<db::ScanResult, String> {
     let result = {
         let mut conn = db.0.lock().map_err(|e| e.to_string())?;
         db::scan_folder(&mut conn, std::path::Path::new(&folder)).map_err(|e| e.to_string())?
@@ -83,7 +92,7 @@ fn scan_folder(app: AppHandle, db: State<'_, Db>, folder: String) -> Result<db::
 
 /// All sessions with their recordings nested under them.
 #[tauri::command]
-fn list_sessions(db: State<'_, Db>) -> Result<Vec<db::Session>, String> {
+async fn list_sessions(db: State<'_, Db>) -> Result<Vec<db::Session>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     db::list_sessions(&conn).map_err(|e| e.to_string())
 }
@@ -93,7 +102,7 @@ fn list_sessions(db: State<'_, Db>) -> Result<Vec<db::Session>, String> {
 /// `segment_state` is `unknown` and `rallies` is empty; the player polls until
 /// it turns `ready`. An unregistered path reports `unknown` with no rallies.
 #[tauri::command]
-fn recording_timeline(db: State<'_, Db>, path: String) -> Result<db::Timeline, String> {
+async fn recording_timeline(db: State<'_, Db>, path: String) -> Result<db::Timeline, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let timeline = db::recording_timeline(&conn, &path).map_err(|e| e.to_string())?;
     Ok(timeline.unwrap_or_else(|| db::Timeline {
@@ -108,7 +117,11 @@ fn recording_timeline(db: State<'_, Db>, path: String) -> Result<db::Timeline, S
 /// return it to the queue, and wake the media worker (ADR 0002). Backs the
 /// Re-analyze action for the human tuning step — re-segment without re-transcoding.
 #[tauri::command]
-fn reanalyze_recording(app: AppHandle, db: State<'_, Db>, path: String) -> Result<(), String> {
+async fn reanalyze_recording(
+    app: AppHandle,
+    db: State<'_, Db>,
+    path: String,
+) -> Result<(), String> {
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         db::reset_segmentation(&conn, &path).map_err(|e| e.to_string())?;
@@ -121,7 +134,7 @@ fn reanalyze_recording(app: AppHandle, db: State<'_, Db>, path: String) -> Resul
 /// to them since (see [`db::scanned_folders`]). Idempotent like a fresh scan, and
 /// kicks off background media work for anything new. Backs the Refresh action.
 #[tauri::command]
-fn rescan_folders(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanResult, String> {
+async fn rescan_folders(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanResult, String> {
     let result = {
         let mut conn = db.0.lock().map_err(|e| e.to_string())?;
         let folders = db::scanned_folders(&conn).map_err(|e| e.to_string())?;
@@ -145,7 +158,7 @@ fn rescan_folders(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanResult, S
 /// [`reanalyze_recording`], for re-segmenting the whole library after a segmenter
 /// change. Discards manual corrections, as a re-analyze does.
 #[tauri::command]
-fn reanalyze_all(app: AppHandle, db: State<'_, Db>) -> Result<(), String> {
+async fn reanalyze_all(app: AppHandle, db: State<'_, Db>) -> Result<(), String> {
     {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         db::reset_all_segmentation(&conn).map_err(|e| e.to_string())?;
@@ -160,7 +173,7 @@ fn reanalyze_all(app: AppHandle, db: State<'_, Db>) -> Result<(), String> {
 /// immediately so gap-free playback reflects the corrected timeline on its next
 /// read, with no reload. Returns whether a rally was actually updated.
 #[tauri::command]
-fn update_rally(
+async fn update_rally(
     db: State<'_, Db>,
     path: String,
     rally_id: i64,
@@ -175,7 +188,7 @@ fn update_rally(
 /// correction, and the new half of a split). Persists immediately; returns the
 /// new rally's id, or `None` when `path` is not a registered recording.
 #[tauri::command]
-fn add_rally(
+async fn add_rally(
     db: State<'_, Db>,
     path: String,
     start_ms: i64,
@@ -189,7 +202,7 @@ fn add_rally(
 /// whose span then becomes a derived gap; also the discarded half of a merge).
 /// Persists immediately. Returns whether a rally was actually removed.
 #[tauri::command]
-fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<bool, String> {
+async fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<bool, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     db::delete_rally(&conn, &path, rally_id).map_err(|e| e.to_string())
 }
