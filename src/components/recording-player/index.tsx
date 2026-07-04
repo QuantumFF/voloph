@@ -29,7 +29,6 @@ import {
   UNCERTAIN_CONFIDENCE,
   buildSessionModel,
   clamp,
-  clampVolume,
   gapSkipAction,
   nextRallyMs,
   nextUncertainMs,
@@ -37,14 +36,13 @@ import {
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
-  speedIndexForValue,
-  stepSpeedIndex,
   type PlaylistRecording,
   type Resume,
   type SessionModel,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
 import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
+import { useMpvTransport } from "./use-mpv-transport"
 import { useSessionTimelines } from "./use-session-timelines"
 import { useTimelineEdits } from "./use-timeline-edits"
 import { CheatSheet } from "./cheat-sheet"
@@ -68,9 +66,6 @@ interface RecordingPlayerProps {
   /** Return to the session list. */
   onBack: () => void
 }
-
-/** Index of `1×` on the speed ladder — the default and the `Ctrl+0` reset target. */
-const DEFAULT_SPEED_INDEX = SPEED_LADDER.indexOf(1)
 
 /**
  * Horizontal scale of the session timeline strip in pixels-per-second, so the
@@ -166,10 +161,6 @@ export function RecordingPlayer({
 
   // The playhead within the current recording (ms), from mpv's `time-pos`.
   const [currentMs, setCurrentMs] = useState(0)
-  const [paused, setPaused] = useState(false)
-  const [muted, setMuted] = useState(false)
-  const [volume, setVolume] = useState(100)
-  const [speedIndex, setSpeedIndex] = useState(DEFAULT_SPEED_INDEX)
   const [looping, setLooping] = useState(false)
   // Whether gap-free playback is on (the North Star default). When off, the
   // playhead runs straight through the gaps between rallies — a manual "watch
@@ -196,6 +187,20 @@ export function RecordingPlayer({
   const { timelines, refreshTimeline, reanalyzing, reanalyze } =
     useSessionTimelines(recordings)
   const timeline = path ? (timelines[path] ?? null) : null
+
+  // mpv's transport state (reconciled from its events) and commands.
+  const {
+    paused,
+    muted,
+    volume,
+    speedIndex,
+    togglePlay,
+    toggleMute,
+    changeVolume,
+    stepSpeed,
+    resetSpeed,
+    frameStep,
+  } = useMpvTransport(path)
 
   const atFirstRecording = index <= 0
   const atLastRecording = index >= recordings.length - 1
@@ -289,25 +294,6 @@ export function RecordingPlayer({
       setPendingSeek(null)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- resume/rallies are the crossing-commit values, deliberately not deps (they'd reload the file)
-  }, [path])
-
-  // Re-apply the user's speed/volume/mute after a load. mpv resets these to its
-  // defaults when a new file opens and *reports those defaults* through the
-  // property events (issue #42) — reporting alone can't carry the user's
-  // session-wide preference across a recording boundary, so this re-push stays
-  // load-bearing. Its job is preference persistence, not UI sync (the events do
-  // that); the events then confirm the re-applied values. Reads the current
-  // transport state at the crossing commit, hence the path-only deps.
-  useEffect(() => {
-    if (!path) return
-    void trackedInvoke("mpv_set_speed", {
-      speed: SPEED_LADDER[speedIndex],
-    }).catch(() => {})
-    void trackedInvoke("mpv_set_volume", { volume }).catch(() => {})
-    void trackedInvoke("mpv_set_mute", { muted }).catch(() => {})
-    // Re-applied per recording (the `path` dep); changes within a recording are
-    // commanded by the transport actions themselves.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path])
 
   // The deferred half of a boundary crossing: a `start`/`end` resume whose
@@ -435,22 +421,6 @@ export function RecordingPlayer({
       resumeTargetRef.current = null
       setError(event.payload ?? "playback failed")
     }).then((u) => unlisten.push(u))
-    // Transport reconciliation (issue #42): mpv reports its own pause/speed/
-    // volume/mute, so the controls reflect the player rather than a hopeful
-    // optimistic write. mpv reports speed/volume as raw numbers; the UI tracks a
-    // speed *ladder index* and a rounded volume.
-    void listen<boolean>("mpv:pause", (event) =>
-      setPaused(event.payload)
-    ).then((u) => unlisten.push(u))
-    void listen<number>("mpv:speed", (event) =>
-      setSpeedIndex(speedIndexForValue(event.payload))
-    ).then((u) => unlisten.push(u))
-    void listen<number>("mpv:volume", (event) =>
-      setVolume(Math.round(event.payload))
-    ).then((u) => unlisten.push(u))
-    void listen<boolean>("mpv:mute", (event) =>
-      setMuted(event.payload)
-    ).then((u) => unlisten.push(u))
     return () => {
       for (const u of unlisten) u()
     }
@@ -523,20 +493,6 @@ export function RecordingPlayer({
     if (target != null) seekSession(target)
   }, [session, globalPlayheadMs, seekSession])
 
-  // --- Transport: the custom bar and keymap drive these via mpv (issue #35). ---
-
-  // The transport actions only *command* mpv; the resulting state lands via the
-  // `mpv:pause`/`speed`/`volume`/`mute` events above (issue #42), so a command
-  // that silently fails leaves no optimistic value the player never reached.
-
-  const togglePlay = useCallback(() => {
-    void trackedInvoke("mpv_set_pause", { paused: !paused }).catch(() => {})
-  }, [paused])
-
-  const toggleMute = useCallback(() => {
-    void trackedInvoke("mpv_set_mute", { muted: !muted }).catch(() => {})
-  }, [muted])
-
   const toggleLoop = useCallback(() => setLooping((l) => !l), [])
 
   const toggleGapSkip = useCallback(() => setGapSkipEnabled((g) => !g), [])
@@ -552,32 +508,6 @@ export function RecordingPlayer({
     setPxPerSec((p) =>
       clamp(p * factor, SESSION_PX_PER_SEC_MIN, SESSION_PX_PER_SEC_MAX)
     )
-  }, [])
-
-  const changeVolume = useCallback(
-    (delta: number) => {
-      void trackedInvoke("mpv_set_volume", {
-        volume: clampVolume(volume + delta),
-      }).catch(() => {})
-    },
-    [volume]
-  )
-
-  const stepSpeed = useCallback(
-    (dir: 1 | -1) => {
-      void trackedInvoke("mpv_set_speed", {
-        speed: SPEED_LADDER[stepSpeedIndex(speedIndex, dir)],
-      }).catch(() => {})
-    },
-    [speedIndex]
-  )
-
-  const resetSpeed = useCallback(() => {
-    void trackedInvoke("mpv_set_speed", { speed: 1 }).catch(() => {})
-  }, [])
-
-  const frameStep = useCallback((forward: boolean) => {
-    void trackedInvoke("mpv_frame_step", { forward }).catch(() => {})
   }, [])
 
   // Seek the session by a signed offset (session-global, so it crosses recording
