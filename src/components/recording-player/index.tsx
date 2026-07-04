@@ -78,8 +78,8 @@ import {
   type SessionModel,
   type SessionRally,
   type Timeline,
-} from "./recording-player-transport"
-import { useMpvSurface } from "./use-mpv-surface"
+} from "@/components/recording-player-transport"
+import { useMpvSurface } from "@/components/use-mpv-surface"
 
 export type { PlaylistRecording }
 
