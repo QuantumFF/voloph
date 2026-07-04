@@ -104,9 +104,11 @@ function fileName(path: string): string {
 }
 
 function formatDuration(ms: number): string {
-  const total = Math.round(ms / 1000)
-  const h = Math.floor(total / 3600)
-  const m = Math.round((total % 3600) / 60)
+  // Round to whole minutes first so 59m30s carries into the hour instead of
+  // rendering as "60m" / "1h 60m".
+  const totalMinutes = Math.round(ms / 60000)
+  const h = Math.floor(totalMinutes / 60)
+  const m = totalMinutes % 60
   if (h > 0) return `${h}h ${m.toString().padStart(2, "0")}m`
   return `${m}m`
 }
@@ -179,15 +181,17 @@ export function SessionList({ onPlay }: SessionListProps) {
 
   // While any recording is still being prepared or segmented in the
   // background, poll so the row flips from "Preparing…"/"Analyzing…" to its
-  // rally count once the draft timeline is ready.
+  // rally count once the draft timeline is ready. Keyed on the derived boolean
+  // (not `sessions`, a fresh array each poll) so the interval survives across
+  // polls instead of being torn down and re-created every tick.
+  const stillWorking = sessions.some((session) =>
+    session.recordings.some((recording) => isProcessing(recording))
+  )
   useEffect(() => {
-    const stillWorking = sessions.some((session) =>
-      session.recordings.some((recording) => isProcessing(recording))
-    )
     if (!stillWorking) return
     const interval = setInterval(() => void refresh(), 3000)
     return () => clearInterval(interval)
-  }, [sessions, refresh])
+  }, [stillWorking, refresh])
 
   async function handlePickFolder() {
     setError(null)
