@@ -48,10 +48,10 @@ import {
   type Resume,
   type SessionModel,
   type SessionRally,
-  type Timeline,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
 import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
+import { useSessionTimelines } from "./use-session-timelines"
 import { CheatSheet } from "./cheat-sheet"
 import { RallyInspector } from "./rally-inspector"
 import { RallyRail } from "./rally-rail"
@@ -73,9 +73,6 @@ interface RecordingPlayerProps {
   /** Return to the session list. */
   onBack: () => void
 }
-
-/** How long to wait before re-checking a recording whose timeline is still being produced. */
-const SEGMENT_POLL_MS = 2000
 
 /** Index of `1×` on the speed ladder — the default and the `Ctrl+0` reset target. */
 const DEFAULT_SPEED_INDEX = SPEED_LADDER.indexOf(1)
@@ -175,10 +172,6 @@ export function RecordingPlayer({
   // here. Null once landed, or when a crossing has no specific target yet.
   const resumeTargetRef = useRef<number | null>(null)
 
-  // Every recording's draft timeline, keyed by path so it survives switching
-  // recordings (and so the whole session can be stitched into one strip). Each
-  // unsegmented recording is polled until its rallies arrive (ADR 0002).
-  const [timelines, setTimelines] = useState<Record<string, Timeline>>({})
   // The playhead within the current recording (ms), from mpv's `time-pos`.
   const [currentMs, setCurrentMs] = useState(0)
   const [paused, setPaused] = useState(false)
@@ -193,10 +186,6 @@ export function RecordingPlayer({
   const [editing, setEditing] = useState(false)
   const [showCheatSheet, setShowCheatSheet] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // Bumped by Re-analyze to re-trigger the timeline fetch/poll; `reanalyzing`
-  // guards the button (ADR 0002, the tuning loop).
-  const [reanalyzeNonce, setReanalyzeNonce] = useState(0)
-  const [reanalyzing, setReanalyzing] = useState(false)
   // Timeline zoom and playhead-follow are owned here rather than by the strip,
   // so the status bar (which lives outside the strip) can drive them; the
   // strip's own wheel/scroll handlers mutate them through the setters.
@@ -210,6 +199,10 @@ export function RecordingPlayer({
   )
   const [pendingSeek, setPendingSeek] = useState<Resume | null>(null)
   const path = recordings[index]?.path ?? null
+
+  // Draft timelines for the whole session, polled until segmented (ADR 0002).
+  const { timelines, refreshTimeline, reanalyzing, reanalyze } =
+    useSessionTimelines(recordings)
   const timeline = path ? (timelines[path] ?? null) : null
 
   const atFirstRecording = index <= 0
@@ -225,45 +218,6 @@ export function RecordingPlayer({
   // (ADR 0008) — lives behind this hook; the returned ref marks the empty pane
   // the surface is slaved to.
   const paneRef = useMpvSurface(showCheatSheet)
-
-  // Fetch every recording's draft timeline so the whole session can be stitched
-  // into one strip, polling the recordings still being segmented so their
-  // rallies appear as soon as the worker finishes (ADR 0002). Re-runs on
-  // Re-analyze so the re-segmented recording is re-polled to ready.
-  useEffect(() => {
-    let cancelled = false
-    const timers: ReturnType<typeof setTimeout>[] = []
-    const loadOne = (recordingPath: string) => {
-      trackedInvoke<Timeline>("recording_timeline", { path: recordingPath })
-        .then((result) => {
-          if (cancelled) return
-          setTimelines((prev) => ({ ...prev, [recordingPath]: result }))
-          if (result.segment_state === "unknown") {
-            timers.push(
-              setTimeout(() => loadOne(recordingPath), SEGMENT_POLL_MS)
-            )
-          }
-        })
-        .catch(() => {
-          // A timeline failure is non-fatal — playback still works without it.
-        })
-    }
-    recordings.forEach((rec) => loadOne(rec.path))
-    return () => {
-      cancelled = true
-      timers.forEach(clearTimeout)
-    }
-  }, [recordings, reanalyzeNonce])
-
-  // Re-fetch a single recording's saved timeline after an inline correction
-  // (issue #7) without disturbing the rest of the session.
-  const refreshTimeline = useCallback((recordingPath: string) => {
-    trackedInvoke<Timeline>("recording_timeline", { path: recordingPath })
-      .then((result) =>
-        setTimelines((prev) => ({ ...prev, [recordingPath]: result }))
-      )
-      .catch(() => {})
-  }, [])
 
   // Rallies for the current recording, ascending by start (sorted in segment.rs).
   // The empty list when there's no timeline means the recording plays straight
@@ -648,12 +602,8 @@ export function RecordingPlayer({
   // Re-run segmentation for the current recording, then re-fetch timelines.
   const handleReanalyze = useCallback(() => {
     if (!path) return
-    setReanalyzing(true)
-    trackedInvoke("reanalyze_recording", { path })
-      .then(() => setReanalyzeNonce((n) => n + 1))
-      .catch(() => {})
-      .finally(() => setReanalyzing(false))
-  }, [path])
+    reanalyze(path)
+  }, [path, reanalyze])
 
   // The five inline corrections (issue #7). The boundary math and integrity
   // guards that decide what reaches SQLite live behind the transport seam (so
