@@ -233,6 +233,31 @@ async fn recording_annotations(
     db::recording_annotations(&conn, &path).map_err(|e| e.to_string())
 }
 
+/// Enrich or re-classify one annotation (issue #9): set its verdict, structured
+/// aspect, and free-text note. Scoped to the recording at `path`; `aspect`/`note`
+/// as given (`None` clears). Returns `false` when the annotation is not found.
+#[tauri::command]
+async fn update_annotation(
+    db: State<'_, Db>,
+    path: String,
+    id: i64,
+    verdict: String,
+    aspect: Option<String>,
+    note: Option<String>,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::update_annotation(&conn, &path, id, &verdict, aspect.as_deref(), note.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// Remove one annotation (issue #9). Scoped to the recording at `path`. Returns
+/// `false` when the annotation is not found.
+#[tauri::command]
+async fn delete_annotation(db: State<'_, Db>, path: String, id: i64) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::delete_annotation(&conn, &path, id).map_err(|e| e.to_string())
+}
+
 /// Start the background media worker unless one is already running. It drains
 /// every pending unit of work — probe each `unknown` recording for its frame
 /// rate, then segment each unsegmented one (ADR 0002) — without holding the DB
@@ -460,6 +485,8 @@ pub fn run() {
             delete_rally,
             add_annotation,
             recording_annotations,
+            update_annotation,
+            delete_annotation,
             mpv::mpv_load,
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,

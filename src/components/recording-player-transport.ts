@@ -123,14 +123,33 @@ export const VERDICTS = ["good", "bad", "mistake"] as const
 export type Verdict = (typeof VERDICTS)[number]
 
 /**
+ * The seeded aspect vocabulary (CONTEXT.md, issue #9): the dimension a verdict
+ * judges, a structured filterable field. This slice exposes the seeded list only;
+ * adding custom aspects from settings is deferred. Stored as free text in the DB
+ * (a user-editable vocabulary, not a fixed enum), so an annotation may carry an
+ * aspect outside this list without breaking.
+ */
+export const ASPECTS = [
+  "selection",
+  "execution",
+  "deception",
+  "footwork",
+  "positioning",
+] as const
+export type Aspect = (typeof ASPECTS)[number]
+
+/**
  * A verdict annotation pinned to a recording-local timestamp (issue #8, matching
  * `Annotation` in `src-tauri/src/db.rs`). The rally it belongs to is implied by
- * which rally's range contains `time_ms`, not stored.
+ * which rally's range contains `time_ms`, not stored. Enriched (issue #9) with an
+ * optional `aspect` and free-text `note`; both null until the user sets them.
  */
 export interface Annotation {
   id: number
   time_ms: number
   verdict: Verdict
+  aspect: string | null
+  note: string | null
 }
 
 /** An annotation lifted onto the session-global axis for the timeline strip. */
@@ -139,6 +158,8 @@ export interface SessionAnnotation {
   recordingIndex: number
   path: string
   verdict: Verdict
+  aspect: string | null
+  note: string | null
   /** Session-global timestamp (what the strip draws). */
   globalMs: number
 }
@@ -162,6 +183,8 @@ export function buildSessionAnnotations(
         recordingIndex: seg.index,
         path: seg.path,
         verdict: a.verdict,
+        aspect: a.aspect,
+        note: a.note,
         globalMs: seg.offsetMs + a.time_ms,
       })
     }

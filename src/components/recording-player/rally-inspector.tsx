@@ -1,10 +1,12 @@
 "use client"
 
-import { FlagIcon, TriangleAlertIcon } from "lucide-react"
+import { useState } from "react"
+import { FlagIcon, TriangleAlertIcon, Trash2Icon } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { formatClock } from "@/lib/format"
 import {
+  ASPECTS,
   UNCERTAIN_CONFIDENCE,
   VERDICTS,
   type SessionAnnotation,
@@ -12,15 +14,6 @@ import {
   type Verdict,
 } from "@/components/recording-player-transport"
 import { LONG_RALLY_MS } from "./index"
-
-/** Seeded aspect vocabulary (CONTEXT.md), previewed in the inspector stub. */
-const STUB_ASPECTS = [
-  "selection",
-  "execution",
-  "deception",
-  "footwork",
-  "positioning",
-]
 
 const VERDICT_DOT = {
   good: "bg-emerald-500",
@@ -31,14 +24,18 @@ const VERDICT_DOT = {
 /**
  * The right inspector of the studio layout (issue #48): everything about the
  * rally under the playhead. Verdict capture (issue #8) is live — a click drops
- * a `good`/`bad`/`mistake` annotation at the playhead, and the ones inside this
- * rally's span list below; flag, aspect, and note stay visual stubs for now.
+ * a `good`/`bad`/`mistake` annotation at the playhead. Selecting one of the
+ * listed annotations enriches it (issue #9): re-classify its verdict, pick an
+ * aspect from the seeded vocabulary, type a note, or delete it. Flag stays a
+ * visual stub for now.
  */
 export function RallyInspector({
   rally,
   rallyNumber,
   annotations,
   onAnnotate,
+  onUpdate,
+  onDelete,
 }: {
   rally: SessionRally | null
   rallyNumber: number
@@ -46,7 +43,19 @@ export function RallyInspector({
   annotations: SessionAnnotation[]
   /** Drop a verdict at the playhead (same path as the 1/2/3 hotkeys). */
   onAnnotate: (verdict: Verdict) => void
+  /** Enrich/re-classify an annotation (issue #9). */
+  onUpdate: (
+    path: string,
+    id: number,
+    verdict: Verdict,
+    aspect: string | null,
+    note: string | null
+  ) => void
+  /** Remove an annotation (issue #9). */
+  onDelete: (path: string, id: number) => void
 }) {
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const selected = annotations.find((a) => a.id === selectedId) ?? null
   return (
     <aside className="flex w-72 shrink-0 flex-col overflow-y-auto border-l">
       {rally === null ? (
@@ -92,7 +101,7 @@ export function RallyInspector({
           </div>
 
           {/* Verdict capture (issue #8): one keystroke or click drops an
-              annotation at the playhead. Aspect + note come in a later slice. */}
+              annotation at the playhead. Enrich it below (issue #9). */}
           <div className="border-b p-4">
             <div className="mb-2 flex items-baseline justify-between">
               <h3 className="text-xs font-medium text-muted-foreground">
@@ -117,22 +126,6 @@ export function RallyInspector({
                 </Button>
               ))}
             </div>
-            <div className="mt-2 flex flex-wrap gap-1">
-              {STUB_ASPECTS.map((aspect) => (
-                <span
-                  key={aspect}
-                  className="rounded-full border px-2 py-0.5 text-xs text-muted-foreground/70"
-                >
-                  {aspect}
-                </span>
-              ))}
-            </div>
-            <textarea
-              disabled
-              placeholder="Note (optional) — shot type goes here"
-              rows={2}
-              className="mt-2 w-full resize-none rounded-md border bg-transparent px-2 py-1.5 text-sm placeholder:text-muted-foreground/70 disabled:cursor-not-allowed"
-            />
           </div>
 
           <div className="p-4">
@@ -147,14 +140,39 @@ export function RallyInspector({
             ) : (
               <ul className="space-y-1 text-sm">
                 {annotations.map((a) => (
-                  <li key={a.id} className="flex items-center gap-2">
-                    <span
-                      className={`size-2 shrink-0 rounded-full ${VERDICT_DOT[a.verdict]}`}
-                    />
-                    <span className="capitalize">{a.verdict}</span>
-                    <span className="ml-auto tabular-nums text-muted-foreground">
-                      {formatClock(a.globalMs)}
-                    </span>
+                  <li key={a.id}>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedId((id) => (id === a.id ? null : a.id))
+                      }
+                      className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left hover:bg-muted ${
+                        a.id === selectedId ? "bg-muted" : ""
+                      }`}
+                    >
+                      <span
+                        className={`size-2 shrink-0 rounded-full ${VERDICT_DOT[a.verdict]}`}
+                      />
+                      <span className="capitalize">{a.verdict}</span>
+                      {a.aspect ? (
+                        <span className="text-xs text-muted-foreground">
+                          {a.aspect}
+                        </span>
+                      ) : null}
+                      <span className="ml-auto tabular-nums text-muted-foreground">
+                        {formatClock(a.globalMs)}
+                      </span>
+                    </button>
+                    {a.id === selectedId && selected ? (
+                      <AnnotationEditor
+                        annotation={selected}
+                        onUpdate={onUpdate}
+                        onDelete={(path, id) => {
+                          onDelete(path, id)
+                          setSelectedId(null)
+                        }}
+                      />
+                    ) : null}
                   </li>
                 ))}
               </ul>
@@ -163,5 +181,86 @@ export function RallyInspector({
         </>
       )}
     </aside>
+  )
+}
+
+/**
+ * Enrich the selected annotation (issue #9): re-classify its verdict, toggle an
+ * aspect from the seeded vocabulary (clicking the set one clears it), and edit a
+ * note. Verdict and aspect persist on click; the note persists on blur so a full
+ * sentence is one write, not one per keystroke. Delete removes it.
+ */
+function AnnotationEditor({
+  annotation,
+  onUpdate,
+  onDelete,
+}: {
+  annotation: SessionAnnotation
+  onUpdate: (
+    path: string,
+    id: number,
+    verdict: Verdict,
+    aspect: string | null,
+    note: string | null
+  ) => void
+  onDelete: (path: string, id: number) => void
+}) {
+  const { path, id, verdict, aspect, note } = annotation
+  const [draftNote, setDraftNote] = useState(note ?? "")
+  return (
+    <div className="mt-1 space-y-2 rounded-md border p-2">
+      <div className="grid grid-cols-3 gap-1.5">
+        {VERDICTS.map((v) => (
+          <Button
+            key={v}
+            variant={v === verdict ? "default" : "outline"}
+            size="sm"
+            className="capitalize"
+            onClick={() => onUpdate(path, id, v, aspect, note)}
+          >
+            <span className={`size-2 rounded-full ${VERDICT_DOT[v]}`} />
+            {v}
+          </Button>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {ASPECTS.map((asp) => (
+          <button
+            key={asp}
+            type="button"
+            onClick={() =>
+              onUpdate(path, id, verdict, asp === aspect ? null : asp, note)
+            }
+            className={`rounded-full border px-2 py-0.5 text-xs ${
+              asp === aspect
+                ? "border-foreground bg-foreground text-background"
+                : "text-muted-foreground hover:bg-muted"
+            }`}
+          >
+            {asp}
+          </button>
+        ))}
+      </div>
+      <textarea
+        value={draftNote}
+        onChange={(e) => setDraftNote(e.target.value)}
+        onBlur={() => {
+          const next = draftNote.trim() || null
+          if (next !== (note ?? null)) onUpdate(path, id, verdict, aspect, next)
+        }}
+        placeholder="Note (optional) — shot type goes here"
+        rows={2}
+        className="w-full resize-none rounded-md border bg-transparent px-2 py-1.5 text-sm placeholder:text-muted-foreground/70"
+      />
+      <Button
+        variant="ghost"
+        size="sm"
+        className="w-full text-destructive hover:text-destructive"
+        onClick={() => onDelete(path, id)}
+      >
+        <Trash2Icon className="size-4" />
+        Delete annotation
+      </Button>
+    </div>
   )
 }

@@ -46,5 +46,32 @@ export function useAnnotations(recordings: PlaylistRecording[]) {
     [load]
   )
 
-  return { annotations, add }
+  // Enrich or re-classify an annotation (issue #9): its verdict, aspect (from the
+  // seeded vocabulary), and free-text note. Re-reads the recording so the change
+  // shows at once.
+  const update = useCallback(
+    (
+      path: string,
+      id: number,
+      verdict: Verdict,
+      aspect: string | null,
+      note: string | null
+    ) => {
+      void trackedInvoke("update_annotation", { path, id, verdict, aspect, note })
+        .then(() => load(path))
+        .catch(() => {})
+    },
+    [load]
+  )
+
+  const remove = useCallback(
+    (path: string, id: number) => {
+      void trackedInvoke("delete_annotation", { path, id })
+        .then(() => load(path))
+        .catch(() => {})
+    },
+    [load]
+  )
+
+  return { annotations, add, update, remove }
 }

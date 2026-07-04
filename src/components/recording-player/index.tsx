@@ -223,7 +223,12 @@ export function RecordingPlayer({
 
   // Verdict annotations (issue #8): fetched per recording, dropped at the
   // playhead by a hotkey, and stitched onto the session axis for the strip.
-  const { annotations, add: addAnnotation } = useAnnotations(recordings)
+  const {
+    annotations,
+    add: addAnnotation,
+    update: updateAnnotation,
+    remove: removeAnnotation,
+  } = useAnnotations(recordings)
   const sessionAnnotations = useMemo(
     () => buildSessionAnnotations(session, annotations),
     [session, annotations]
@@ -439,6 +444,8 @@ export function RecordingPlayer({
           rallyNumber={currentRallyIndex + 1}
           annotations={rallyAnnotations}
           onAnnotate={annotate}
+          onUpdate={updateAnnotation}
+          onDelete={removeAnnotation}
         />
       </div>
 

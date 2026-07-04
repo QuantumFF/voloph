@@ -330,8 +330,10 @@ describe("buildSessionAnnotations", () => {
       "b.mp4": timeline(8000, [rally(2, 500, 1500)]),
     })
     const marks = buildSessionAnnotations(session, {
-      "b.mp4": [{ id: 3, time_ms: 700, verdict: "mistake" }],
-      "a.mp4": [{ id: 2, time_ms: 1500, verdict: "good" }],
+      "b.mp4": [{ id: 3, time_ms: 700, verdict: "mistake", aspect: null, note: null }],
+      "a.mp4": [
+        { id: 2, time_ms: 1500, verdict: "good", aspect: "selection", note: "clean" },
+      ],
     })
     // Ordered by global time: a's at 1500, b's lifted by a's 10000 → 10700.
     expect(marks.map((m) => [m.id, m.globalMs, m.verdict])).toEqual([
@@ -339,6 +341,9 @@ describe("buildSessionAnnotations", () => {
       [3, 10700, "mistake"],
     ])
     expect(marks[1].recordingIndex).toBe(1)
+    // Aspect and note ride along onto the session axis.
+    expect(marks[0].aspect).toBe("selection")
+    expect(marks[0].note).toBe("clean")
   })
 
   it("skips annotations on an unplaced recording", () => {
@@ -353,8 +358,8 @@ describe("buildSessionAnnotations", () => {
     })
     // a isn't placed (no duration) → b isn't either; both drop out.
     const marks = buildSessionAnnotations(session, {
-      "a.mp4": [{ id: 1, time_ms: 100, verdict: "good" }],
-      "b.mp4": [{ id: 2, time_ms: 100, verdict: "bad" }],
+      "a.mp4": [{ id: 1, time_ms: 100, verdict: "good", aspect: null, note: null }],
+      "b.mp4": [{ id: 2, time_ms: 100, verdict: "bad", aspect: null, note: null }],
     })
     expect(marks).toEqual([])
   })

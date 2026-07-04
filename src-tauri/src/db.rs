@@ -82,7 +82,9 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             id           INTEGER PRIMARY KEY,
             recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
             time_ms      INTEGER NOT NULL,
-            verdict      TEXT NOT NULL
+            verdict      TEXT NOT NULL,
+            aspect       TEXT,
+            note         TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_annotations_recording ON annotations(recording_id);
         CREATE TABLE IF NOT EXISTS scanned_folders (
@@ -123,6 +125,11 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // as a JSON array of normalized `[0,1]` floats. Produced alongside the draft
     // timeline during segmentation; null until a recording is segmented.
     let _ = conn.execute("ALTER TABLE recordings ADD COLUMN waveform TEXT", []);
+    // Enrich verdict annotations with a structured aspect and a free-text note
+    // (issue #9). Both nullable — a fast-captured annotation carries a verdict
+    // only until it is enriched. Added here so DBs from issue #8 gain the columns.
+    let _ = conn.execute("ALTER TABLE annotations ADD COLUMN aspect TEXT", []);
+    let _ = conn.execute("ALTER TABLE annotations ADD COLUMN note TEXT", []);
     Ok(conn)
 }
 
@@ -723,12 +730,16 @@ pub fn delete_rally(conn: &Connection, path: &str, rally_id: i64) -> rusqlite::R
 /// recording-local absolute timestamp it is pinned to, and its one-keystroke
 /// verdict. The rally it belongs to is *not* stored — it is implied by which
 /// rally's range contains `time_ms` (glossary), so moving a rally boundary never
-/// disturbs an annotation.
+/// disturbs an annotation. The quick verdict is optionally enriched (issue #9)
+/// with a structured `aspect` (the dimension it judges) and a free-text `note`
+/// (where shot type lives); both are null until the user enriches it.
 #[derive(Debug, Serialize)]
 pub struct Annotation {
     pub id: i64,
     pub time_ms: i64,
     pub verdict: String,
+    pub aspect: Option<String>,
+    pub note: Option<String>,
 }
 
 /// Drop a verdict annotation at `time_ms` (recording-local) on the recording at
@@ -754,14 +765,15 @@ pub fn add_annotation(
 }
 
 /// Every verdict annotation on the recording at `path`, in timestamp order, so
-/// the player can lay their markers over the timeline strip (issue #8). Empty
-/// when the recording has none or `path` is not registered.
+/// the player can lay their markers over the timeline strip (issue #8) and show
+/// their aspect/note in the inspector (issue #9). Empty when the recording has
+/// none or `path` is not registered.
 pub fn recording_annotations(conn: &Connection, path: &str) -> rusqlite::Result<Vec<Annotation>> {
     let Some(rid) = recording_id(conn, path)? else {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare(
-        "SELECT id, time_ms, verdict FROM annotations
+        "SELECT id, time_ms, verdict, aspect, note FROM annotations
          WHERE recording_id = ?1 ORDER BY time_ms, id",
     )?;
     let annotations = stmt
@@ -770,10 +782,49 @@ pub fn recording_annotations(conn: &Connection, path: &str) -> rusqlite::Result<
                 id: row.get(0)?,
                 time_ms: row.get(1)?,
                 verdict: row.get(2)?,
+                aspect: row.get(3)?,
+                note: row.get(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(annotations)
+}
+
+/// Enrich or re-classify one annotation (issue #9): set its `verdict`, structured
+/// `aspect`, and free-text `note`. Scoped to the recording at `path` like the
+/// rally edits, so a stray path touches nothing. `aspect`/`note` are set as given
+/// — pass `None` to clear a field. Returns `false` when the recording or
+/// annotation is not found.
+pub fn update_annotation(
+    conn: &Connection,
+    path: &str,
+    id: i64,
+    verdict: &str,
+    aspect: Option<&str>,
+    note: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(false);
+    };
+    let changed = conn.execute(
+        "UPDATE annotations SET verdict = ?1, aspect = ?2, note = ?3
+         WHERE id = ?4 AND recording_id = ?5",
+        rusqlite::params![verdict, aspect, note, id, rid],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Remove one annotation (issue #9). Scoped to the recording at `path`. Returns
+/// `false` when the recording or annotation is not found.
+pub fn delete_annotation(conn: &Connection, path: &str, id: i64) -> rusqlite::Result<bool> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(false);
+    };
+    let changed = conn.execute(
+        "DELETE FROM annotations WHERE id = ?1 AND recording_id = ?2",
+        rusqlite::params![id, rid],
+    )?;
+    Ok(changed > 0)
 }
 
 /// Parse the stored waveform JSON (a bare array of floats written by
@@ -1124,5 +1175,52 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM annotations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    /// Enriching an annotation sets its aspect and note and can re-classify its
+    /// verdict; they read back and clearing a field sets it null (issue #9).
+    #[test]
+    fn annotation_enriches_and_clears() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        let id = add_annotation(&conn, "/r.mp4", 2000, "bad").unwrap().unwrap();
+        assert!(update_annotation(
+            &conn,
+            "/r.mp4",
+            id,
+            "mistake",
+            Some("execution"),
+            Some("late smash into the net"),
+        )
+        .unwrap());
+        let a = &recording_annotations(&conn, "/r.mp4").unwrap()[0];
+        assert_eq!(a.verdict, "mistake");
+        assert_eq!(a.aspect.as_deref(), Some("execution"));
+        assert_eq!(a.note.as_deref(), Some("late smash into the net"));
+
+        update_annotation(&conn, "/r.mp4", id, "mistake", None, None).unwrap();
+        let a = &recording_annotations(&conn, "/r.mp4").unwrap()[0];
+        assert_eq!(a.aspect, None);
+        assert_eq!(a.note, None);
+    }
+
+    /// Update and delete are scoped to the recording, and delete removes just the
+    /// one annotation (issue #9). A stray path or unknown id touches nothing.
+    #[test]
+    fn annotation_update_and_delete_are_scoped() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        let a = add_annotation(&conn, "/r.mp4", 2000, "good").unwrap().unwrap();
+        let b = add_annotation(&conn, "/r.mp4", 3000, "bad").unwrap().unwrap();
+
+        assert!(!update_annotation(&conn, "/missing.mp4", a, "good", None, None).unwrap());
+        assert!(!delete_annotation(&conn, "/missing.mp4", a).unwrap());
+        assert!(!delete_annotation(&conn, "/r.mp4", 9999).unwrap());
+        assert_eq!(verdicts(&conn, "/r.mp4").len(), 2);
+
+        assert!(delete_annotation(&conn, "/r.mp4", a).unwrap());
+        assert_eq!(verdicts(&conn, "/r.mp4"), vec![(3000, "bad".to_string())]);
+        assert_eq!(
+            recording_annotations(&conn, "/r.mp4").unwrap()[0].id,
+            b
+        );
     }
 }
