@@ -278,57 +278,115 @@ export function RecordingPlayer({
 
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
-  // Export the current recording's rallies, gaps removed, to a file the user
-  // picks (issue #12). `null` = idle; otherwise a fraction in [0, 1] driving the
-  // progress readout. One engine — the flagged/mistake reels (issues #13/#14)
-  // will call the same command with a rally-id selection.
+  // The Export engine, driven from the player (issues #12/#13/#14). `null` = idle;
+  // otherwise a fraction in [0, 1] driving the progress readout. `exportError`
+  // surfaces a failed or empty-selection export in the header.
   const [exportProgress, setExportProgress] = useState<number | null>(null)
-  const exportCondensed = useCallback(async () => {
-    if (!path || exportProgress != null) return
-    const output = await save({
-      title: "Export condensed recording",
-      defaultPath: `${fileName(path).replace(/\.[^.]+$/, "")}-condensed.mp4`,
-      filters: [{ name: "Video", extensions: ["mp4"] }],
-    })
-    if (!output) return
-    setExportProgress(0)
-    const unlisten = await listen<number>("export:progress", (e) =>
-      setExportProgress(e.payload)
-    )
-    try {
-      await trackedInvoke("export_rallies", { path, output })
-    } finally {
-      unlisten()
-      setExportProgress(null)
-    }
-  }, [path, exportProgress])
+  const [exportError, setExportError] = useState<string | null>(null)
 
-  // Export the *whole session* — every rally across all its recordings, gaps
-  // removed, concatenated across file boundaries into one portable MP4 (issue
-  // #13, the headline condensed-session export). Same engine and progress
-  // readout, handed every recording's path in capture order.
-  const exportSession = useCallback(async () => {
-    if (recordings.length === 0 || exportProgress != null) return
-    const output = await save({
-      title: "Export condensed session",
-      defaultPath: `${day ?? "session"}-condensed.mp4`,
-      filters: [{ name: "Video", extensions: ["mp4"] }],
-    })
-    if (!output) return
-    setExportProgress(0)
-    const unlisten = await listen<number>("export:progress", (e) =>
-      setExportProgress(e.payload)
-    )
-    try {
-      await trackedInvoke("export_session", {
-        paths: recordings.map((r) => r.path),
-        output,
+  // Run one export: pick a destination, then invoke `command`/`args` with a live
+  // progress readout. All four Export items funnel through here so the save
+  // dialog, progress listener, and error surfacing live in one place.
+  const runExport = useCallback(
+    async (
+      title: string,
+      defaultName: string,
+      command: string,
+      args: Record<string, unknown>
+    ) => {
+      if (exportProgress != null) return
+      setExportError(null)
+      const output = await save({
+        title,
+        defaultPath: `${defaultName}.mp4`,
+        filters: [{ name: "Video", extensions: ["mp4"] }],
       })
-    } finally {
-      unlisten()
-      setExportProgress(null)
-    }
-  }, [recordings, day, exportProgress])
+      if (!output) return
+      setExportProgress(0)
+      const unlisten = await listen<number>("export:progress", (e) =>
+        setExportProgress(e.payload)
+      )
+      try {
+        await trackedInvoke(command, { ...args, output })
+      } catch (e) {
+        setExportError(String(e))
+      } finally {
+        unlisten()
+        setExportProgress(null)
+      }
+    },
+    [exportProgress]
+  )
+
+  const paths = useMemo(() => recordings.map((r) => r.path), [recordings])
+
+  // Condensed recording (#12): every rally of the open recording, gaps removed.
+  const exportCondensed = useCallback(() => {
+    if (!path) return
+    return runExport(
+      "Export condensed recording",
+      `${fileName(path).replace(/\.[^.]+$/, "")}-condensed`,
+      "export_rallies",
+      { path }
+    )
+  }, [path, runExport])
+
+  // Condensed session (#13): every rally across all the session's recordings,
+  // gaps removed, concatenated across file boundaries into one portable MP4.
+  const exportSession = useCallback(
+    () =>
+      runExport(
+        "Export condensed session",
+        `${day ?? "session"}-condensed`,
+        "export_session",
+        { paths, rallyIds: null }
+      ),
+    [day, paths, runExport]
+  )
+
+  // A targeted reel (#14): the same session engine pointed at a rally-id
+  // selection. An empty selection never reaches ffmpeg — we surface it instead.
+  const exportReel = useCallback(
+    (label: string, name: string, rallyIds: number[]) => {
+      if (rallyIds.length === 0) {
+        setExportError(`No ${label} in this session to export.`)
+        return
+      }
+      return runExport(
+        `Export ${label}`,
+        `${day ?? "session"}-${name}`,
+        "export_session",
+        { paths, rallyIds }
+      )
+    },
+    [day, paths, runExport]
+  )
+
+  // Flagged rallies (#14): the rallies the user marked as ones that matter.
+  const exportFlagged = useCallback(
+    () =>
+      exportReel(
+        "flagged rallies",
+        "flagged",
+        session.rallies.filter((r) => r.flagged).map((r) => r.id)
+      ),
+    [exportReel, session]
+  )
+
+  // Rallies with mistakes (#14): a rally owns the annotations in its span
+  // (glossary), so a rally is a "mistake" rally if a `mistake` verdict falls
+  // inside it. Reuses the session annotations already lifted onto the axis (#11).
+  const exportMistakes = useCallback(() => {
+    const mistakeMs = sessionAnnotations
+      .filter((a) => a.verdict === "mistake")
+      .map((a) => a.globalMs)
+    const ids = session.rallies
+      .filter((r) =>
+        mistakeMs.some((ms) => ms >= r.globalStart && ms < r.globalEnd)
+      )
+      .map((r) => r.id)
+    return exportReel("rallies with mistakes", "mistakes", ids)
+  }, [exportReel, session, sessionAnnotations])
 
   // The keymap array is rebuilt only when an action's closure changes; the
   // window key handler lives in `useGlobalKeymap`.
@@ -424,11 +482,15 @@ export function RecordingPlayer({
         >
           {day && path ? fileName(path) : null}
         </span>
-        <div className="ml-auto shrink-0">
-          {/* Export engine: the condensed recording (#12) and the headline
-              condensed *session* — every rally across all its recordings, gaps
-              removed, one portable file (#13) — are live; the flagged/mistake
-              reels (#14) point the same engine at a rally-id selection next. */}
+        <div className="ml-auto flex shrink-0 items-center">
+          {/* Export engine: the condensed recording (#12), the condensed
+              *session* (#13), and targeted reels (#14 — flagged rallies, rallies
+              with mistakes) all point the one engine at a different selection. */}
+          {exportError ? (
+            <span className="mr-3 text-sm text-destructive" role="alert">
+              {exportError}
+            </span>
+          ) : null}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -458,8 +520,10 @@ export function RecordingPlayer({
               <DropdownMenuItem onSelect={() => void exportCondensed()}>
                 Condensed recording (gaps removed)
               </DropdownMenuItem>
-              <DropdownMenuItem disabled>Flagged rallies</DropdownMenuItem>
-              <DropdownMenuItem disabled>
+              <DropdownMenuItem onSelect={() => void exportFlagged()}>
+                Flagged rallies
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void exportMistakes()}>
                 Rallies with mistakes
               </DropdownMenuItem>
             </DropdownMenuContent>

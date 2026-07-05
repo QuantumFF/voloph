@@ -333,12 +333,14 @@ async fn export_rallies(
     export::export(&app, &[&path], &output, &cuts)
 }
 
-/// Render one new MP4 at `output` from **every rally of a whole session** — all
+/// Render one new MP4 at `output` from a selection of a whole session's rallies —
 /// the rallies of `paths` (the session's recordings, given in capture order),
-/// gaps removed, concatenated across file boundaries into one portable file
-/// (issue #13, the headline condensed-session export). Each recording becomes an
-/// ffmpeg input; its rallies are cut from it and stitched in, in the order the
-/// paths arrive. Sources are never modified. Progress is emitted on
+/// gaps removed, concatenated across file boundaries into one portable file. Each
+/// recording becomes an ffmpeg input; its rallies are cut from it and stitched in,
+/// in the order the paths arrive. `rally_ids` picks which rallies (by their unique
+/// row id); `None` exports **every** rally (issue #13's condensed session), a
+/// selection drives a targeted reel (issue #14 — flagged rallies, rallies with
+/// mistakes). Sources are never modified. Progress is emitted on
 /// [`export::EVENT_PROGRESS`]. The DB lock is held only for the timeline reads.
 #[tauri::command]
 async fn export_session(
@@ -346,6 +348,7 @@ async fn export_session(
     db: State<'_, Db>,
     paths: Vec<String>,
     output: String,
+    rally_ids: Option<Vec<i64>>,
 ) -> Result<(), String> {
     let cuts: Vec<export::Cut> = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -356,11 +359,17 @@ async fn export_session(
                 .ok_or_else(|| format!("recording is not registered: {path}"))?;
             // Timeline order is already start_ms-ascending, so appending each
             // recording's rallies in turn yields capture-then-timeline order.
-            cuts.extend(timeline.rallies.iter().map(|r| export::Cut {
-                src,
-                start_ms: r.start_ms,
-                end_ms: r.end_ms,
-            }));
+            cuts.extend(
+                timeline
+                    .rallies
+                    .iter()
+                    .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
+                    .map(|r| export::Cut {
+                        src,
+                        start_ms: r.start_ms,
+                        end_ms: r.end_ms,
+                    }),
+            );
         }
         cuts
     };
