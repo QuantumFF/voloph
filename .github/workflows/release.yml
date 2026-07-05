@@ -72,6 +72,25 @@ jobs:
           assetNamePattern: "[name]-[version]-[platform]-[arch][ext]"
           includeUpdaterJson: false
 
+      # linuxdeploy bundles libmpv's audio deps (pipewire/pulse/jack) into the
+      # AppImage, which collide with the host's at runtime (ADR 0008). Strip them
+      # and replace the asset tauri-action just uploaded.
+      - name: Fix AppImage audio libs and re-upload
+        if: startsWith(matrix.platform, 'ubuntu') && steps.tauri.outputs.releaseId != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+        run: |
+          set -euo pipefail
+          fixed="$(bash scripts/fix-appimage.sh)"
+          tag="$(gh api "repos/$REPO/releases/$RELEASE_ID" -q .tag_name)"
+          asset="$(gh api "repos/$REPO/releases/$RELEASE_ID/assets" \
+            -q '.[] | select(.name | endswith(".AppImage")) | .name')"
+          cp "$fixed" "$RUNNER_TEMP/$asset"
+          gh release upload "$tag" "$RUNNER_TEMP/$asset" --clobber --repo "$REPO"
+
       - name: Release summary
         if: steps.tauri.outputs.releaseHtmlUrl != ''
         shell: bash
