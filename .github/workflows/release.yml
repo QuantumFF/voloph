@@ -74,12 +74,21 @@ jobs:
 
       - name: Release summary
         if: steps.tauri.outputs.releaseHtmlUrl != ''
+        shell: bash
+        # Pass values via env, not ${{ }} interpolation: artifactPaths is JSON
+        # with embedded quotes/backslashes that would break the shell (and is an
+        # injection vector) if spliced directly into the script.
+        env:
+          PLATFORM: ${{ matrix.name }}
+          APP_VERSION: ${{ steps.tauri.outputs.appVersion }}
+          RELEASE_URL: ${{ steps.tauri.outputs.releaseHtmlUrl }}
+          ARTIFACTS: ${{ steps.tauri.outputs.artifactPaths }}
         run: |
           {
             echo "## Tauri Release"
             echo ""
-            echo "- Platform: \`${{ matrix.name }}\`"
-            echo "- Version: \`${{ steps.tauri.outputs.appVersion }}\`"
-            echo "- Release: ${{ steps.tauri.outputs.releaseHtmlUrl }}"
-            echo "- Artifacts: \`${{ steps.tauri.outputs.artifactPaths }}\`"
+            echo "- Platform: \`$PLATFORM\`"
+            echo "- Version: \`$APP_VERSION\`"
+            echo "- Release: $RELEASE_URL"
+            echo "- Artifacts: \`$ARTIFACTS\`"
           } >> "$GITHUB_STEP_SUMMARY"
