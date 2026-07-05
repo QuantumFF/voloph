@@ -47,3 +47,11 @@ strip = true      # Ensures debug symbols are removed.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 glib = "0.18"
+
+# Vendored wry 0.55.1 with one patch (see ADR 0009): IPC custom-protocol
+# responses are delivered at glib DEFAULT priority instead of DEFAULT_IDLE,
+# which the continuously-rendering mpv GLArea starves — every `invoke()`
+# response would otherwise stall until playback pauses. Grep the vendor tree
+# for "VOLOPH PATCH" and re-apply when bumping wry.
+[patch.crates-io]
+wry = { path = "vendor/wry" }
