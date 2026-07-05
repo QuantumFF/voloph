@@ -16,10 +16,94 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use tauri::{AppHandle, Emitter};
 
 use crate::media::sidecar_path;
+
+/// How to drive one H.264 encoder. Most GPU encoders (NVENC/QSV/AMF) are
+/// software-decode + GPU-encode (ADR 0005): they take the same system-memory
+/// frames as libx264, so `global` and `vfilter` are empty and only `codec`
+/// differs. VAAPI is the exception — it encodes from GPU surfaces, so it needs a
+/// hw device (`global`) and `format=nv12,hwupload` spliced onto the video output
+/// (`vfilter`) to lift frames onto the GPU first.
+///
+/// The `-cq`/`-global_quality`/`-qp`/`-quality` numbers are the calibration knobs:
+/// GPU output is quality-vs-speed and cards vary — tune per encoder if exports
+/// look soft or run slow.
+#[derive(Clone, Copy)]
+struct EncoderPlan {
+    /// Args placed before the inputs (hw device init). Empty for most encoders.
+    global: &'static [&'static str],
+    /// Filter to run on the concat'd video before encoding (GPU upload). `None`
+    /// maps the concat output straight to the encoder.
+    vfilter: Option<&'static str>,
+    /// Codec selection and tuning.
+    codec: &'static [&'static str],
+}
+
+/// libx264 `veryfast` — always usable, the final fallback.
+const SOFTWARE: EncoderPlan = EncoderPlan {
+    global: &[],
+    vfilter: None,
+    codec: &["-c:v", "libx264", "-preset", "veryfast"],
+};
+
+/// GPU candidates, fastest-usable-first (ADR 0005): NVIDIA NVENC, Intel QSV,
+/// generic VAAPI (Intel/AMD on Linux), then AMD AMF. Whichever opens first wins.
+const HW_ENCODERS: &[EncoderPlan] = &[
+    EncoderPlan {
+        global: &[],
+        vfilter: None,
+        codec: &["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"],
+    },
+    EncoderPlan {
+        global: &[],
+        vfilter: None,
+        codec: &["-c:v", "h264_qsv", "-global_quality", "23"],
+    },
+    EncoderPlan {
+        global: &["-init_hw_device", "vaapi=va:/dev/dri/renderD128", "-filter_hw_device", "va"],
+        vfilter: Some("format=nv12,hwupload"),
+        codec: &["-c:v", "h264_vaapi", "-qp", "23"],
+    },
+    EncoderPlan {
+        global: &[],
+        vfilter: None,
+        codec: &["-c:v", "h264_amf", "-quality", "balanced"],
+    },
+];
+
+/// True if a plan can actually *open* its encoder, not merely list it: an iGPU can
+/// advertise an encoder it has no entrypoint for (ADR 0005). Confirmed with a
+/// sub-second throwaway encode of a tiny synthetic clip, run through the plan's own
+/// device + upload filter so the probe exercises the real pipeline.
+fn plan_works(plan: &EncoderPlan) -> bool {
+    let mut cmd = Command::new(sidecar_path("ffmpeg"));
+    cmd.args(["-v", "error"]);
+    cmd.args(plan.global);
+    cmd.args(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=5:d=0.1"]);
+    if let Some(vf) = plan.vfilter {
+        cmd.args(["-vf", vf]);
+    }
+    cmd.args(plan.codec);
+    cmd.args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Fastest usable encoder plan, probed once per process (ADR 0005): the first GPU
+/// candidate that opens, else software. A working GPU encoder cuts a re-encode to
+/// roughly a third of software time.
+fn video_encoder() -> EncoderPlan {
+    static CHOSEN: OnceLock<EncoderPlan> = OnceLock::new();
+    *CHOSEN.get_or_init(|| HW_ENCODERS.iter().find(|p| plan_works(p)).copied().unwrap_or(SOFTWARE))
+}
 
 /// Tauri event carrying export progress as a fraction in `[0, 1]`.
 pub const EVENT_PROGRESS: &str = "export:progress";
@@ -74,22 +158,27 @@ pub fn export(app: &AppHandle, srcs: &[&str], dest: &str, cuts: &[Cut]) -> Resul
     }
     filter.push_str(&format!("concat=n={}:v=1:a=1[v][a]", cuts.len()));
 
+    // A GPU-surface encoder (VAAPI) needs the concat'd video lifted onto the GPU
+    // before it can encode; splice its upload filter on and map that instead.
+    let plan = video_encoder();
+    let map_v = match plan.vfilter {
+        Some(vf) => {
+            filter.push_str(&format!(";[v]{vf}[venc]"));
+            "[venc]"
+        }
+        None => "[v]",
+    };
+
     let mut cmd = Command::new(sidecar_path("ffmpeg"));
     cmd.args(["-v", "error", "-nostats", "-y"]);
+    cmd.args(plan.global);
     for src in srcs {
         cmd.args(["-i", src]);
     }
+    cmd.args(["-filter_complex", &filter, "-map", map_v, "-map", "[a]"]);
+    cmd.args(plan.codec);
     let mut child = cmd
-        .args([
-            "-filter_complex", &filter,
-            "-map", "[v]", "-map", "[a]",
-            // ponytail: software libx264 always works (ADR 0005); GPU-encoder
-            // selection is an optimization to add if export is too slow.
-            "-c:v", "libx264", "-preset", "veryfast",
-            "-c:a", "aac",
-            "-progress", "pipe:1",
-            dest,
-        ])
+        .args(["-c:a", "aac", "-progress", "pipe:1", dest])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -151,5 +240,21 @@ mod tests {
         ];
         let total: i64 = cuts.iter().map(|c| (c.end_ms - c.start_ms).max(0)).sum();
         assert_eq!(total, 1500);
+    }
+
+    /// Every candidate names a codec, and only VAAPI (the GPU-surface encoder)
+    /// carries a hw device + upload filter; the others are drop-in swaps that leave
+    /// the pipeline untouched. Software is the always-valid fallback.
+    #[test]
+    fn encoder_plans_are_well_formed() {
+        assert!(SOFTWARE.codec.contains(&"libx264"));
+        assert!(SOFTWARE.global.is_empty() && SOFTWARE.vfilter.is_none());
+
+        for plan in HW_ENCODERS {
+            assert!(plan.codec.contains(&"-c:v"));
+            // A device/upload filter appears together, and only for GPU-surface encoders.
+            assert_eq!(plan.vfilter.is_some(), !plan.global.is_empty());
+        }
+        assert!(HW_ENCODERS.iter().any(|p| p.codec.contains(&"h264_vaapi") && p.vfilter.is_some()));
     }
 }
