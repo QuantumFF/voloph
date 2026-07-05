@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { fileName } from "@/lib/format"
 import { formatCaptureDay } from "@/lib/utils"
+import { useExport } from "@/components/use-export"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
@@ -274,6 +275,86 @@ export function RecordingPlayer({
 
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
+  // The Export engine, driven from the player (issues #12/#13/#14): the four
+  // Export items point one engine at a different rally selection. The save
+  // dialog, live progress readout, and error surfacing live in the shared hook.
+  const {
+    progress: exportProgress,
+    error: exportError,
+    setError: setExportError,
+    runExport,
+  } = useExport()
+
+  const paths = useMemo(() => recordings.map((r) => r.path), [recordings])
+
+  // Condensed recording (#12): every rally of the open recording, gaps removed.
+  const exportCondensed = useCallback(() => {
+    if (!path) return
+    return runExport(
+      "Export condensed recording",
+      `${fileName(path).replace(/\.[^.]+$/, "")}-condensed`,
+      "export_rallies",
+      { path }
+    )
+  }, [path, runExport])
+
+  // Condensed session (#13): every rally across all the session's recordings,
+  // gaps removed, concatenated across file boundaries into one portable MP4.
+  const exportSession = useCallback(
+    () =>
+      runExport(
+        "Export condensed session",
+        `${day ?? "session"}-condensed`,
+        "export_session",
+        { paths, rallyIds: null }
+      ),
+    [day, paths, runExport]
+  )
+
+  // A targeted reel (#14): the same session engine pointed at a rally-id
+  // selection. An empty selection never reaches ffmpeg — we surface it instead.
+  const exportReel = useCallback(
+    (label: string, name: string, rallyIds: number[]) => {
+      if (rallyIds.length === 0) {
+        setExportError(`No ${label} in this session to export.`)
+        return
+      }
+      return runExport(
+        `Export ${label}`,
+        `${day ?? "session"}-${name}`,
+        "export_session",
+        { paths, rallyIds }
+      )
+    },
+    [day, paths, runExport, setExportError]
+  )
+
+  // Flagged rallies (#14): the rallies the user marked as ones that matter.
+  const exportFlagged = useCallback(
+    () =>
+      exportReel(
+        "flagged rallies",
+        "flagged",
+        session.rallies.filter((r) => r.flagged).map((r) => r.id)
+      ),
+    [exportReel, session]
+  )
+
+  // Rallies with mistakes (#14): a rally owns the annotations in its span
+  // (glossary), so a rally is a "mistake" rally if a `mistake` verdict falls
+  // inside it. Reuses the session annotations already lifted onto the axis (#11).
+  const exportMistakes = useCallback(() => {
+    const mistakeMs = sessionAnnotations
+      .filter((a) => a.verdict === "mistake")
+      .map((a) => a.globalMs)
+    const ids = session.rallies
+      .filter((r) =>
+        mistakeMs.some((ms) => ms >= r.globalStart && ms < r.globalEnd)
+      )
+      .map((r) => r.id)
+    return exportReel("rallies with mistakes", "mistakes", ids)
+  }, [exportReel, session, sessionAnnotations])
+
   // The keymap array is rebuilt only when an action's closure changes; the
   // window key handler lives in `useGlobalKeymap`.
   const keymap = useMemo<Keybinding[]>(
@@ -368,27 +449,48 @@ export function RecordingPlayer({
         >
           {day && path ? fileName(path) : null}
         </span>
-        <div className="ml-auto shrink-0">
-          {/* Export stub: the selection-driven render (CONTEXT.md) isn't built
-              yet, but its entry point lives here in the studio design. */}
+        <div className="ml-auto flex shrink-0 items-center">
+          {/* Export engine: the condensed recording (#12), the condensed
+              *session* (#13), and targeted reels (#14 — flagged rallies, rallies
+              with mistakes) all point the one engine at a different selection. */}
+          {exportError ? (
+            <span className="mr-3 text-sm text-destructive" role="alert">
+              {exportError}
+            </span>
+          ) : null}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
                 variant="outline"
                 size="sm"
+                disabled={exportProgress != null || sessionRallyCount === 0}
                 title="Render one new video from a selection of rallies."
               >
-                <DownloadIcon className="size-4" />
-                Export
+                {exportProgress != null ? (
+                  <>
+                    <Loader2Icon className="size-4 animate-spin" />
+                    Exporting… {Math.round(exportProgress * 100)}%
+                  </>
+                ) : (
+                  <>
+                    <DownloadIcon className="size-4" />
+                    Export
+                  </>
+                )}
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Export — coming soon</DropdownMenuLabel>
-              <DropdownMenuItem disabled>
+              <DropdownMenuLabel>Export</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => void exportSession()}>
                 Condensed session (gaps removed)
               </DropdownMenuItem>
-              <DropdownMenuItem disabled>Flagged rallies</DropdownMenuItem>
-              <DropdownMenuItem disabled>
+              <DropdownMenuItem onSelect={() => void exportCondensed()}>
+                Condensed recording (gaps removed)
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void exportFlagged()}>
+                Flagged rallies
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void exportMistakes()}>
                 Rallies with mistakes
               </DropdownMenuItem>
             </DropdownMenuContent>

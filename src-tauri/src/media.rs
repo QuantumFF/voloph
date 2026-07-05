@@ -118,7 +118,7 @@ pub fn extract_motion(path: &str) -> Result<Vec<f64>, String> {
 
 /// Resolve a bundled sidecar binary. Tauri places `externalBin` next to the
 /// app executable (and copies them beside the dev binary), so we look there.
-fn sidecar_path(name: &str) -> PathBuf {
+pub(crate) fn sidecar_path(name: &str) -> PathBuf {
     let file = if cfg!(windows) {
         format!("{name}.exe")
     } else {

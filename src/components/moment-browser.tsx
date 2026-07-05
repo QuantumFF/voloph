@@ -1,12 +1,20 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { ArrowLeftIcon, FlagIcon, PlayIcon, SearchXIcon } from "lucide-react"
+import {
+  ArrowLeftIcon,
+  DownloadIcon,
+  FlagIcon,
+  Loader2Icon,
+  PlayIcon,
+  SearchXIcon,
+} from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { fileName, formatClock, formatDuration } from "@/lib/format"
 import { trackedInvoke } from "@/lib/tauri"
 import { formatCaptureDay } from "@/lib/utils"
+import { useExport } from "@/components/use-export"
 import {
   ASPECTS,
   VERDICTS,
@@ -119,6 +127,28 @@ export function MomentBrowser({
     [sessions, onJump]
   )
 
+  // Export a reel of the current filter (issue #14): every rally the filter
+  // matched, across every session, stitched into one MP4 in the order shown.
+  // The backend has already resolved verdict/aspect/length/flag to rally ids, so
+  // the export just hands the session engine those ids plus each result's
+  // recording as a source (distinct paths, in first-seen order). The button is
+  // disabled on an empty result set, so this never renders nothing.
+  const {
+    progress: exportProgress,
+    error: exportError,
+    runExport,
+  } = useExport()
+
+  const exportReel = useCallback(() => {
+    if (results.length === 0) return
+    const paths = [...new Set(results.map((r) => r.recording_path))]
+    const rallyIds = results.map((r) => r.rally_id)
+    return runExport("Export filtered reel", "reel", "export_session", {
+      paths,
+      rallyIds,
+    })
+  }, [results, runExport])
+
   const active =
     filters.verdict !== null ||
     filters.aspect !== null ||
@@ -136,6 +166,34 @@ export function MomentBrowser({
         <span className="text-sm text-muted-foreground">
           Filter across every session
         </span>
+        <div className="ml-auto flex items-center">
+          {/* Export the current filter as a reel (issue #14): the same session
+              engine the player uses, pointed at the filtered rally selection. */}
+          {exportError ? (
+            <span className="mr-3 text-sm text-destructive" role="alert">
+              {exportError}
+            </span>
+          ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={exportProgress != null || results.length === 0}
+            onClick={() => void exportReel()}
+            title="Render one MP4 of every rally matching the current filter, in order."
+          >
+            {exportProgress != null ? (
+              <>
+                <Loader2Icon className="size-4 animate-spin" />
+                Exporting… {Math.round(exportProgress * 100)}%
+              </>
+            ) : (
+              <>
+                <DownloadIcon className="size-4" />
+                Export reel
+              </>
+            )}
+          </Button>
+        </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
