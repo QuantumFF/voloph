@@ -98,6 +98,8 @@ export interface Rally {
   end_ms: number
   /** Per-region confidence in [0, 1]; low values are uncertain regions. */
   confidence: number
+  /** Whether the user flagged this rally as one that matters (issue #10). */
+  flagged: boolean
 }
 
 /** Result of the `recording_timeline` command (see `src-tauri/src/db.rs`). */
@@ -112,6 +114,105 @@ export interface Timeline {
 /** One recording in the session playlist, in capture-time order. */
 export interface PlaylistRecording {
   path: string
+}
+
+/**
+ * The three verdicts an annotation can carry (CONTEXT.md): the one-keystroke
+ * classification captured in the moment. `mistake` is an outright, point-ending
+ * unforced error; `bad` is suboptimal but not point-ending; `good` is well done.
+ */
+export const VERDICTS = ["good", "bad", "mistake"] as const
+export type Verdict = (typeof VERDICTS)[number]
+
+/**
+ * The seeded aspect vocabulary (CONTEXT.md, issue #9): the dimension a verdict
+ * judges, a structured filterable field. This slice exposes the seeded list only;
+ * adding custom aspects from settings is deferred. Stored as free text in the DB
+ * (a user-editable vocabulary, not a fixed enum), so an annotation may carry an
+ * aspect outside this list without breaking.
+ */
+export const ASPECTS = [
+  "selection",
+  "execution",
+  "deception",
+  "footwork",
+  "positioning",
+] as const
+export type Aspect = (typeof ASPECTS)[number]
+
+/**
+ * A verdict annotation pinned to a recording-local timestamp (issue #8, matching
+ * `Annotation` in `src-tauri/src/db.rs`). The rally it belongs to is implied by
+ * which rally's range contains `time_ms`, not stored. Enriched (issue #9) with an
+ * optional `aspect` and free-text `note`; both null until the user sets them.
+ */
+export interface Annotation {
+  id: number
+  time_ms: number
+  verdict: Verdict
+  aspect: string | null
+  note: string | null
+}
+
+/** An annotation lifted onto the session-global axis for the timeline strip. */
+export interface SessionAnnotation {
+  id: number
+  recordingIndex: number
+  path: string
+  verdict: Verdict
+  aspect: string | null
+  note: string | null
+  /** Session-global timestamp (what the strip draws). */
+  globalMs: number
+}
+
+/**
+ * Lift every placed recording's annotations onto the session-global axis (issue
+ * #8), so their markers sit at the right spot on the one continuous strip. A
+ * recording that isn't placed yet (unknown duration) contributes nothing, since
+ * it has no offset. Ordered by global timestamp.
+ */
+export function buildSessionAnnotations(
+  session: SessionModel,
+  annotations: Record<string, Annotation[]>
+): SessionAnnotation[] {
+  const out: SessionAnnotation[] = []
+  for (const seg of session.segments) {
+    if (seg.durationMs == null) continue
+    for (const a of annotations[seg.path] ?? []) {
+      out.push({
+        id: a.id,
+        recordingIndex: seg.index,
+        path: seg.path,
+        verdict: a.verdict,
+        aspect: a.aspect,
+        note: a.note,
+        globalMs: seg.offsetMs + a.time_ms,
+      })
+    }
+  }
+  return out.sort((a, b) => a.globalMs - b.globalMs)
+}
+
+/**
+ * A rally returned by the cross-session filter (issue #11), matching
+ * `FilteredRally` in `src-tauri/src/db.rs`. Carries enough context to identify
+ * it and jump to it — the containing recording's `recording_path` opened at
+ * `start_ms`, named by `capture_day`. `annotations` holds the matching moments
+ * when the filter carried a verdict/aspect, empty for a length/flag-only filter.
+ */
+export interface FilteredRally {
+  session_id: number
+  capture_day: string
+  recording_id: number
+  recording_path: string
+  rally_id: number
+  start_ms: number
+  end_ms: number
+  /** Derived from duration (CONTEXT.md), never from quality. */
+  long: boolean
+  flagged: boolean
+  annotations: Annotation[]
 }
 
 /**
@@ -142,6 +243,8 @@ export interface SessionRally {
   globalStart: number
   globalEnd: number
   confidence: number
+  /** Whether the user flagged this rally as one that matters (issue #10). */
+  flagged: boolean
 }
 
 /** The whole session stitched onto one continuous axis. */
@@ -196,6 +299,7 @@ export function buildSessionModel(
         globalStart: seg.offsetMs + r.start_ms,
         globalEnd: seg.offsetMs + r.end_ms,
         confidence: r.confidence,
+        flagged: r.flagged,
       })
     }
   }
@@ -268,9 +372,7 @@ export function nextRallyMs(rallies: Rally[], ms: number): number | null {
  * - `none`: no rallies at all.
  */
 export type PrevRallyAction =
-  | { kind: "seek"; ms: number }
-  | { kind: "prev-recording" }
-  | { kind: "none" }
+  { kind: "seek"; ms: number } | { kind: "prev-recording" } | { kind: "none" }
 
 export function prevRallyAction(
   rallies: Rally[],
@@ -399,7 +501,13 @@ export function adjustRallyEdit(
   return {
     kind: "ops",
     ops: [
-      { command: "update_rally", path: rally.path, rallyId: rally.id, startMs, endMs },
+      {
+        command: "update_rally",
+        path: rally.path,
+        rallyId: rally.id,
+        startMs,
+        endMs,
+      },
     ],
   }
 }

@@ -207,6 +207,97 @@ async fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<
     db::delete_rally(&conn, &path, rally_id).map_err(|e| e.to_string())
 }
 
+/// Set a rally's flag (issue #10 — "this rally matters", the source material for
+/// an export reel). Scoped to the recording at `path` like the inline edits;
+/// persists immediately so it survives restart. Returns whether a rally was found.
+#[tauri::command]
+async fn set_rally_flag(
+    db: State<'_, Db>,
+    path: String,
+    rally_id: i64,
+    flagged: bool,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::set_rally_flag(&conn, &path, rally_id, flagged).map_err(|e| e.to_string())
+}
+
+/// Drop a verdict annotation at `time_ms` (recording-local) on the recording at
+/// `path` (issue #8 — the fast capture path: `good`/`bad`/`mistake`, no pause).
+/// Persists immediately, pinned to absolute time so it survives restart; returns
+/// the new annotation's id, or `None` when `path` is not a registered recording.
+#[tauri::command]
+async fn add_annotation(
+    db: State<'_, Db>,
+    path: String,
+    time_ms: i64,
+    verdict: String,
+) -> Result<Option<i64>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::add_annotation(&conn, &path, time_ms, &verdict).map_err(|e| e.to_string())
+}
+
+/// Every verdict annotation on the recording at `path`, in timestamp order, so
+/// the player can lay their markers over the timeline strip (issue #8).
+#[tauri::command]
+async fn recording_annotations(
+    db: State<'_, Db>,
+    path: String,
+) -> Result<Vec<db::Annotation>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::recording_annotations(&conn, &path).map_err(|e| e.to_string())
+}
+
+/// Enrich or re-classify one annotation (issue #9): set its verdict, structured
+/// aspect, and free-text note. Scoped to the recording at `path`; `aspect`/`note`
+/// as given (`None` clears). Returns `false` when the annotation is not found.
+#[tauri::command]
+async fn update_annotation(
+    db: State<'_, Db>,
+    path: String,
+    id: i64,
+    verdict: String,
+    aspect: Option<String>,
+    note: Option<String>,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::update_annotation(&conn, &path, id, &verdict, aspect.as_deref(), note.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// Remove one annotation (issue #9). Scoped to the recording at `path`. Returns
+/// `false` when the annotation is not found.
+#[tauri::command]
+async fn delete_annotation(db: State<'_, Db>, path: String, id: i64) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::delete_annotation(&conn, &path, id).map_err(|e| e.to_string())
+}
+
+/// Cross-session filter over rallies and their annotations (issue #11 — the
+/// payoff of the structured data). Every argument is optional and they combine
+/// with AND; `verdict`/`aspect` keep rallies containing a matching moment (and
+/// attach those moments), `length` (`Some(true)` = long, derived from duration)
+/// and `flagged` filter the rally itself. Returns the matching rallies newest
+/// session first, each carrying enough context to open the right recording at its
+/// timestamp.
+#[tauri::command]
+async fn filter_moments(
+    db: State<'_, Db>,
+    verdict: Option<String>,
+    aspect: Option<String>,
+    length: Option<bool>,
+    flagged: Option<bool>,
+) -> Result<Vec<db::FilteredRally>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::filter_moments(
+        &conn,
+        verdict.as_deref(),
+        aspect.as_deref(),
+        length,
+        flagged,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Start the background media worker unless one is already running. It drains
 /// every pending unit of work — probe each `unknown` recording for its frame
 /// rate, then segment each unsegmented one (ADR 0002) — without holding the DB
@@ -432,6 +523,12 @@ pub fn run() {
             update_rally,
             add_rally,
             delete_rally,
+            set_rally_flag,
+            add_annotation,
+            recording_annotations,
+            update_annotation,
+            delete_annotation,
+            filter_moments,
             mpv::mpv_load,
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,

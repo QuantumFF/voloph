@@ -2,6 +2,8 @@
 
 import { useEffect } from "react"
 
+import type { Verdict } from "@/components/recording-player-transport"
+
 /** Arrow-seek step sizes in ms (session-global), by modifier. */
 const SEEK_FINE_MS = 2500 // Ctrl+←/→
 const SEEK_DEFAULT_MS = 5000 // ←/→
@@ -37,6 +39,8 @@ export interface KeymapActions {
   toggleMute: () => void
   stepSpeed: (dir: 1 | -1) => void
   resetSpeed: () => void
+  annotate: (verdict: Verdict) => void
+  flagCurrentRally: () => void
   toggleCheatSheet: () => void
 }
 
@@ -58,6 +62,8 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     toggleMute,
     stepSpeed,
     resetSpeed,
+    annotate,
+    flagCurrentRally,
     toggleCheatSheet,
   } = actions
   const plain = (e: KeyboardEvent) =>
@@ -154,6 +160,30 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
       label: "Mute",
       match: (e) => plain(e) && e.key.toLowerCase() === "m",
       run: toggleMute,
+    },
+    {
+      keys: ["1"],
+      label: "Annotate: good at playhead",
+      match: (e) => plain(e) && e.key === "1",
+      run: () => annotate("good"),
+    },
+    {
+      keys: ["2"],
+      label: "Annotate: bad at playhead",
+      match: (e) => plain(e) && e.key === "2",
+      run: () => annotate("bad"),
+    },
+    {
+      keys: ["3"],
+      label: "Annotate: mistake at playhead",
+      match: (e) => plain(e) && e.key === "3",
+      run: () => annotate("mistake"),
+    },
+    {
+      keys: ["X"],
+      label: "Flag / unflag the current rally",
+      match: (e) => plain(e) && e.key.toLowerCase() === "x",
+      run: flagCurrentRally,
     },
     {
       keys: ["Ctrl+-", "Ctrl+="],

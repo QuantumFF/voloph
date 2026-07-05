@@ -39,6 +39,7 @@ const RESUME_TICK_TOL_MS = 250
 export function useSessionPlayback({
   recordings,
   startIndex,
+  startMs,
   timelines,
   session,
   segmentOffset,
@@ -46,6 +47,11 @@ export function useSessionPlayback({
   recordings: PlaylistRecording[]
   /** Index of the recording to open first. */
   startIndex: number
+  /**
+   * Recording-local time (ms) to open the first recording at — a jump to a
+   * specific moment (issue #11). Undefined for a normal review (starts at 0).
+   */
+  startMs?: number
   /** Every recording's draft timeline, keyed by path. */
   timelines: Record<string, Timeline>
   /** The whole session stitched onto one continuous axis. */
@@ -85,7 +91,9 @@ export function useSessionPlayback({
   const resumeTargetRef = useRef<number | null>(null)
 
   // The playhead within the current recording (ms), from mpv's `time-pos`.
-  const [currentMs, setCurrentMs] = useState(0)
+  // Seeded with a jump target (issue #11) so the optimistic playhead is right
+  // from the first render, before mpv's first tick arrives.
+  const [currentMs, setCurrentMs] = useState(startMs ?? 0)
   const [looping, setLooping] = useState(false)
   // Whether gap-free playback is on (the North Star default). When off, the
   // playhead runs straight through the gaps between rallies — a manual "watch
@@ -98,7 +106,12 @@ export function useSessionPlayback({
   const [index, setIndex] = useState(() =>
     Math.min(Math.max(startIndex, 0), Math.max(recordings.length - 1, 0))
   )
-  const [pendingSeek, setPendingSeek] = useState<Resume | null>(null)
+  // A jump to a specific moment (issue #11) opens at `startMs`; the mount load
+  // effect bakes this `{ atMs }` into `mpv_load` just like a strip-click crossing,
+  // so the recording opens already seeked. Null for a normal review.
+  const [pendingSeek, setPendingSeek] = useState<Resume | null>(
+    startMs != null ? { atMs: startMs } : null
+  )
   const path = recordings[index]?.path ?? null
   const timeline = path ? (timelines[path] ?? null) : null
 

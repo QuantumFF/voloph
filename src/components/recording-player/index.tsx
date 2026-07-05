@@ -25,12 +25,15 @@ import { formatCaptureDay } from "@/lib/utils"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
+  buildSessionAnnotations,
   buildSessionModel,
   clamp,
   type PlaylistRecording,
   type SessionModel,
+  type Verdict,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
+import { useAnnotations } from "./use-annotations"
 import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
 import { useMpvTransport } from "./use-mpv-transport"
 import { useSessionPlayback } from "./use-session-playback"
@@ -52,6 +55,12 @@ interface RecordingPlayerProps {
   recordings: PlaylistRecording[]
   /** Index of the recording to open first (defaults to the session's start). */
   startIndex?: number
+  /**
+   * Recording-local time (ms) to open the first recording at — a jump from the
+   * cross-session filter to a specific moment (issue #11). Omitted for a normal
+   * session review, which starts from the first rally.
+   */
+  startMs?: number
   /** The session's capture day, shown in the top bar. */
   day?: string
   /** Return to the session list. */
@@ -102,6 +111,7 @@ export const LONG_RALLY_MS = 15_000
 export function RecordingPlayer({
   recordings,
   startIndex = 0,
+  startMs,
   day,
   onBack,
 }: RecordingPlayerProps) {
@@ -168,6 +178,7 @@ export function RecordingPlayer({
   } = useSessionPlayback({
     recordings,
     startIndex,
+    startMs,
     timelines,
     session,
     segmentOffset,
@@ -208,15 +219,58 @@ export function RecordingPlayer({
 
   // The five inline corrections (issue #7): boundary math behind the transport
   // seam, persistence + timeline refresh behind this hook.
-  const { adjustRally, addAtPlayhead, deleteRally, splitRally, mergeRallies } =
-    useTimelineEdits({
-      session,
-      path,
-      index,
-      currentMs,
-      segmentOffset,
-      refreshTimeline,
-    })
+  const {
+    adjustRally,
+    addAtPlayhead,
+    deleteRally,
+    splitRally,
+    mergeRallies,
+    toggleFlag,
+  } = useTimelineEdits({
+    session,
+    path,
+    index,
+    currentMs,
+    segmentOffset,
+    refreshTimeline,
+  })
+
+  // Verdict annotations (issue #8): fetched per recording, dropped at the
+  // playhead by a hotkey, and stitched onto the session axis for the strip.
+  const {
+    annotations,
+    add: addAnnotation,
+    update: updateAnnotation,
+    remove: removeAnnotation,
+  } = useAnnotations(recordings)
+  const sessionAnnotations = useMemo(
+    () => buildSessionAnnotations(session, annotations),
+    [session, annotations]
+  )
+  const annotate = useCallback(
+    (verdict: Verdict) => {
+      if (path) addAnnotation(path, currentMs, verdict)
+    },
+    [path, currentMs, addAnnotation]
+  )
+
+  // The rally under the playhead (session-global), driving the rail highlight,
+  // the inspector, and the flag hotkey; -1 while the playhead sits in a gap or
+  // before placement.
+  const currentRallyIndex =
+    globalPlayheadMs == null
+      ? -1
+      : session.rallies.findIndex(
+          (r) =>
+            globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
+        )
+  const currentRally =
+    currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
+
+  // Flag / unflag the rally under the playhead (issue #10); a no-op in a gap.
+  const flagCurrentRally = useCallback(() => {
+    if (currentRally) toggleFlag(currentRally)
+  }, [currentRally, toggleFlag])
 
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
@@ -238,6 +292,8 @@ export function RecordingPlayer({
         toggleMute,
         stepSpeed,
         resetSpeed,
+        annotate,
+        flagCurrentRally,
         toggleCheatSheet,
       }),
     [
@@ -253,21 +309,24 @@ export function RecordingPlayer({
       toggleMute,
       stepSpeed,
       resetSpeed,
+      annotate,
+      flagCurrentRally,
       toggleCheatSheet,
     ]
   )
 
   useGlobalKeymap(keymap)
 
-  // The rally under the playhead (session-global), driving the rail highlight
-  // and the inspector; -1 while the playhead sits in a gap or before placement.
-  const currentRallyIndex =
-    globalPlayheadMs == null
-      ? -1
-      : session.rallies.findIndex(
-          (r) =>
-            globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
-        )
+  // Annotations whose timestamp falls inside the rally under the playhead
+  // (glossary: a rally owns the annotations in its span), for the inspector.
+  const rallyAnnotations = useMemo(() => {
+    const rally =
+      currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
+    if (!rally) return []
+    return sessionAnnotations.filter(
+      (a) => a.globalMs >= rally.globalStart && a.globalMs < rally.globalEnd
+    )
+  }, [currentRallyIndex, session, sessionAnnotations])
 
   // Status-bar readouts: how segmentation stands across the whole session.
   const segmentingNow =
@@ -341,6 +400,7 @@ export function RecordingPlayer({
         <RallyRail
           session={session}
           recordings={recordings}
+          annotations={sessionAnnotations}
           currentRallyIndex={currentRallyIndex}
           onSelectRally={(rally) => seekSession(rally.globalStart)}
         />
@@ -352,7 +412,10 @@ export function RecordingPlayer({
             className="mx-4 mt-3 mb-1 min-h-0 flex-1 rounded-lg bg-black"
           />
           {error ? (
-            <div className="shrink-0 px-4 pt-2 text-sm text-destructive" role="alert">
+            <div
+              className="shrink-0 px-4 pt-2 text-sm text-destructive"
+              role="alert"
+            >
               {error}
             </div>
           ) : null}
@@ -379,6 +442,7 @@ export function RecordingPlayer({
             <SessionTimeline
               ref={timelineRef}
               session={session}
+              annotations={sessionAnnotations}
               globalPlayheadMs={globalPlayheadMs}
               pxPerSec={pxPerSec}
               setPxPerSec={setPxPerSec}
@@ -406,6 +470,11 @@ export function RecordingPlayer({
             currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
           }
           rallyNumber={currentRallyIndex + 1}
+          annotations={rallyAnnotations}
+          onAnnotate={annotate}
+          onToggleFlag={flagCurrentRally}
+          onUpdate={updateAnnotation}
+          onDelete={removeAnnotation}
         />
       </div>
 
@@ -423,8 +492,8 @@ export function RecordingPlayer({
           <span>No rallies detected.</span>
         ) : (
           <span className="tabular-nums">
-            {sessionRallyCount}{" "}
-            {sessionRallyCount === 1 ? "rally" : "rallies"} across the session
+            {sessionRallyCount} {sessionRallyCount === 1 ? "rally" : "rallies"}{" "}
+            across the session
             {uncertainCount > 0 ? (
               <>
                 {" · "}
@@ -443,8 +512,8 @@ export function RecordingPlayer({
         {unprocessed > 0 ? (
           <span className="flex items-center gap-1.5">
             <Loader2Icon className="size-3.5 animate-spin" />
-            {unprocessed} more{" "}
-            {unprocessed === 1 ? "recording" : "recordings"} preparing
+            {unprocessed} more {unprocessed === 1 ? "recording" : "recordings"}{" "}
+            preparing
           </span>
         ) : null}
         {recordings.length > 1 ? (
