@@ -400,6 +400,7 @@ export function RecordingPlayer({
         <RallyRail
           session={session}
           recordings={recordings}
+          annotations={sessionAnnotations}
           currentRallyIndex={currentRallyIndex}
           onSelectRally={(rally) => seekSession(rally.globalStart)}
         />
