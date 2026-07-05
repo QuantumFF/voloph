@@ -20,12 +20,9 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { listen } from "@tauri-apps/api/event"
-import { save } from "@tauri-apps/plugin-dialog"
-
 import { fileName } from "@/lib/format"
-import { trackedInvoke } from "@/lib/tauri"
 import { formatCaptureDay } from "@/lib/utils"
+import { useExport } from "@/components/use-export"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
@@ -278,45 +275,15 @@ export function RecordingPlayer({
 
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
-  // The Export engine, driven from the player (issues #12/#13/#14). `null` = idle;
-  // otherwise a fraction in [0, 1] driving the progress readout. `exportError`
-  // surfaces a failed or empty-selection export in the header.
-  const [exportProgress, setExportProgress] = useState<number | null>(null)
-  const [exportError, setExportError] = useState<string | null>(null)
-
-  // Run one export: pick a destination, then invoke `command`/`args` with a live
-  // progress readout. All four Export items funnel through here so the save
-  // dialog, progress listener, and error surfacing live in one place.
-  const runExport = useCallback(
-    async (
-      title: string,
-      defaultName: string,
-      command: string,
-      args: Record<string, unknown>
-    ) => {
-      if (exportProgress != null) return
-      setExportError(null)
-      const output = await save({
-        title,
-        defaultPath: `${defaultName}.mp4`,
-        filters: [{ name: "Video", extensions: ["mp4"] }],
-      })
-      if (!output) return
-      setExportProgress(0)
-      const unlisten = await listen<number>("export:progress", (e) =>
-        setExportProgress(e.payload)
-      )
-      try {
-        await trackedInvoke(command, { ...args, output })
-      } catch (e) {
-        setExportError(String(e))
-      } finally {
-        unlisten()
-        setExportProgress(null)
-      }
-    },
-    [exportProgress]
-  )
+  // The Export engine, driven from the player (issues #12/#13/#14): the four
+  // Export items point one engine at a different rally selection. The save
+  // dialog, live progress readout, and error surfacing live in the shared hook.
+  const {
+    progress: exportProgress,
+    error: exportError,
+    setError: setExportError,
+    runExport,
+  } = useExport()
 
   const paths = useMemo(() => recordings.map((r) => r.path), [recordings])
 
@@ -359,7 +326,7 @@ export function RecordingPlayer({
         { paths, rallyIds }
       )
     },
-    [day, paths, runExport]
+    [day, paths, runExport, setExportError]
   )
 
   // Flagged rallies (#14): the rallies the user marked as ones that matter.
