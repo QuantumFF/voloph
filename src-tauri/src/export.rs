@@ -1,13 +1,15 @@
 //! Export engine: render one new MP4 from a **selection of rallies** (CONTEXT.md,
-//! issue #12). Given a recording's path and a set of rally intervals, cut those
-//! rallies out of the source and concatenate them in order into a single clean
-//! file — no burned-in overlays, source never touched (non-destructive).
+//! issue #12). Given one or more source recordings and a set of rally intervals
+//! (each naming its source), cut those rallies out and concatenate them in order
+//! into a single clean file — no burned-in overlays, sources never touched
+//! (non-destructive).
 //!
 //! One ffmpeg sidecar invocation (ADR 0004) does the whole job with a
 //! `filter_complex` of per-rally `trim`s fed into `concat`. Because the cuts run
 //! through filters (not stream copy) the output is re-encoded, so cut points that
-//! don't land on a keyframe are frame-accurate — the acceptance criterion. This
-//! is the one engine issues #13/#14 reuse by handing it a different selection.
+//! don't land on a keyframe are frame-accurate — and cuts from **different**
+//! source files concatenate cleanly (the condensed-session case, issue #13).
+//! This is the one engine issues #13/#14 reuse by handing it a different selection.
 //!
 //! Progress is reported by parsing ffmpeg's `-progress pipe:1` stream and emitting
 //! the fraction of the selected duration muxed so far as a Tauri event.
@@ -23,19 +25,28 @@ use crate::media::sidecar_path;
 pub const EVENT_PROGRESS: &str = "export:progress";
 
 /// A rally interval to include in the export, in recording-local milliseconds.
+/// `src` indexes into the `srcs` slice given to [`export`] — the recording this
+/// rally is cut from, so a session mixes cuts from several files (issue #13).
 #[derive(Debug, Clone, Copy)]
 pub struct Cut {
+    pub src: usize,
     pub start_ms: i64,
     pub end_ms: i64,
 }
 
-/// Cut `cuts` out of the recording at `src` and concatenate them, in the given
-/// order, into a new MP4 at `dest`. Re-encodes (H.264/AAC) so non-keyframe cut
-/// points are exact. Emits [`EVENT_PROGRESS`] as ffmpeg muxes. Errors if there
-/// is nothing to export, or the sidecar cannot run / exits non-zero.
-pub fn export(app: &AppHandle, src: &str, dest: &str, cuts: &[Cut]) -> Result<(), String> {
+/// Cut `cuts` out of the `srcs` recordings and concatenate them, in the given
+/// order, into a new MP4 at `dest`. Each cut's `src` field indexes `srcs`, so a
+/// single output can stitch rallies from several files (the condensed session).
+/// Re-encodes (H.264/AAC) so non-keyframe cut points are exact and cuts from
+/// different sources join cleanly. Emits [`EVENT_PROGRESS`] as ffmpeg muxes.
+/// Errors if there is nothing to export, or the sidecar cannot run / exits
+/// non-zero.
+pub fn export(app: &AppHandle, srcs: &[&str], dest: &str, cuts: &[Cut]) -> Result<(), String> {
     if cuts.is_empty() {
         return Err("no rallies selected to export".to_string());
+    }
+    if cuts.iter().any(|c| c.src >= srcs.len()) {
+        return Err("export cut references a missing source".to_string());
     }
 
     // Total selected duration, so a progress tick can be turned into a fraction.
@@ -44,16 +55,18 @@ pub fn export(app: &AppHandle, src: &str, dest: &str, cuts: &[Cut]) -> Result<()
         return Err("selected rallies have no duration".to_string());
     }
 
-    // Build the trim+concat filter: one trim per rally on both video and audio,
-    // then concat them all back-to-back. `setpts`/`asetpts` rebase each segment's
-    // timestamps to zero so the pieces butt up seamlessly.
+    // Build the trim+concat filter: one trim per rally on both video and audio
+    // (each pulling from its own source input `[{src}:...]`), then concat them all
+    // back-to-back. `setpts`/`asetpts` rebase each segment's timestamps to zero so
+    // the pieces butt up seamlessly across file boundaries too.
     let mut filter = String::new();
     for (i, c) in cuts.iter().enumerate() {
         let start = c.start_ms as f64 / 1000.0;
         let end = c.end_ms as f64 / 1000.0;
+        let s = c.src;
         filter.push_str(&format!(
-            "[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];\
-             [0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}];"
+            "[{s}:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];\
+             [{s}:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}];"
         ));
     }
     for i in 0..cuts.len() {
@@ -61,10 +74,13 @@ pub fn export(app: &AppHandle, src: &str, dest: &str, cuts: &[Cut]) -> Result<()
     }
     filter.push_str(&format!("concat=n={}:v=1:a=1[v][a]", cuts.len()));
 
-    let mut child = Command::new(sidecar_path("ffmpeg"))
+    let mut cmd = Command::new(sidecar_path("ffmpeg"));
+    cmd.args(["-v", "error", "-nostats", "-y"]);
+    for src in srcs {
+        cmd.args(["-i", src]);
+    }
+    let mut child = cmd
         .args([
-            "-v", "error", "-nostats", "-y",
-            "-i", src,
             "-filter_complex", &filter,
             "-map", "[v]", "-map", "[a]",
             // ponytail: software libx264 always works (ADR 0005); GPU-encoder
@@ -125,12 +141,13 @@ mod tests {
         assert!(cuts.is_empty());
     }
 
-    /// Total duration sums the selected spans (the progress denominator).
+    /// Total duration sums the selected spans (the progress denominator), even
+    /// when the cuts come from different sources (the condensed session).
     #[test]
     fn total_duration_sums_cuts() {
         let cuts = [
-            Cut { start_ms: 0, end_ms: 1000 },
-            Cut { start_ms: 5000, end_ms: 5500 },
+            Cut { src: 0, start_ms: 0, end_ms: 1000 },
+            Cut { src: 1, start_ms: 5000, end_ms: 5500 },
         ];
         let total: i64 = cuts.iter().map(|c| (c.end_ms - c.start_ms).max(0)).sum();
         assert_eq!(total, 1500);

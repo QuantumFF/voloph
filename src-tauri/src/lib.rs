@@ -325,11 +325,47 @@ async fn export_rallies(
         .iter()
         .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
         .map(|r| export::Cut {
+            src: 0,
             start_ms: r.start_ms,
             end_ms: r.end_ms,
         })
         .collect();
-    export::export(&app, &path, &output, &cuts)
+    export::export(&app, &[&path], &output, &cuts)
+}
+
+/// Render one new MP4 at `output` from **every rally of a whole session** — all
+/// the rallies of `paths` (the session's recordings, given in capture order),
+/// gaps removed, concatenated across file boundaries into one portable file
+/// (issue #13, the headline condensed-session export). Each recording becomes an
+/// ffmpeg input; its rallies are cut from it and stitched in, in the order the
+/// paths arrive. Sources are never modified. Progress is emitted on
+/// [`export::EVENT_PROGRESS`]. The DB lock is held only for the timeline reads.
+#[tauri::command]
+async fn export_session(
+    app: AppHandle,
+    db: State<'_, Db>,
+    paths: Vec<String>,
+    output: String,
+) -> Result<(), String> {
+    let cuts: Vec<export::Cut> = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut cuts = Vec::new();
+        for (src, path) in paths.iter().enumerate() {
+            let timeline = db::recording_timeline(&conn, path)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("recording is not registered: {path}"))?;
+            // Timeline order is already start_ms-ascending, so appending each
+            // recording's rallies in turn yields capture-then-timeline order.
+            cuts.extend(timeline.rallies.iter().map(|r| export::Cut {
+                src,
+                start_ms: r.start_ms,
+                end_ms: r.end_ms,
+            }));
+        }
+        cuts
+    };
+    let srcs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    export::export(&app, &srcs, &output, &cuts)
 }
 
 /// Start the background media worker unless one is already running. It drains
@@ -564,6 +600,7 @@ pub fn run() {
             delete_annotation,
             filter_moments,
             export_rallies,
+            export_session,
             mpv::mpv_load,
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,

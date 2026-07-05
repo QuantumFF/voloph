@@ -303,6 +303,33 @@ export function RecordingPlayer({
     }
   }, [path, exportProgress])
 
+  // Export the *whole session* — every rally across all its recordings, gaps
+  // removed, concatenated across file boundaries into one portable MP4 (issue
+  // #13, the headline condensed-session export). Same engine and progress
+  // readout, handed every recording's path in capture order.
+  const exportSession = useCallback(async () => {
+    if (recordings.length === 0 || exportProgress != null) return
+    const output = await save({
+      title: "Export condensed session",
+      defaultPath: `${day ?? "session"}-condensed.mp4`,
+      filters: [{ name: "Video", extensions: ["mp4"] }],
+    })
+    if (!output) return
+    setExportProgress(0)
+    const unlisten = await listen<number>("export:progress", (e) =>
+      setExportProgress(e.payload)
+    )
+    try {
+      await trackedInvoke("export_session", {
+        paths: recordings.map((r) => r.path),
+        output,
+      })
+    } finally {
+      unlisten()
+      setExportProgress(null)
+    }
+  }, [recordings, day, exportProgress])
+
   // The keymap array is rebuilt only when an action's closure changes; the
   // window key handler lives in `useGlobalKeymap`.
   const keymap = useMemo<Keybinding[]>(
@@ -398,9 +425,10 @@ export function RecordingPlayer({
           {day && path ? fileName(path) : null}
         </span>
         <div className="ml-auto shrink-0">
-          {/* Export engine (issue #12): the condensed-recording case is live;
-              the flagged/mistake reels (issues #13/#14) point the same engine at
-              a rally-id selection and land next. */}
+          {/* Export engine: the condensed recording (#12) and the headline
+              condensed *session* — every rally across all its recordings, gaps
+              removed, one portable file (#13) — are live; the flagged/mistake
+              reels (#14) point the same engine at a rally-id selection next. */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
@@ -424,6 +452,9 @@ export function RecordingPlayer({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuLabel>Export</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => void exportSession()}>
+                Condensed session (gaps removed)
+              </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => void exportCondensed()}>
                 Condensed recording (gaps removed)
               </DropdownMenuItem>
