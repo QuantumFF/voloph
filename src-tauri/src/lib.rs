@@ -1,4 +1,5 @@
 mod db;
+mod export;
 mod media;
 mod segment;
 
@@ -298,6 +299,39 @@ async fn filter_moments(
     .map_err(|e| e.to_string())
 }
 
+/// Render one new MP4 at `output` from a selection of the rallies of the
+/// recording at `path` (issue #12 — the Export engine). `rally_ids` picks which
+/// rallies; `None` exports **all** of them (the condensed-recording case). The
+/// rallies are cut from the source and concatenated in timeline order; the source
+/// is never modified. Progress is emitted on [`export::EVENT_PROGRESS`]. The slow
+/// ffmpeg run happens off the DB lock (only the timeline read holds it).
+#[tauri::command]
+async fn export_rallies(
+    app: AppHandle,
+    db: State<'_, Db>,
+    path: String,
+    output: String,
+    rally_ids: Option<Vec<i64>>,
+) -> Result<(), String> {
+    let timeline = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::recording_timeline(&conn, &path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "recording is not registered".to_string())?
+    };
+    // Timeline order is already start_ms-ascending; keep only the selected rallies.
+    let cuts: Vec<export::Cut> = timeline
+        .rallies
+        .iter()
+        .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
+        .map(|r| export::Cut {
+            start_ms: r.start_ms,
+            end_ms: r.end_ms,
+        })
+        .collect();
+    export::export(&app, &path, &output, &cuts)
+}
+
 /// Start the background media worker unless one is already running. It drains
 /// every pending unit of work — probe each `unknown` recording for its frame
 /// rate, then segment each unsegmented one (ADR 0002) — without holding the DB
@@ -529,6 +563,7 @@ pub fn run() {
             update_annotation,
             delete_annotation,
             filter_moments,
+            export_rallies,
             mpv::mpv_load,
             mpv::mpv_set_pause,
             mpv::mpv_set_rect,

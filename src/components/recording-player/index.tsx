@@ -20,7 +20,11 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { listen } from "@tauri-apps/api/event"
+import { save } from "@tauri-apps/plugin-dialog"
+
 import { fileName } from "@/lib/format"
+import { trackedInvoke } from "@/lib/tauri"
 import { formatCaptureDay } from "@/lib/utils"
 import {
   SPEED_LADDER,
@@ -274,6 +278,31 @@ export function RecordingPlayer({
 
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
+  // Export the current recording's rallies, gaps removed, to a file the user
+  // picks (issue #12). `null` = idle; otherwise a fraction in [0, 1] driving the
+  // progress readout. One engine — the flagged/mistake reels (issues #13/#14)
+  // will call the same command with a rally-id selection.
+  const [exportProgress, setExportProgress] = useState<number | null>(null)
+  const exportCondensed = useCallback(async () => {
+    if (!path || exportProgress != null) return
+    const output = await save({
+      title: "Export condensed recording",
+      defaultPath: `${fileName(path).replace(/\.[^.]+$/, "")}-condensed.mp4`,
+      filters: [{ name: "Video", extensions: ["mp4"] }],
+    })
+    if (!output) return
+    setExportProgress(0)
+    const unlisten = await listen<number>("export:progress", (e) =>
+      setExportProgress(e.payload)
+    )
+    try {
+      await trackedInvoke("export_rallies", { path, output })
+    } finally {
+      unlisten()
+      setExportProgress(null)
+    }
+  }, [path, exportProgress])
+
   // The keymap array is rebuilt only when an action's closure changes; the
   // window key handler lives in `useGlobalKeymap`.
   const keymap = useMemo<Keybinding[]>(
@@ -369,23 +398,34 @@ export function RecordingPlayer({
           {day && path ? fileName(path) : null}
         </span>
         <div className="ml-auto shrink-0">
-          {/* Export stub: the selection-driven render (CONTEXT.md) isn't built
-              yet, but its entry point lives here in the studio design. */}
+          {/* Export engine (issue #12): the condensed-recording case is live;
+              the flagged/mistake reels (issues #13/#14) point the same engine at
+              a rally-id selection and land next. */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
                 variant="outline"
                 size="sm"
+                disabled={exportProgress != null || sessionRallyCount === 0}
                 title="Render one new video from a selection of rallies."
               >
-                <DownloadIcon className="size-4" />
-                Export
+                {exportProgress != null ? (
+                  <>
+                    <Loader2Icon className="size-4 animate-spin" />
+                    Exporting… {Math.round(exportProgress * 100)}%
+                  </>
+                ) : (
+                  <>
+                    <DownloadIcon className="size-4" />
+                    Export
+                  </>
+                )}
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Export — coming soon</DropdownMenuLabel>
-              <DropdownMenuItem disabled>
-                Condensed session (gaps removed)
+              <DropdownMenuLabel>Export</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => void exportCondensed()}>
+                Condensed recording (gaps removed)
               </DropdownMenuItem>
               <DropdownMenuItem disabled>Flagged rallies</DropdownMenuItem>
               <DropdownMenuItem disabled>
