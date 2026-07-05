@@ -422,3 +422,10 @@ check-cfg = [
     "cfg(linux)",
     "cfg(gtk)",
 ]
+
+# VOLOPH PATCH: vendored path deps don't get cargo's --cap-lints suppression,
+# so upstream's deprecated webkit2gtk `run_javascript` calls would warn on
+# every build. Same-as-upstream code, just silenced.
+[lints.rust.deprecated]
+level = "allow"
+priority = 0
