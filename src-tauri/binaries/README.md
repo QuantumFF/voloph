@@ -16,23 +16,28 @@ ffmpeg-<target-triple>[.exe]
 ffprobe-<target-triple>[.exe]
 ```
 
-Find the triple with `rustc -vV | grep host`. The committed binaries cover
-`x86_64-unknown-linux-gnu`.
+Find the triple with `rustc -vV | grep host`.
 
-## Sourcing per platform
+## Getting them
 
-Drop a static (or self-contained) ffmpeg/ffprobe build for the target into this
-directory under the names above:
+The binaries are **not committed** (`ffmpeg-*` / `ffprobe-*` are gitignored);
+only this README is tracked. Populate them for your host triple with:
 
-- **Linux** `x86_64-unknown-linux-gnu` — e.g. John Van Sickle's static builds
-  (<https://johnvansickle.com/ffmpeg/>), or copy the system `ffmpeg`/`ffprobe`.
-- **macOS** `aarch64-apple-darwin` / `x86_64-apple-darwin` — e.g.
-  <https://evermeet.cx/ffmpeg/>.
-- **Windows** `x86_64-pc-windows-msvc` — e.g. gyan.dev builds; add the `.exe`
-  suffix.
+```
+scripts/fetch-sidecars.sh          # host triple, via `rustc -vV`
+scripts/fetch-sidecars.sh <triple> # cross-fetch a specific target
+```
 
-Prefer a statically linked build so the sidecar does not depend on system
-shared libraries at runtime.
+The script pulls a static **LGPL** build from
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) and installs
+it here under the names above. The release workflow runs the same script per
+runner, so a fresh clone needs one `scripts/fetch-sidecars.sh` before its first
+`tauri dev` / `tauri build`.
+
+Other sources, if you provision by hand instead: John Van Sickle static builds
+for Linux (<https://johnvansickle.com/ffmpeg/>), gyan.dev for Windows (add the
+`.exe` suffix). Prefer a statically linked build so the sidecar does not depend
+on system shared libraries at runtime.
 
 ## Licensing
 
