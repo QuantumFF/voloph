@@ -46,6 +46,16 @@ pub struct Session {
 pub struct ScanResult {
     pub registered: usize,
     pub skipped: usize,
+    /// Known recordings re-linked to a new relative path after being moved or
+    /// renamed inside the library (matched by quick hash + size; ADR 0011). Their
+    /// review state follows them, since re-linking rewrites the row's `path` and
+    /// everything else keys off the row.
+    pub relocated: usize,
+    /// Absolute paths of known recordings that could not be found anywhere under
+    /// the library after the scan — reported to the user rather than silently kept
+    /// as dead entries (ADR 0011). Their rows and review state are retained, so a
+    /// recording that reappears later (same hash + size) re-links on a later scan.
+    pub unresolved: Vec<String>,
 }
 
 /// Open (creating if needed) the metadata database and ensure the schema exists.
@@ -340,19 +350,48 @@ pub fn designate_library(conn: &mut Connection, folder: &Path) -> rusqlite::Resu
 /// into sessions by capture day. Idempotent: files already registered are left
 /// untouched, so re-scanning never duplicates. Errors when no library has been
 /// designated (ADR 0011 — scanning means scanning the library).
+///
+/// Completes the adoption pass (ADR 0011). Beyond registering new files, a video
+/// on disk that is not registered at its relative path but whose quick hash + size
+/// match a **known recording whose own file has gone missing** is treated as that
+/// recording moved or renamed inside the library: its row's `path` is rewritten to
+/// the new relative key, so its timeline, annotations, and flags follow it (they
+/// key off the row, not the path). Known recordings still absent from the library
+/// after the walk are returned as `unresolved` — retained, not deleted, so one that
+/// reappears later (same hash + size) re-links on a subsequent scan.
 pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
     let mut registered = 0usize;
     let mut skipped = 0usize;
+    let mut relocated = 0usize;
 
     let Some(library) = library_path(conn)? else {
         return Ok(ScanResult {
             registered: 0,
             skipped: 0,
+            relocated: 0,
+            unresolved: Vec::new(),
         });
     };
     let folder = Path::new(&library);
 
     let tx = conn.transaction()?;
+
+    // Known recordings that resolve under the library (relative keys — an absolute
+    // key is an unadopted outsider, ADR 0011). Track which are still present on
+    // disk; whatever remains missing after the walk is a relocation candidate or,
+    // if unmatched, unresolved.
+    let mut missing: std::collections::HashMap<String, i64> = {
+        let mut stmt = tx.prepare("SELECT id, path FROM recordings")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .filter(|(_, rel)| !Path::new(rel).is_absolute())
+            .filter(|(_, rel)| !folder.join(rel).exists())
+            .map(|(id, rel)| (rel, id))
+            .collect()
+    };
+
     for entry in walkdir::WalkDir::new(folder)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -386,8 +425,33 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
             Err(_) => continue,
         };
         let file_size = meta.len();
-        let day = capture_day(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
         let hash = quick_hash(path, file_size).unwrap_or_default();
+
+        // Relocation: an unregistered file whose quick hash + size match a known
+        // recording whose own file is gone is that recording moved/renamed inside
+        // the library. Re-link it (rewrite the row's path) so its review state
+        // follows; do not register a duplicate.
+        let moved = missing.iter().find_map(|(old_rel, &id)| {
+            let (o_size, o_hash): (i64, String) = tx
+                .query_row(
+                    "SELECT file_size, quick_hash FROM recordings WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((-1, String::new()));
+            (o_size == file_size as i64 && o_hash == hash).then(|| (old_rel.clone(), id))
+        });
+        if let Some((old_rel, id)) = moved {
+            tx.execute(
+                "UPDATE recordings SET path = ?1 WHERE id = ?2",
+                rusqlite::params![rel, id],
+            )?;
+            missing.remove(&old_rel);
+            relocated += 1;
+            continue;
+        }
+
+        let day = capture_day(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
 
         tx.execute(
             "INSERT OR IGNORE INTO sessions (capture_day) VALUES (?1)",
@@ -408,9 +472,17 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
     }
     tx.commit()?;
 
+    // Whatever known recordings are still missing after the walk could not be
+    // re-linked — report them (as absolute paths) rather than delete them.
+    let mut unresolved: Vec<String> =
+        missing.keys().map(|rel| absolute(&library, rel)).collect();
+    unresolved.sort();
+
     Ok(ScanResult {
         registered,
         skipped,
+        relocated,
+        unresolved,
     })
 }
 
@@ -1471,6 +1543,102 @@ mod tests {
         designate_library(&mut conn, Path::new("/lib")).unwrap();
         let recs = &list_sessions(&conn).unwrap()[0].recordings;
         assert_eq!(recs[0].path, "/lib/a/sub/game.mp4");
+    }
+
+    /// A throwaway directory under the OS temp dir, removed on drop — enough for the
+    /// scan tests, which need real files on disk (no tempfile dep, ponytail).
+    struct TempLib(std::path::PathBuf);
+    impl TempLib {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "voloph-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempLib(dir)
+        }
+        /// Write `contents` to `rel` under the library (creating parents), returning
+        /// the absolute path. Distinct contents → distinct quick hash.
+        fn write(&self, rel: &str, contents: &[u8]) -> std::path::PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+    impl Drop for TempLib {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The adoption pass re-links a recording moved/renamed inside the library by
+    /// quick hash + size, carrying its review state to the new path; a recording
+    /// that vanished entirely is reported unresolved (not deleted) and re-links on
+    /// its own when it reappears. Re-designating re-runs the same pass.
+    #[test]
+    fn scan_relocates_by_hash_and_reports_unresolved() {
+        let lib = TempLib::new();
+        lib.write("day1/game.mp4", b"aaaa");
+        lib.write("day1/other.mp4", b"bbbb");
+        let mut conn = open(Path::new(":memory:")).unwrap();
+
+        designate_library(&mut conn, &lib.0).unwrap();
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 2); // both files
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 0); // idempotent
+        let game_abs = absolute(&lib.0.to_string_lossy(), "day1/game.mp4");
+        // Flag a rally on game.mp4 so we can prove its review state follows it.
+        let game_id = recording_id(&conn, &game_abs).unwrap().unwrap();
+        conn.execute(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+             VALUES (?1, 0, 5000, 1.0, 1)",
+            [game_id],
+        )
+        .unwrap();
+
+        // Move game.mp4 to a new subfolder+name; delete other.mp4 entirely.
+        std::fs::create_dir_all(lib.0.join("moved")).unwrap();
+        std::fs::rename(lib.0.join("day1/game.mp4"), lib.0.join("moved/renamed.mp4")).unwrap();
+        std::fs::remove_file(lib.0.join("day1/other.mp4")).unwrap();
+
+        let result = scan_library(&mut conn).unwrap();
+        assert_eq!(result.relocated, 1);
+        assert_eq!(result.registered, 0);
+        // game.mp4 re-linked to its new key, same row, review state intact.
+        assert_eq!(stored_path(&conn, game_id), "moved/renamed.mp4");
+        let moved_abs = absolute(&lib.0.to_string_lossy(), "moved/renamed.mp4");
+        assert_eq!(
+            recording_timeline(&conn, &moved_abs).unwrap().unwrap().rallies[0].flagged,
+            true
+        );
+        // other.mp4 is gone and unmatched → unresolved, but its row is retained.
+        let other_abs = absolute(&lib.0.to_string_lossy(), "day1/other.mp4");
+        assert_eq!(result.unresolved, vec![other_abs.clone()]);
+        assert!(recording_id(&conn, &other_abs).unwrap().is_some());
+
+        // It reappears (same content, anywhere) → re-links automatically, no longer
+        // unresolved, and does not double-register.
+        lib.write("archive/other.mp4", b"bbbb");
+        let result = scan_library(&mut conn).unwrap();
+        assert_eq!(result.relocated, 1);
+        assert!(result.unresolved.is_empty());
+        assert_eq!(result.registered, 0);
+
+        // Re-designating a subfolder re-runs adoption: game.mp4 lies under it and
+        // re-links; the archive copy falls outside and drops off as unresolved.
+        let result = designate_library_then_scan(&mut conn, &lib.0.join("moved"));
+        assert!(stored_path(&conn, game_id) == "renamed.mp4");
+        assert!(!result.unresolved.contains(&moved_abs));
+    }
+
+    /// Designate + the scan lib.rs runs after it — the real re-designation path.
+    fn designate_library_then_scan(conn: &mut Connection, folder: &Path) -> ScanResult {
+        designate_library(conn, folder).unwrap();
+        scan_library(conn).unwrap()
     }
 
     use crate::media::CaptureDate;

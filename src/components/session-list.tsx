@@ -87,6 +87,14 @@ interface Session {
 interface ScanResult {
   registered: number
   skipped: number
+  /** Known recordings re-linked after being moved/renamed inside the library. */
+  relocated: number
+  /**
+   * Absolute paths of known recordings no longer found under the library after a
+   * scan (ADR 0011). Their review state is retained, not deleted; one that
+   * reappears (same hash + size) re-links on a later scan.
+   */
+  unresolved: string[]
 }
 
 /** The stats line under a session's date: recordings, rallies, footage length. */
@@ -143,6 +151,10 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   // Which bulk action is awaiting confirmation in the dialog, if any.
   const [confirmAction, setConfirmAction] = useState<"reanalyze" | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Known recordings the last scan could not find under the library (ADR 0011).
+  // Retained in the DB with their review state; listed here so the user can put
+  // them back (they re-link automatically) rather than losing the work silently.
+  const [unresolved, setUnresolved] = useState<string[]>([])
 
   const refresh = useCallback(async () => {
     try {
@@ -188,7 +200,10 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
 
     setScanning(true)
     try {
-      await trackedInvoke<ScanResult>("designate_library", { folder })
+      const result = await trackedInvoke<ScanResult>("designate_library", {
+        folder,
+      })
+      setUnresolved(result.unresolved)
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -203,7 +218,8 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
     setError(null)
     setRefreshing(true)
     try {
-      await trackedInvoke<ScanResult>("rescan_library")
+      const result = await trackedInvoke<ScanResult>("rescan_library")
+      setUnresolved(result.unresolved)
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -359,6 +375,27 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl space-y-4 px-4 py-6">
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          {unresolved.length > 0 ? (
+            <div className="rounded-lg border border-amber-500/50 bg-amber-500/5 px-4 py-3 text-sm">
+              <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-500">
+                <AlertTriangleIcon className="size-4" />
+                {unresolved.length} recording
+                {unresolved.length === 1 ? "" : "s"} not found in your library
+              </div>
+              <p className="mt-1 text-muted-foreground">
+                Their review stays saved. Put the file
+                {unresolved.length === 1 ? "" : "s"} back anywhere under your
+                library and Refresh — the review re-links automatically.
+              </p>
+              <ul className="mt-2 space-y-0.5 text-muted-foreground">
+                {unresolved.map((path) => (
+                  <li key={path} className="truncate" title={path}>
+                    {fileName(path)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           {sessions.length === 0 ? (
             <div className="rounded-xl border border-dashed px-6 py-16 text-center">
               <p className="font-medium">
