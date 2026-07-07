@@ -69,23 +69,34 @@ struct Db(Arc<Mutex<Connection>>);
 /// up on the same pass; a scan that arrives after it exits starts a fresh worker.
 struct MediaWorker(Arc<AtomicBool>);
 
-/// Register the video files under `folder` as recordings, grouped into
-/// sessions by capture day. Idempotent across re-scans. Kicks off background
-/// media work (probe then segment) for any newly registered recordings.
-///
-/// This and every other DB command below is `async` so Tauri runs it on the
-/// async runtime's thread pool rather than inline on the GTK main thread —
-/// a library scan (tree walk + per-file content hashing under the DB lock)
-/// would otherwise freeze the webview and queue every other command behind it.
+/// The active local library folder (ADR 0011), or `None` when the user has not
+/// designated one yet — the frontend prompts for designation before the first
+/// scan. This and every other DB command below is `async` so Tauri runs it on the
+/// async runtime's thread pool rather than inline on the GTK main thread.
 #[tauri::command]
-async fn scan_folder(
+async fn active_library(db: State<'_, Db>) -> Result<Option<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::library_path(&conn).map_err(|e| e.to_string())
+}
+
+/// Designate (or re-designate) `folder` as the local library (ADR 0011). Runs the
+/// adoption pass — every already-known recording under `folder` converts to
+/// library-relative identity with its review state intact — then scans the folder
+/// so new files appear, and kicks off background media work for anything new.
+///
+/// A library scan (tree walk + per-file content hashing under the DB lock) would
+/// freeze the webview if run inline on the GTK main thread, hence `async`.
+#[tauri::command]
+async fn designate_library(
     app: AppHandle,
     db: State<'_, Db>,
     folder: String,
 ) -> Result<db::ScanResult, String> {
     let result = {
         let mut conn = db.0.lock().map_err(|e| e.to_string())?;
-        db::scan_folder(&mut conn, std::path::Path::new(&folder)).map_err(|e| e.to_string())?
+        db::designate_library(&mut conn, std::path::Path::new(&folder))
+            .map_err(|e| e.to_string())?;
+        db::scan_library(&mut conn).map_err(|e| e.to_string())?
     };
     spawn_media_worker(&app);
     Ok(result)
@@ -131,25 +142,14 @@ async fn reanalyze_recording(
     Ok(())
 }
 
-/// Re-walk every folder a previous scan registered, picking up recordings added
-/// to them since (see [`db::scanned_folders`]). Idempotent like a fresh scan, and
-/// kicks off background media work for anything new. Backs the Refresh action.
+/// Re-walk the active library for recordings added to it since the last scan
+/// (ADR 0011). Idempotent like a fresh scan, and kicks off background media work
+/// for anything new. Backs the Refresh action.
 #[tauri::command]
-async fn rescan_folders(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanResult, String> {
+async fn rescan_library(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanResult, String> {
     let result = {
         let mut conn = db.0.lock().map_err(|e| e.to_string())?;
-        let folders = db::scanned_folders(&conn).map_err(|e| e.to_string())?;
-        let mut total = db::ScanResult {
-            registered: 0,
-            skipped: 0,
-        };
-        for folder in folders {
-            let r = db::scan_folder(&mut conn, std::path::Path::new(&folder))
-                .map_err(|e| e.to_string())?;
-            total.registered += r.registered;
-            total.skipped += r.skipped;
-        }
-        total
+        db::scan_library(&mut conn).map_err(|e| e.to_string())?
     };
     spawn_media_worker(&app);
     Ok(result)
@@ -593,11 +593,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            scan_folder,
+            active_library,
+            designate_library,
             list_sessions,
             recording_timeline,
             reanalyze_recording,
-            rescan_folders,
+            rescan_library,
             reanalyze_all,
             update_rally,
             add_rally,

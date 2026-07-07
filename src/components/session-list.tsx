@@ -134,6 +134,9 @@ interface SessionListProps {
  */
 export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
+  // The active local library folder (ADR 0011), or null until the user
+  // designates one. The whole app's world of recordings lives under it.
+  const [library, setLibrary] = useState<string | null>(null)
   const [scanning, setScanning] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [reanalyzingAll, setReanalyzingAll] = useState(false)
@@ -143,8 +146,12 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
 
   const refresh = useCallback(async () => {
     try {
-      const next = await trackedInvoke<Session[]>("list_sessions")
+      const [next, lib] = await Promise.all([
+        trackedInvoke<Session[]>("list_sessions"),
+        trackedInvoke<string | null>("active_library"),
+      ])
       setSessions(next)
+      setLibrary(lib)
     } catch (e) {
       setError(String(e))
     }
@@ -171,14 +178,17 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
     return () => clearInterval(interval)
   }, [stillWorking, refresh])
 
-  async function handlePickFolder() {
+  // Designate (or re-designate) the local library folder (ADR 0011). Adopts every
+  // known recording under it to library-relative identity with its review state
+  // intact, then scans it so new files appear.
+  async function handleDesignateLibrary() {
     setError(null)
     const folder = await open({ directory: true, multiple: false })
     if (typeof folder !== "string") return
 
     setScanning(true)
     try {
-      await trackedInvoke<ScanResult>("scan_folder", { folder })
+      await trackedInvoke<ScanResult>("designate_library", { folder })
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -187,13 +197,13 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
     }
   }
 
-  // Re-walk every previously scanned folder for recordings added since, without
+  // Re-walk the library for recordings added to it since the last scan, without
   // re-picking the folder. New recordings flow through the same import pipeline.
   async function handleRefresh() {
     setError(null)
     setRefreshing(true)
     try {
-      await trackedInvoke<ScanResult>("rescan_folders")
+      await trackedInvoke<ScanResult>("rescan_library")
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -296,17 +306,28 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
             variant="outline"
             size="sm"
             onClick={handleRefresh}
-            disabled={refreshing}
-            title="Re-scan known folders for newly added recordings."
+            disabled={refreshing || library === null}
+            title="Re-scan the library for newly added recordings."
           >
             <RefreshCwIcon
               className={`size-4 ${refreshing ? "animate-spin" : ""}`}
             />
             {refreshing ? "Refreshing…" : "Refresh"}
           </Button>
-          <Button size="sm" onClick={handlePickFolder} disabled={scanning}>
+          <Button
+            size="sm"
+            onClick={handleDesignateLibrary}
+            disabled={scanning}
+            title={
+              library ?? "Designate the folder that is your library of recordings."
+            }
+          >
             <FolderOpenIcon className="size-4" />
-            {scanning ? "Scanning…" : "Scan folder"}
+            {scanning
+              ? "Scanning…"
+              : library === null
+                ? "Designate library"
+                : "Change library"}
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -340,10 +361,13 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
           {sessions.length === 0 ? (
             <div className="rounded-xl border border-dashed px-6 py-16 text-center">
-              <p className="font-medium">No sessions yet</p>
+              <p className="font-medium">
+                {library === null ? "No library yet" : "No recordings yet"}
+              </p>
               <p className="mt-1 text-sm text-muted-foreground">
-                Scan a folder of recordings to get started. Originals play in
-                place and are never modified.
+                {library === null
+                  ? "Designate the folder that holds your recordings — it becomes your library, the app's whole world of recordings. Originals play in place and are never modified."
+                  : "Add recordings to your library folder, then Refresh. Originals play in place and are never modified."}
               </p>
             </div>
           ) : (
