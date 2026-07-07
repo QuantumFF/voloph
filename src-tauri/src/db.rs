@@ -65,12 +65,21 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
             id          INTEGER PRIMARY KEY,
-            capture_day TEXT NOT NULL UNIQUE
+            capture_day TEXT NOT NULL,
+            -- Which library this session belongs to (ADR 0011): 'local' or
+            -- 'shared'. A session never spans libraries, so a capture day is
+            -- unique only within its library.
+            library     TEXT NOT NULL DEFAULT 'local',
+            UNIQUE(library, capture_day)
         );
         CREATE TABLE IF NOT EXISTS recordings (
             id          INTEGER PRIMARY KEY,
             session_id  INTEGER NOT NULL REFERENCES sessions(id),
-            path        TEXT NOT NULL UNIQUE,
+            path        TEXT NOT NULL,
+            -- Which library this recording belongs to (ADR 0011). Its `path` is
+            -- relative to that library's folder, so the relative key is unique
+            -- only within the library — the same relative path may exist in both.
+            library     TEXT NOT NULL DEFAULT 'local',
             file_size   INTEGER NOT NULL,
             quick_hash  TEXT NOT NULL,
             capture_day TEXT NOT NULL,
@@ -78,7 +87,8 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             segment_state   TEXT NOT NULL DEFAULT 'unknown',
             date_state      TEXT NOT NULL DEFAULT 'unknown',
             duration_ms     INTEGER,
-            waveform        TEXT
+            waveform        TEXT,
+            UNIQUE(library, path)
         );
         CREATE TABLE IF NOT EXISTS rallies (
             id           INTEGER PRIMARY KEY,
@@ -101,15 +111,25 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
         CREATE TABLE IF NOT EXISTS scanned_folders (
             path TEXT NOT NULL UNIQUE
         );
-        -- The library (ADR 0011): the user-designated folder that is the app's
-        -- whole world of recordings. This slice models the single `local`
-        -- library only; the `kind` column reserves room for the shared library
-        -- (issue #62). A recording's stored `path` is relative to its library's
-        -- folder, with the absolute path computed at use time.
+        -- The libraries (ADR 0011): at most one of each `kind` ('local',
+        -- 'shared'). `path` is where the library is mounted *on this device* — a
+        -- per-device fact that never enters shared metadata. `mount` is the
+        -- locality the user declared for that mount: 'local' or 'network', an
+        -- explicit choice (never filesystem detection); the local library is
+        -- always 'local'. A recording's stored `path` is relative to its
+        -- library's folder, with the absolute path computed at use time.
         CREATE TABLE IF NOT EXISTS libraries (
-            id   INTEGER PRIMARY KEY,
-            path TEXT NOT NULL,
-            kind TEXT NOT NULL DEFAULT 'local' UNIQUE
+            id    INTEGER PRIMARY KEY,
+            path  TEXT NOT NULL,
+            kind  TEXT NOT NULL DEFAULT 'local' UNIQUE,
+            mount TEXT NOT NULL DEFAULT 'local'
+        );
+        -- Per-device app state as a key/value store. Holds `active_library` —
+        -- the kind ('local'|'shared') the switcher currently has active; the
+        -- session list, filters, and review all scope to it (ADR 0011).
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );",
     )?;
     // Upgrade DBs created before later slices. The CREATE above is a no-op when
@@ -156,7 +176,71 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // from earlier slices gain the column. Cleared on re-analyze along with every
     // other manual rally correction (the rally row is replaced; ADR 0002).
     let _ = conn.execute("ALTER TABLE rallies ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0", []);
+    // Two typed libraries (issue #62): the shared library adds a `mount` locality
+    // to `libraries`, and every session/recording is tagged with the library it
+    // belongs to so the same relative path or capture day can exist in both. A DB
+    // from #60/#61 held only the local library, so its rows migrate to 'local'.
+    let _ = conn.execute("ALTER TABLE libraries ADD COLUMN mount TEXT NOT NULL DEFAULT 'local'", []);
+    // A pre-#62 `sessions`/`recordings` still carries the old table-level
+    // UNIQUE(capture_day) / UNIQUE(path), which would forbid the shared library
+    // from reusing a relative path or day already present under local. Detect the
+    // old schema by the absent `library` column and rebuild the two tables with
+    // the library-scoped uniques, migrating every row to 'local'. A fresh DB
+    // already has the new shape (inline in the CREATE above), so this is skipped.
+    let has_library_column = conn
+        .prepare("SELECT library FROM recordings LIMIT 0")
+        .is_ok();
+    if !has_library_column {
+        migrate_to_typed_libraries(&conn)?;
+    }
     Ok(conn)
+}
+
+/// One-time rebuild of `sessions` and `recordings` for the two-library model
+/// (issue #62): recreate them with a `library` column and library-scoped uniques,
+/// copying every existing row across as 'local'. Runs only on a pre-#62 DB (the
+/// old table-level UNIQUE(path)/UNIQUE(capture_day) cannot be dropped in place).
+fn migrate_to_typed_libraries(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE sessions RENAME TO sessions_old;
+         ALTER TABLE recordings RENAME TO recordings_old;
+         CREATE TABLE sessions (
+            id          INTEGER PRIMARY KEY,
+            capture_day TEXT NOT NULL,
+            library     TEXT NOT NULL DEFAULT 'local',
+            UNIQUE(library, capture_day)
+         );
+         CREATE TABLE recordings (
+            id          INTEGER PRIMARY KEY,
+            session_id  INTEGER NOT NULL REFERENCES sessions(id),
+            path        TEXT NOT NULL,
+            library     TEXT NOT NULL DEFAULT 'local',
+            file_size   INTEGER NOT NULL,
+            quick_hash  TEXT NOT NULL,
+            capture_day TEXT NOT NULL,
+            probe_state TEXT NOT NULL DEFAULT 'unknown',
+            segment_state   TEXT NOT NULL DEFAULT 'unknown',
+            date_state      TEXT NOT NULL DEFAULT 'unknown',
+            duration_ms     INTEGER,
+            waveform        TEXT,
+            UNIQUE(library, path)
+         );
+         INSERT INTO sessions (id, capture_day, library)
+            SELECT id, capture_day, 'local' FROM sessions_old;
+         INSERT INTO recordings
+            (id, session_id, path, library, file_size, quick_hash, capture_day,
+             probe_state, segment_state, date_state, duration_ms, waveform)
+            SELECT id, session_id, path, 'local', file_size, quick_hash, capture_day,
+                   probe_state, segment_state, date_state, duration_ms, waveform
+            FROM recordings_old;
+         DROP TABLE recordings_old;
+         DROP TABLE sessions_old;
+         COMMIT;",
+    )?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
 }
 
 fn is_video(path: &Path) -> bool {
@@ -166,16 +250,78 @@ fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The active local library's folder (ADR 0011), or `None` when the user has not
-/// designated one yet. Every recording's stored path is relative to this folder;
-/// the absolute path is computed at use time by joining it.
-pub fn library_path(conn: &Connection) -> rusqlite::Result<Option<String>> {
+/// A designated library and how this device reaches it (ADR 0011).
+#[derive(Debug, Clone, Serialize)]
+pub struct Library {
+    /// 'local' or 'shared'.
+    pub kind: String,
+    /// Where the library is mounted *on this device* — a per-device fact that
+    /// never enters shared metadata.
+    pub path: String,
+    /// Declared locality of that mount: 'local' or 'network' (ADR 0011). Always
+    /// 'local' for the local library.
+    pub mount: String,
+}
+
+/// The kind of library the switcher currently has active (ADR 0011), defaulting
+/// to 'local'. The session list, filters, and review all scope to it.
+pub fn active_kind(conn: &Connection) -> rusqlite::Result<String> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'active_library'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(stored.unwrap_or_else(|| "local".to_string()))
+}
+
+/// The folder of the library of `kind` as mounted on this device, or `None` when
+/// that kind has not been designated. `path` is per-device (ADR 0011).
+fn library_path_of(conn: &Connection, kind: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row(
-        "SELECT path FROM libraries WHERE kind = 'local'",
-        [],
+        "SELECT path FROM libraries WHERE kind = ?1",
+        [kind],
         |row| row.get(0),
     )
     .optional()
+}
+
+/// The folder of the **active** library (ADR 0011), or `None` when the active
+/// kind has not been designated yet. Every recording in the active library has a
+/// stored path relative to this folder; the absolute path is computed at use time
+/// by joining it. Path-keyed and listing operations all resolve against this.
+pub fn library_path(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    library_path_of(conn, &active_kind(conn)?)
+}
+
+/// Every designated library with how this device reaches it, plus which kind is
+/// active — what the switcher UI needs (ADR 0011).
+pub fn library_state(conn: &Connection) -> rusqlite::Result<(Vec<Library>, String)> {
+    let mut stmt = conn.prepare("SELECT kind, path, mount FROM libraries ORDER BY kind")?;
+    let libraries = stmt
+        .query_map([], |row| {
+            Ok(Library {
+                kind: row.get(0)?,
+                path: row.get(1)?,
+                mount: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((libraries, active_kind(conn)?))
+}
+
+/// Make `kind` the active library (ADR 0011). Idempotent; the caller ensures the
+/// kind is designated. The session list, filters, and review all scope to it, and
+/// switching back and forth loses nothing — each library's rows are tagged with
+/// their kind and simply stop resolving while another is active.
+pub fn set_active_kind(conn: &Connection, kind: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('active_library', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [kind],
+    )?;
+    Ok(())
 }
 
 /// The absolute path of a recording stored library-relative under `library`.
@@ -196,12 +342,18 @@ fn relative(library: &str, absolute: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Look a recording's stored (library-relative) key up from an absolute path, or
-/// `None` when there is no library or the path lies outside it. Every path-keyed
-/// command hands db.rs an absolute path (the frontend and media worker only ever
-/// see absolutes); this is the single seam that maps back to the stored key.
-fn stored_key(conn: &Connection, absolute_path: &str) -> rusqlite::Result<Option<String>> {
-    Ok(library_path(conn)?.and_then(|lib| relative(&lib, absolute_path)))
+/// Map an absolute path to the active library's kind and the recording's stored
+/// (library-relative) key, or `None` when there is no active library or the path
+/// lies outside it. Every path-keyed command hands db.rs an absolute path (the
+/// frontend and media worker only ever see absolutes); this is the single seam
+/// that maps back to the stored key — and, since the relative key is unique only
+/// within a library, its kind, so a same-named recording in the other library is
+/// never touched.
+fn stored_key(conn: &Connection, absolute_path: &str) -> rusqlite::Result<Option<(String, String)>> {
+    let kind = active_kind(conn)?;
+    Ok(library_path_of(conn, &kind)?
+        .and_then(|lib| relative(&lib, absolute_path))
+        .map(|rel| (kind, rel)))
 }
 
 /// The session capture day (`YYYY-MM-DD`) for a recording, preferring the date
@@ -293,36 +445,48 @@ fn quick_hash(path: &Path, file_size: u64) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Designate (or re-designate) `folder` as the local library (ADR 0011), running
-/// an **adoption pass**: every already-known recording found under `folder` — by
-/// its stored path lying under the folder — is converted to that library's
-/// relative identity with all review state intact (rallies, annotations, flags,
-/// and session grouping key off the recording row, so they travel untouched).
+/// Designate (or re-designate) `folder` as the library of `kind` ('local' or
+/// 'shared'), declaring where it is mounted here and its `mount` locality ('local'
+/// or 'network' — an explicit user choice, never filesystem detection; ADR 0011).
+/// `kind` becomes the active library. Runs an **adoption pass** over that
+/// library's own recordings: every already-known recording of this kind found
+/// under `folder` — by its stored path lying under the folder — is converted to
+/// the library's relative identity with all review state intact (rallies,
+/// annotations, flags, and session grouping key off the recording row, so they
+/// travel untouched).
 ///
-/// Idempotent and safe on a fresh install (no recordings → the pass is a no-op).
-/// On re-designation, recordings adopt into the new folder where they lie under
-/// it; a recording outside the new library keeps its old key and stops appearing
-/// (ADR 0011 — a video outside the library does not exist to the app). Locating
-/// *moved* files by quick hash and reporting the unresolved is a later slice
+/// At most one library of each kind (`libraries.kind` is UNIQUE); re-designating
+/// replaces the existing one of that kind, re-pointing its whole world without
+/// touching the other library's recordings. Idempotent and safe on a fresh
+/// install (no recordings → the pass is a no-op). A recording outside the new
+/// folder keeps its old key and stops appearing (ADR 0011). Locating *moved*
+/// files by quick hash and reporting the unresolved happens in the follow-up scan
 /// (issue #61); this pass adopts by path prefix only.
-pub fn designate_library(conn: &mut Connection, folder: &Path) -> rusqlite::Result<()> {
+pub fn designate_library(
+    conn: &mut Connection,
+    kind: &str,
+    folder: &Path,
+    mount: &str,
+) -> rusqlite::Result<()> {
     let folder_str = folder.to_string_lossy().into_owned();
-    let previous = library_path(conn)?;
+    // The previous folder of *this* kind, to resolve its recordings' current
+    // absolute paths (the other kind's recordings are left untouched).
+    let previous = library_path_of(conn, kind)?;
     let tx = conn.transaction()?;
-    // At most one local library; replacing its folder re-points the whole world.
+    // At most one library per kind; replacing its folder re-points that world.
     tx.execute(
-        "INSERT INTO libraries (kind, path) VALUES ('local', ?1)
-         ON CONFLICT(kind) DO UPDATE SET path = excluded.path",
-        [&folder_str],
+        "INSERT INTO libraries (kind, path, mount) VALUES (?1, ?2, ?3)
+         ON CONFLICT(kind) DO UPDATE SET path = excluded.path, mount = excluded.mount",
+        rusqlite::params![kind, &folder_str, mount],
     )?;
 
-    // Adoption: rewrite each known recording's stored path to be relative to the
-    // new folder. A recording's current *absolute* path is its stored key
-    // resolved against the previous library folder (or the stored key itself when
-    // there was no library yet — the pre-library DBs stored absolute paths).
-    let mut stmt = tx.prepare("SELECT id, path FROM recordings")?;
+    // Adoption: rewrite each known recording of this kind so its stored path is
+    // relative to the new folder. Its current *absolute* path is its stored key
+    // resolved against the previous folder of this kind (or the stored key itself
+    // when there was none yet — a pre-library DB stored absolute paths).
+    let mut stmt = tx.prepare("SELECT id, path FROM recordings WHERE library = ?1")?;
     let rows: Vec<(i64, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
     for (id, stored) in rows {
@@ -341,6 +505,13 @@ pub fn designate_library(conn: &mut Connection, folder: &Path) -> rusqlite::Resu
         // Recordings not under the new folder keep their key and simply stop
         // resolving — they no longer appear (ADR 0011).
     }
+    // The designated kind becomes active (the switcher points at what was just set
+    // up). set_active_kind uses the meta k/v store, safe inside this transaction.
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('active_library', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [kind],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -364,7 +535,8 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
     let mut skipped = 0usize;
     let mut relocated = 0usize;
 
-    let Some(library) = library_path(conn)? else {
+    let kind = active_kind(conn)?;
+    let Some(library) = library_path_of(conn, &kind)? else {
         return Ok(ScanResult {
             registered: 0,
             skipped: 0,
@@ -376,14 +548,14 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
 
     let tx = conn.transaction()?;
 
-    // Known recordings that resolve under the library (relative keys — an absolute
-    // key is an unadopted outsider, ADR 0011). Track which are still present on
-    // disk; whatever remains missing after the walk is a relocation candidate or,
-    // if unmatched, unresolved.
+    // Known recordings *of the active library* that resolve under it (relative
+    // keys — an absolute key is an unadopted outsider, ADR 0011). Track which are
+    // still present on disk; whatever remains missing after the walk is a
+    // relocation candidate or, if unmatched, unresolved.
     let mut missing: std::collections::HashMap<String, i64> = {
-        let mut stmt = tx.prepare("SELECT id, path FROM recordings")?;
+        let mut stmt = tx.prepare("SELECT id, path FROM recordings WHERE library = ?1")?;
         let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .query_map([&kind], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         rows.into_iter()
             .filter(|(_, rel)| !Path::new(rel).is_absolute())
@@ -409,11 +581,14 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
             continue;
         };
 
-        // Idempotent dedup: skip files already registered by their relative key.
+        // Idempotent dedup: skip files already registered in this library by their
+        // relative key (the same key may exist in the other library).
         let already: bool = tx
-            .query_row("SELECT 1 FROM recordings WHERE path = ?1", [&rel], |_| {
-                Ok(true)
-            })
+            .query_row(
+                "SELECT 1 FROM recordings WHERE library = ?1 AND path = ?2",
+                rusqlite::params![&kind, &rel],
+                |_| Ok(true),
+            )
             .unwrap_or(false);
         if already {
             skipped += 1;
@@ -453,20 +628,21 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
 
         let day = capture_day(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
 
+        // Session grouping is per-library (a session never spans libraries).
         tx.execute(
-            "INSERT OR IGNORE INTO sessions (capture_day) VALUES (?1)",
-            [&day],
+            "INSERT OR IGNORE INTO sessions (capture_day, library) VALUES (?1, ?2)",
+            rusqlite::params![&day, &kind],
         )?;
         let session_id: i64 = tx.query_row(
-            "SELECT id FROM sessions WHERE capture_day = ?1",
-            [&day],
+            "SELECT id FROM sessions WHERE capture_day = ?1 AND library = ?2",
+            rusqlite::params![&day, &kind],
             |row| row.get(0),
         )?;
 
         tx.execute(
-            "INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![session_id, rel, file_size as i64, hash, day],
+            "INSERT INTO recordings (session_id, path, library, file_size, quick_hash, capture_day)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![session_id, rel, &kind, file_size as i64, hash, day],
         )?;
         registered += 1;
     }
@@ -507,27 +683,28 @@ pub fn refine_capture_day(
     let day = derive_capture_day(embedded, modified);
 
     let tx = conn.transaction()?;
-    let old_session: Option<i64> = tx
+    let old: Option<(i64, String)> = tx
         .query_row(
-            "SELECT session_id FROM recordings WHERE id = ?1",
+            "SELECT session_id, library FROM recordings WHERE id = ?1",
             [id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
     // The recording may have been removed between scan and this pass; nothing to
     // re-home, so just drop out without touching any session.
-    let Some(old_session) = old_session else {
+    let Some((old_session, library)) = old else {
         tx.commit()?;
         return Ok(());
     };
 
+    // Re-home within the recording's own library — a session never spans libraries.
     tx.execute(
-        "INSERT OR IGNORE INTO sessions (capture_day) VALUES (?1)",
-        [&day],
+        "INSERT OR IGNORE INTO sessions (capture_day, library) VALUES (?1, ?2)",
+        rusqlite::params![&day, &library],
     )?;
     let new_session: i64 = tx.query_row(
-        "SELECT id FROM sessions WHERE capture_day = ?1",
-        [&day],
+        "SELECT id FROM sessions WHERE capture_day = ?1 AND library = ?2",
+        rusqlite::params![&day, &library],
         |row| row.get(0),
     )?;
 
@@ -556,13 +733,16 @@ pub fn refine_capture_day(
 /// outside it — are omitted, so they never appear in the app. With no library
 /// designated nothing resolves and the list is empty.
 pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
-    let Some(library) = library_path(conn)? else {
+    let kind = active_kind(conn)?;
+    let Some(library) = library_path_of(conn, &kind)? else {
         return Ok(Vec::new());
     };
-    let mut stmt =
-        conn.prepare("SELECT id, capture_day FROM sessions ORDER BY capture_day DESC")?;
+    // Only the active library's sessions (ADR 0011 — the switcher scopes the list).
+    let mut stmt = conn.prepare(
+        "SELECT id, capture_day FROM sessions WHERE library = ?1 ORDER BY capture_day DESC",
+    )?;
     let sessions: Vec<(i64, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map([&kind], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
     let mut out = Vec::with_capacity(sessions.len());
@@ -634,9 +814,12 @@ pub enum MediaWork {
 /// `None` when every recording is both probed and segmented (or has failed).
 pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>> {
     // The worker runs ffmpeg/ffprobe against real files, so it needs absolute
-    // paths (ADR 0011 — the absolute path is computed at use time). With no
-    // library there is nothing resolvable to work on.
-    let Some(library) = library_path(conn)? else {
+    // paths (ADR 0011 — the absolute path is computed at use time). Scoped to the
+    // active library: its recordings resolve against the active mount, and the
+    // worker follows the switcher (a fresh worker is spawned on each switch). With
+    // no active library there is nothing resolvable to work on.
+    let kind = active_kind(conn)?;
+    let Some(library) = library_path_of(conn, &kind)? else {
         return Ok(None);
     };
     // Phase 0: anything whose capture day is still the provisional mtime guess.
@@ -645,8 +828,8 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     let date = conn
         .query_row(
             "SELECT id, path FROM recordings
-             WHERE date_state = 'unknown' ORDER BY id LIMIT 1",
-            [],
+             WHERE library = ?1 AND date_state = 'unknown' ORDER BY id LIMIT 1",
+            [&kind],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
@@ -657,8 +840,8 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     let probe = conn
         .query_row(
             "SELECT id, path FROM recordings
-             WHERE probe_state = 'unknown' ORDER BY id LIMIT 1",
-            [],
+             WHERE library = ?1 AND probe_state = 'unknown' ORDER BY id LIMIT 1",
+            [&kind],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
@@ -669,9 +852,9 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     let segment = conn
         .query_row(
             "SELECT id, path FROM recordings
-             WHERE probe_state = 'ready' AND segment_state = 'unknown'
+             WHERE library = ?1 AND probe_state = 'ready' AND segment_state = 'unknown'
              ORDER BY id LIMIT 1",
-            [],
+            [&kind],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
@@ -693,31 +876,39 @@ pub fn set_probe_result(conn: &Connection, id: i64, state: &str) -> rusqlite::Re
 /// action used while tuning the segmenter (ADR 0002). A no-op when `path` is not
 /// registered.
 pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()> {
-    let Some(key) = stored_key(conn, path)? else {
+    let Some((kind, key)) = stored_key(conn, path)? else {
         return Ok(());
     };
     conn.execute(
-        "DELETE FROM rallies WHERE recording_id = (SELECT id FROM recordings WHERE path = ?1)",
-        [&key],
+        "DELETE FROM rallies WHERE recording_id =
+            (SELECT id FROM recordings WHERE library = ?1 AND path = ?2)",
+        rusqlite::params![&kind, &key],
     )?;
     conn.execute(
         "UPDATE recordings
          SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL
-         WHERE path = ?1",
-        [&key],
+         WHERE library = ?1 AND path = ?2",
+        rusqlite::params![&kind, &key],
     )?;
     Ok(())
 }
 
-/// Reset every recording's draft timeline so the media worker re-segments the
-/// whole library on its next pass — the bulk Re-analyze-all counterpart of
-/// [`reset_segmentation`]. Like a per-recording re-analyze, this discards manual
-/// corrections (ADR 0002).
+/// Reset every recording's draft timeline in the **active** library so the media
+/// worker re-segments it on its next pass — the bulk Re-analyze-all counterpart of
+/// [`reset_segmentation`]. Scoped to the active library like everything the
+/// session list drives (ADR 0011). Like a per-recording re-analyze, this discards
+/// manual corrections (ADR 0002).
 pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM rallies", [])?;
+    let kind = active_kind(conn)?;
     conn.execute(
-        "UPDATE recordings SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL",
-        [],
+        "DELETE FROM rallies WHERE recording_id IN
+            (SELECT id FROM recordings WHERE library = ?1)",
+        [&kind],
+    )?;
+    conn.execute(
+        "UPDATE recordings SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL
+         WHERE library = ?1",
+        [&kind],
     )?;
     Ok(())
 }
@@ -815,13 +1006,14 @@ pub struct Timeline {
 /// The draft timeline for the recording at `path`, for the player. `None` when
 /// the path is not a registered recording (e.g. opened straight from a dialog).
 pub fn recording_timeline(conn: &Connection, path: &str) -> rusqlite::Result<Option<Timeline>> {
-    let Some(key) = stored_key(conn, path)? else {
+    let Some((kind, key)) = stored_key(conn, path)? else {
         return Ok(None);
     };
     let row = conn
         .query_row(
-            "SELECT id, segment_state, duration_ms, waveform FROM recordings WHERE path = ?1",
-            [&key],
+            "SELECT id, segment_state, duration_ms, waveform FROM recordings
+             WHERE library = ?1 AND path = ?2",
+            rusqlite::params![&kind, &key],
             |row| {
                 let id: i64 = row.get(0)?;
                 let state: String = row.get(1)?;
@@ -868,12 +1060,14 @@ const CORRECTED_CONFIDENCE: f64 = 1.0;
 /// The inline-correction commands resolve the recording first, then scope every
 /// edit to its rallies, so a stray id from another recording cannot be touched.
 fn recording_id(conn: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
-    let Some(key) = stored_key(conn, path)? else {
+    let Some((kind, key)) = stored_key(conn, path)? else {
         return Ok(None);
     };
-    conn.query_row("SELECT id FROM recordings WHERE path = ?1", [&key], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT id FROM recordings WHERE library = ?1 AND path = ?2",
+        rusqlite::params![&kind, &key],
+        |row| row.get(0),
+    )
     .optional()
 }
 
@@ -1120,28 +1314,32 @@ pub fn filter_moments(
         "a.recording_id = r.recording_id AND a.time_ms >= r.start_ms AND a.time_ms < r.end_ms
          AND (?1 IS NULL OR a.verdict = ?1)
          AND (?2 IS NULL OR a.aspect = ?2)";
+    // Scoped to the active library (ADR 0011 — the switcher scopes cross-session
+    // filters). `?5` is the active kind; only its recordings and sessions match.
     let sql = format!(
         "SELECT s.id, s.capture_day, rec.id, rec.path,
                 r.id, r.start_ms, r.end_ms, r.flagged
          FROM rallies r
          JOIN recordings rec ON rec.id = r.recording_id
          JOIN sessions s ON s.id = rec.session_id
-         WHERE (?3 IS NULL OR (r.end_ms - r.start_ms >= {LONG_RALLY_MS}) = ?3)
+         WHERE rec.library = ?5
+           AND (?3 IS NULL OR (r.end_ms - r.start_ms >= {LONG_RALLY_MS}) = ?3)
            AND (?4 IS NULL OR r.flagged = ?4)
            AND ((?1 IS NULL AND ?2 IS NULL)
                 OR EXISTS (SELECT 1 FROM annotations a WHERE {annotation_matches}))
          ORDER BY s.capture_day DESC, rec.path, r.start_ms"
     );
     // The jump target opens the recording by its absolute path (ADR 0011); with
-    // no library nothing resolves, so return no results.
-    let Some(library) = library_path(conn)? else {
+    // no active library nothing resolves, so return no results.
+    let kind = active_kind(conn)?;
+    let Some(library) = library_path_of(conn, &kind)? else {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare(&sql)?;
     let want_annotations = verdict.is_some() || aspect.is_some();
     let rows: Vec<FilteredRally> = stmt
         .query_map(
-            rusqlite::params![verdict, aspect, length, flagged],
+            rusqlite::params![verdict, aspect, length, flagged, kind],
             |row| {
                 let start_ms: i64 = row.get(5)?;
                 let end_ms: i64 = row.get(6)?;
@@ -1475,7 +1673,7 @@ mod tests {
     fn designate_adopts_by_prefix_and_drops_outsiders() {
         let mut conn = open(Path::new(":memory:")).unwrap();
         // Fresh install: designating before any recordings exist is safe.
-        designate_library(&mut conn, Path::new("/lib")).unwrap();
+        designate_library(&mut conn, "local", Path::new("/lib"), "local").unwrap();
         assert!(list_sessions(&conn).unwrap().is_empty());
 
         // Simulate a pre-library DB: recordings stored by absolute path, one under
@@ -1493,7 +1691,7 @@ mod tests {
         )
         .unwrap();
 
-        designate_library(&mut conn, Path::new("/lib")).unwrap();
+        designate_library(&mut conn, "local", Path::new("/lib"), "local").unwrap();
 
         // Inside recording adopted to a relative key; outside kept its absolute one.
         assert_eq!(stored_path(&conn, inside), "day1/game.mp4");
@@ -1515,7 +1713,7 @@ mod tests {
         assert!(set_rally_flag(&conn, "/lib/day1/game.mp4", 1, false).unwrap());
 
         // Re-designating the same folder is idempotent.
-        designate_library(&mut conn, Path::new("/lib")).unwrap();
+        designate_library(&mut conn, "local", Path::new("/lib"), "local").unwrap();
         assert_eq!(stored_path(&conn, inside), "day1/game.mp4");
     }
 
@@ -1525,7 +1723,7 @@ mod tests {
     #[test]
     fn redesignate_readopts_from_previous_library() {
         let mut conn = open(Path::new(":memory:")).unwrap();
-        designate_library(&mut conn, Path::new("/lib/a")).unwrap();
+        designate_library(&mut conn, "local", Path::new("/lib/a"), "local").unwrap();
         // Register a recording relative to /lib/a directly.
         conn.execute(
             "INSERT INTO sessions (capture_day) VALUES ('2026-01-01')",
@@ -1540,9 +1738,135 @@ mod tests {
         .unwrap();
         // Its absolute path is /lib/a/sub/game.mp4. Re-designate the parent /lib:
         // it should re-adopt to a/sub/game.mp4 and still resolve.
-        designate_library(&mut conn, Path::new("/lib")).unwrap();
+        designate_library(&mut conn, "local", Path::new("/lib"), "local").unwrap();
         let recs = &list_sessions(&conn).unwrap()[0].recordings;
         assert_eq!(recs[0].path, "/lib/a/sub/game.mp4");
+    }
+
+    /// A pre-#62 DB (sessions/recordings with the old table-level UNIQUE and no
+    /// `library` column) upgrades in place: `open` rebuilds both tables, tags every
+    /// existing row 'local', and preserves the recording's row (id + review state).
+    #[test]
+    fn open_migrates_pre_library_column_db() {
+        let path = std::env::temp_dir().join(format!(
+            "voloph-migrate-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Build the old schema (pre-#62) by hand and seed a recording + rally.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY, capture_day TEXT NOT NULL UNIQUE);
+                 CREATE TABLE recordings (
+                    id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL,
+                    path TEXT NOT NULL UNIQUE, file_size INTEGER NOT NULL,
+                    quick_hash TEXT NOT NULL, capture_day TEXT NOT NULL,
+                    probe_state TEXT NOT NULL DEFAULT 'unknown',
+                    segment_state TEXT NOT NULL DEFAULT 'unknown',
+                    date_state TEXT NOT NULL DEFAULT 'unknown',
+                    duration_ms INTEGER, waveform TEXT);
+                 CREATE TABLE rallies (
+                    id INTEGER PRIMARY KEY, recording_id INTEGER NOT NULL,
+                    start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                    confidence REAL NOT NULL, flagged INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO sessions (id, capture_day) VALUES (1, '2026-01-01');
+                 INSERT INTO recordings (id, session_id, path, file_size, quick_hash, capture_day)
+                    VALUES (7, 1, 'day1/game.mp4', 0, '', '2026-01-01');
+                 INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+                    VALUES (7, 0, 5000, 1.0, 1);",
+            )
+            .unwrap();
+        }
+        // Upgrade path: open() rebuilds the tables with a `library` column.
+        let conn = open(&path).unwrap();
+        let (id, lib): (i64, String) = conn
+            .query_row(
+                "SELECT id, library FROM recordings WHERE path = 'day1/game.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, 7); // same row (review state kept)
+        assert_eq!(lib, "local"); // migrated to the local library
+        let session_lib: String = conn
+            .query_row("SELECT library FROM sessions WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session_lib, "local");
+        // The rally survived the rebuild.
+        let flagged: i64 = conn
+            .query_row("SELECT flagged FROM rallies WHERE recording_id = 7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(flagged, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two typed libraries coexist (issue #62): a shared library is designated with
+    /// its per-device mount and declared locality, the switcher scopes the session
+    /// list and path-keyed edits to the active library, and switching back and
+    /// forth loses nothing. A recording relative path that exists in both libraries
+    /// resolves to the right file per active library.
+    #[test]
+    fn two_libraries_switch_and_scope() {
+        let local = TempLib::new();
+        let shared = TempLib::new();
+        // The same relative path in both libraries, distinct contents.
+        local.write("day1/game.mp4", b"local-bytes");
+        shared.write("day1/game.mp4", b"shared-bytes");
+        let mut conn = open(Path::new(":memory:")).unwrap();
+
+        // Designate local (mount always local) and scan it.
+        designate_library(&mut conn, "local", &local.0, "local").unwrap();
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 1);
+        assert_eq!(active_kind(&conn).unwrap(), "local");
+
+        // Designate the shared library on its own mount, declared network. Adoption
+        // runs on it too (empty here — the follow-up scan registers the file). It
+        // becomes active, so the list now shows the shared library only.
+        designate_library(&mut conn, "shared", &shared.0, "network").unwrap();
+        assert_eq!(active_kind(&conn).unwrap(), "shared");
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 1);
+        let shared_abs = absolute(&shared.0.to_string_lossy(), "day1/game.mp4");
+        assert_eq!(list_sessions(&conn).unwrap()[0].recordings[0].path, shared_abs);
+
+        // The switcher state carries both libraries with their per-device mount and
+        // declared locality; local is always 'local', shared is 'network' here.
+        let (libs, active) = library_state(&conn).unwrap();
+        assert_eq!(active, "shared");
+        assert_eq!(libs.len(), 2);
+        let mount_of = |k: &str| libs.iter().find(|l| l.kind == k).unwrap().mount.clone();
+        assert_eq!(mount_of("local"), "local");
+        assert_eq!(mount_of("shared"), "network");
+
+        // A flag set on the shared recording is scoped to the shared library.
+        let shared_rally = add_rally(&conn, &shared_abs, 0, 5000).unwrap().unwrap();
+        assert!(set_rally_flag(&conn, &shared_abs, shared_rally, true).unwrap());
+
+        // Switch back to local: its own recording (same relative path, different
+        // file) shows, and the shared flag is not visible here.
+        set_active_kind(&conn, "local").unwrap();
+        let local_abs = absolute(&local.0.to_string_lossy(), "day1/game.mp4");
+        assert_eq!(list_sessions(&conn).unwrap()[0].recordings[0].path, local_abs);
+        // The local recording has no rallies (the shared one's are not its own).
+        assert!(recording_timeline(&conn, &local_abs)
+            .unwrap()
+            .unwrap()
+            .rallies
+            .is_empty());
+
+        // Switch back to shared: nothing lost — the flagged rally is still there.
+        set_active_kind(&conn, "shared").unwrap();
+        assert_eq!(
+            recording_timeline(&conn, &shared_abs).unwrap().unwrap().rallies[0].flagged,
+            true
+        );
     }
 
     /// A throwaway directory under the OS temp dir, removed on drop — enough for the
@@ -1587,7 +1911,7 @@ mod tests {
         lib.write("day1/other.mp4", b"bbbb");
         let mut conn = open(Path::new(":memory:")).unwrap();
 
-        designate_library(&mut conn, &lib.0).unwrap();
+        designate_library(&mut conn, "local", &lib.0, "local").unwrap();
         assert_eq!(scan_library(&mut conn).unwrap().registered, 2); // both files
         assert_eq!(scan_library(&mut conn).unwrap().registered, 0); // idempotent
         let game_abs = absolute(&lib.0.to_string_lossy(), "day1/game.mp4");
@@ -1637,7 +1961,7 @@ mod tests {
 
     /// Designate + the scan lib.rs runs after it — the real re-designation path.
     fn designate_library_then_scan(conn: &mut Connection, folder: &Path) -> ScanResult {
-        designate_library(conn, folder).unwrap();
+        designate_library(conn, "local", folder, "local").unwrap();
         scan_library(conn).unwrap()
     }
 

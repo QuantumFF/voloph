@@ -84,6 +84,21 @@ interface Session {
   recordings: Recording[]
 }
 
+/** A designated library and how this device reaches it (ADR 0011). */
+interface Library {
+  /** "local" | "shared". */
+  kind: string
+  /** Where the library is mounted on this device (per-device, never shared). */
+  path: string
+  /** Declared locality of that mount: "local" | "network". */
+  mount: string
+}
+
+/** Human label for a library kind, for the switcher and buttons. */
+function kindLabel(kind: string): string {
+  return kind === "shared" ? "Shared" : "Local"
+}
+
 interface ScanResult {
   registered: number
   skipped: number
@@ -142,9 +157,11 @@ interface SessionListProps {
  */
 export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
-  // The active local library folder (ADR 0011), or null until the user
-  // designates one. The whole app's world of recordings lives under it.
-  const [library, setLibrary] = useState<string | null>(null)
+  // The designated libraries (ADR 0011) and which kind the switcher has active.
+  // At most one of each kind; the session list, filters, and review scope to the
+  // active one. The whole app's world of recordings is the active library.
+  const [libraries, setLibraries] = useState<Library[]>([])
+  const [active, setActive] = useState<string>("local")
   const [scanning, setScanning] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [reanalyzingAll, setReanalyzingAll] = useState(false)
@@ -158,16 +175,22 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
 
   const refresh = useCallback(async () => {
     try {
-      const [next, lib] = await Promise.all([
+      const [next, state] = await Promise.all([
         trackedInvoke<Session[]>("list_sessions"),
-        trackedInvoke<string | null>("active_library"),
+        trackedInvoke<[Library[], string]>("library_state"),
       ])
       setSessions(next)
-      setLibrary(lib)
+      setLibraries(state[0])
+      setActive(state[1])
     } catch (e) {
       setError(String(e))
     }
   }, [])
+
+  // The active library's own record (mount path + locality), or undefined until
+  // its kind is designated on this device.
+  const activeLibrary = libraries.find((l) => l.kind === active)
+  const library = activeLibrary?.path ?? null
 
   useEffect(() => {
     // Load persisted sessions once on mount. The setState lands after an
@@ -190,10 +213,12 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
     return () => clearInterval(interval)
   }, [stillWorking, refresh])
 
-  // Designate (or re-designate) the local library folder (ADR 0011). Adopts every
-  // known recording under it to library-relative identity with its review state
-  // intact, then scans it so new files appear.
-  async function handleDesignateLibrary() {
+  // Designate (or re-designate) a library of `kind` ("local" | "shared") with the
+  // folder where it is mounted here and its declared `mount` locality ("local" |
+  // "network"; ADR 0011). Adopts every known recording of this kind under it to
+  // library-relative identity with its review state intact, then scans it so new
+  // files appear. The designated kind becomes active.
+  async function handleDesignateLibrary(kind: string, mount: string) {
     setError(null)
     const folder = await open({ directory: true, multiple: false })
     if (typeof folder !== "string") return
@@ -201,7 +226,9 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
     setScanning(true)
     try {
       const result = await trackedInvoke<ScanResult>("designate_library", {
+        kind,
         folder,
+        mount,
       })
       setUnresolved(result.unresolved)
       await refresh()
@@ -209,6 +236,22 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
       setError(String(e))
     } finally {
       setScanning(false)
+    }
+  }
+
+  // Switch the active library (ADR 0011). The session list, filters, and review
+  // scope to it; switching back and forth loses nothing. Re-scans the newly active
+  // library so files added since last time appear.
+  async function handleSwitch(kind: string) {
+    if (kind === active) return
+    setError(null)
+    setUnresolved([])
+    try {
+      const result = await trackedInvoke<ScanResult>("switch_library", { kind })
+      setUnresolved(result.unresolved)
+      await refresh()
+    } catch (e) {
+      setError(String(e))
     }
   }
 
@@ -308,6 +351,27 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
           Every rally, no downtime
         </span>
         <div className="ml-auto flex items-center gap-2">
+          {/* Library switcher (ADR 0011): pick the active library when more than
+              one is designated. Each button scopes the whole app to its kind. */}
+          {libraries.length > 1 ? (
+            <div className="flex overflow-hidden rounded-md border">
+              {libraries.map((lib) => (
+                <button
+                  key={lib.kind}
+                  type="button"
+                  onClick={() => void handleSwitch(lib.kind)}
+                  title={`${kindLabel(lib.kind)} library — ${lib.path}`}
+                  className={`px-2.5 py-1 text-xs font-medium ${
+                    lib.kind === active
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:bg-accent"
+                  }`}
+                >
+                  {kindLabel(lib.kind)}
+                </button>
+              ))}
+            </div>
+          ) : null}
           <Button
             variant="outline"
             size="sm"
@@ -323,28 +387,48 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
             size="sm"
             onClick={handleRefresh}
             disabled={refreshing || library === null}
-            title="Re-scan the library for newly added recordings."
+            title="Re-scan the active library for newly added recordings."
           >
             <RefreshCwIcon
               className={`size-4 ${refreshing ? "animate-spin" : ""}`}
             />
             {refreshing ? "Refreshing…" : "Refresh"}
           </Button>
-          <Button
-            size="sm"
-            onClick={handleDesignateLibrary}
-            disabled={scanning}
-            title={
-              library ?? "Designate the folder that is your library of recordings."
-            }
-          >
-            <FolderOpenIcon className="size-4" />
-            {scanning
-              ? "Scanning…"
-              : library === null
-                ? "Designate library"
-                : "Change library"}
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="sm" disabled={scanning}>
+                <FolderOpenIcon className="size-4" />
+                {scanning ? "Scanning…" : "Libraries"}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-64">
+              <DropdownMenuLabel>Local library</DropdownMenuLabel>
+              <DropdownMenuItem
+                onClick={() => void handleDesignateLibrary("local", "local")}
+              >
+                <FolderOpenIcon className="size-4" />
+                {libraries.some((l) => l.kind === "local")
+                  ? "Change local library"
+                  : "Designate local library"}
+              </DropdownMenuItem>
+              <DropdownMenuLabel>Shared library</DropdownMenuLabel>
+              {/* The user declares whether this device reaches the shared mount as
+                  a local disk or over the network — an explicit choice, never
+                  filesystem detection (ADR 0011). */}
+              <DropdownMenuItem
+                onClick={() => void handleDesignateLibrary("shared", "local")}
+              >
+                <FolderOpenIcon className="size-4" />
+                Designate shared (local mount)
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => void handleDesignateLibrary("shared", "network")}
+              >
+                <FolderOpenIcon className="size-4" />
+                Designate shared (network mount)
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button

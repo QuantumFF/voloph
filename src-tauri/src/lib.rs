@@ -69,20 +69,31 @@ struct Db(Arc<Mutex<Connection>>);
 /// up on the same pass; a scan that arrives after it exits starts a fresh worker.
 struct MediaWorker(Arc<AtomicBool>);
 
-/// The active local library folder (ADR 0011), or `None` when the user has not
-/// designated one yet — the frontend prompts for designation before the first
-/// scan. This and every other DB command below is `async` so Tauri runs it on the
-/// async runtime's thread pool rather than inline on the GTK main thread.
+/// The active library's folder on this device (ADR 0011), or `None` when the
+/// active kind has not been designated yet — the frontend prompts for designation
+/// before the first scan. This and every other DB command below is `async` so
+/// Tauri runs it on the async runtime's thread pool rather than inline on the GTK
+/// main thread.
 #[tauri::command]
 async fn active_library(db: State<'_, Db>) -> Result<Option<String>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     db::library_path(&conn).map_err(|e| e.to_string())
 }
 
-/// Designate (or re-designate) `folder` as the local library (ADR 0011). Runs the
-/// adoption pass — every already-known recording under `folder` converts to
-/// library-relative identity with its review state intact — then scans the folder
-/// so new files appear, and kicks off background media work for anything new.
+/// The switcher's state (ADR 0011): every designated library (kind, per-device
+/// mount path, declared locality) and which kind is currently active.
+#[tauri::command]
+async fn library_state(db: State<'_, Db>) -> Result<(Vec<db::Library>, String), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::library_state(&conn).map_err(|e| e.to_string())
+}
+
+/// Designate (or re-designate) `folder` as the library of `kind` ('local' or
+/// 'shared'), declaring its `mount` locality ('local' or 'network'; ADR 0011).
+/// `kind` becomes active. Runs the adoption pass — every already-known recording
+/// of this kind under `folder` converts to library-relative identity with its
+/// review state intact — then scans the folder so new files appear, and kicks off
+/// background media work for anything new.
 ///
 /// A library scan (tree walk + per-file content hashing under the DB lock) would
 /// freeze the webview if run inline on the GTK main thread, hence `async`.
@@ -90,12 +101,33 @@ async fn active_library(db: State<'_, Db>) -> Result<Option<String>, String> {
 async fn designate_library(
     app: AppHandle,
     db: State<'_, Db>,
+    kind: String,
     folder: String,
+    mount: String,
 ) -> Result<db::ScanResult, String> {
     let result = {
         let mut conn = db.0.lock().map_err(|e| e.to_string())?;
-        db::designate_library(&mut conn, std::path::Path::new(&folder))
+        db::designate_library(&mut conn, &kind, std::path::Path::new(&folder), &mount)
             .map_err(|e| e.to_string())?;
+        db::scan_library(&mut conn).map_err(|e| e.to_string())?
+    };
+    spawn_media_worker(&app);
+    Ok(result)
+}
+
+/// Switch the active library to `kind` (ADR 0011). The session list, filters, and
+/// review scope to it; switching back and forth loses nothing. Re-scans the newly
+/// active library so newly added files appear and starts background media work for
+/// it (the worker follows the active library).
+#[tauri::command]
+async fn switch_library(
+    app: AppHandle,
+    db: State<'_, Db>,
+    kind: String,
+) -> Result<db::ScanResult, String> {
+    let result = {
+        let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::set_active_kind(&conn, &kind).map_err(|e| e.to_string())?;
         db::scan_library(&mut conn).map_err(|e| e.to_string())?
     };
     spawn_media_worker(&app);
@@ -594,7 +626,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             active_library,
+            library_state,
             designate_library,
+            switch_library,
             list_sessions,
             recording_timeline,
             reanalyze_recording,
