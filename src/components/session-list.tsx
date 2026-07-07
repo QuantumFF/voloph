@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { open } from "@tauri-apps/plugin-dialog"
+import { open, save } from "@tauri-apps/plugin-dialog"
 import {
   AlertTriangleIcon,
   ClapperboardIcon,
@@ -12,6 +12,7 @@ import {
   PlayIcon,
   RefreshCwIcon,
   RotateCwIcon,
+  Share2Icon,
   VideoIcon,
 } from "lucide-react"
 
@@ -191,18 +192,33 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   // silently — to carry that review to the other copy; the user accepts or declines
   // per offer, and declining leaves both sides untouched.
   const [carryOffers, setCarryOffers] = useState<CarryOffer[]>([])
+  // The name this device signs its shared bundles with (ADR 0012), persisted in
+  // the DB so the user names themselves only once. Empty until they do.
+  const [sharerLabel, setSharerLabel] = useState<string>("")
+  // Which session's share is awaiting the name dialog, and whether that share is
+  // the "save elsewhere" fallback rather than a write into the shared library.
+  const [shareTarget, setShareTarget] = useState<{
+    session: Session
+    saveAs: boolean
+  } | null>(null)
+  // Draft name in the share dialog, seeded from the persisted label.
+  const [shareName, setShareName] = useState<string>("")
+  // One-line confirmation after a successful share, cleared on the next action.
+  const [shareNote, setShareNote] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [next, state, offers] = await Promise.all([
+      const [next, state, offers, label] = await Promise.all([
         trackedInvoke<Session[]>("list_sessions"),
         trackedInvoke<[Library[], string]>("library_state"),
         trackedInvoke<CarryOffer[]>("carry_offers"),
+        trackedInvoke<string | null>("sharer_label"),
       ])
       setSessions(next)
       setLibraries(state[0])
       setActive(state[1])
       setCarryOffers(offers)
+      setSharerLabel(label ?? "")
     } catch (e) {
       setError(String(e))
     }
@@ -344,6 +360,53 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
     }
   }
 
+  // Open the share dialog for a session (ADR 0012). `saveAs` picks the fallback
+  // path (write the same artifact anywhere) over writing into the shared library.
+  // Seeds the name field with the persisted label so the user confirms it once.
+  function openShare(session: Session, saveAs: boolean) {
+    setError(null)
+    setShareNote(null)
+    setShareName(sharerLabel)
+    setShareTarget({ session, saveAs })
+  }
+
+  // Confirm a share: write the metadata-only bundle either into the shared
+  // library (keyed by session + name, overwriting this sharer's own previous
+  // bundle) or to a user-chosen path. The name is remembered for next time.
+  async function confirmShare() {
+    if (!shareTarget) return
+    const name = shareName.trim()
+    if (!name) return
+    const { session, saveAs } = shareTarget
+    setShareTarget(null)
+    setError(null)
+    try {
+      if (saveAs) {
+        const output = await save({
+          title: "Save session bundle",
+          defaultPath: `${session.capture_day}__${name}.vbundle`,
+          filters: [{ name: "Voloph bundle", extensions: ["vbundle"] }],
+        })
+        if (!output) return
+        await trackedInvoke("save_session_bundle_as", {
+          sessionId: session.id,
+          sharerLabel: name,
+          output,
+        })
+        setShareNote("Bundle saved.")
+      } else {
+        await trackedInvoke("share_session_bundle", {
+          sessionId: session.id,
+          sharerLabel: name,
+        })
+        setShareNote("Shared to the shared library.")
+      }
+      setSharerLabel(name)
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   const confirmCopy = {
     reanalyze: {
       title: "Re-analyze all recordings?",
@@ -379,6 +442,52 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
               }
             >
               {copy?.action}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Share dialog (ADR 0012): name yourself once, then write a metadata-only
+          bundle of the session's review. Re-sharing overwrites only your own
+          bundle. Shown for both "share into shared library" and "save as". */}
+      <AlertDialog
+        open={shareTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setShareTarget(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {shareTarget?.saveAs ? "Save session bundle" : "Share session"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Share your review of{" "}
+              {shareTarget
+                ? formatCaptureDay(shareTarget.session.capture_day)
+                : ""}{" "}
+              as a metadata-only bundle. No video is copied. Enter the name to
+              share under — re-sharing this session later overwrites only your own
+              bundle.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <input
+            autoFocus
+            value={shareName}
+            onChange={(e) => setShareName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && shareName.trim()) void confirmShare()
+            }}
+            placeholder="Your name"
+            className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          />
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmShare}
+              disabled={!shareName.trim()}
+            >
+              {shareTarget?.saveAs ? "Save" : "Share"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -499,6 +608,9 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl space-y-4 px-4 py-6">
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          {shareNote ? (
+            <p className="text-sm text-muted-foreground">{shareNote}</p>
+          ) : null}
           {unresolved.length > 0 ? (
             <div className="rounded-lg border border-amber-500/50 bg-amber-500/5 px-4 py-3 text-sm">
               <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-500">
@@ -582,6 +694,40 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
                     <PlayIcon className="size-4" />
                     Review session
                   </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="icon-sm"
+                        className="shrink-0"
+                        title="Share this session"
+                      >
+                        <Share2Icon className="size-4" />
+                        <span className="sr-only">Share this session</span>
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-56">
+                      <DropdownMenuLabel>Session bundle</DropdownMenuLabel>
+                      {/* Sharing into the shared library is only meaningful there
+                          — recipients cannot reach local files (ADR 0012). */}
+                      <DropdownMenuItem
+                        onClick={() => openShare(session, false)}
+                        disabled={active !== "shared"}
+                        title={
+                          active === "shared"
+                            ? undefined
+                            : "Switch to the shared library to share here."
+                        }
+                      >
+                        <Share2Icon className="size-4" />
+                        Share to shared library
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => openShare(session, true)}>
+                        <FolderOpenIcon className="size-4" />
+                        Save bundle as…
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
                 <ul className="divide-y">
                   {session.recordings.map((recording, recordingIndex) => (

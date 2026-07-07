@@ -324,6 +324,22 @@ pub fn set_active_kind(conn: &Connection, kind: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Read a per-device app-state value from `meta`, or `None` when unset.
+pub fn meta_get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()
+}
+
+/// Write a per-device app-state value to `meta` (upsert).
+pub fn meta_set(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )?;
+    Ok(())
+}
+
 /// The absolute path of a recording stored library-relative under `library`.
 fn absolute(library: &str, relative: &str) -> String {
     Path::new(library)
@@ -1724,6 +1740,201 @@ fn parse_waveform(json: Option<&str>) -> Vec<f32> {
         .collect()
 }
 
+// --- Session bundles (ADR 0012, issue #65) -------------------------------
+//
+// A session bundle is a metadata-only snapshot of one session's review, written
+// as a file into the shared library so another device/person can pick the review
+// up (receive lands in #66). It carries, per recording, only what is portable
+// across devices: the library-relative path (ADR 0011), the quick hash + size
+// for strict verification on receive, the capture day, duration, waveform, the
+// full timeline (rallies with machine confidence — low confidence marks an
+// uncertain region), annotations, and flags. Nothing per-device: no mount path,
+// no locality. No video bytes.
+//
+// The file is JSON, tagged with a format id and a version so a future format
+// change stays backward-readable — bundles live in users' shared folders (ADR
+// 0012). serde_json (not the hand-rolled waveform parser) because a receiver in
+// #66 must parse this back robustly.
+
+/// The on-disk bundle format tag and current version. Bumped only on a
+/// breaking format change; readers key backward-compat off it.
+pub const BUNDLE_FORMAT: &str = "voloph-session-bundle";
+pub const BUNDLE_VERSION: u32 = 1;
+
+/// A rally in a bundled timeline. Same shape as [`TimelineRally`] but its own
+/// type so the wire format is decoupled from the in-app struct.
+#[derive(Debug, Serialize)]
+pub struct BundleRally {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub confidence: f64,
+    pub flagged: bool,
+}
+
+/// A verdict annotation in a bundle. Row ids are dropped — the receiver mints
+/// its own; only the portable fields travel.
+#[derive(Debug, Serialize)]
+pub struct BundleAnnotation {
+    pub time_ms: i64,
+    pub verdict: String,
+    pub aspect: Option<String>,
+    pub note: Option<String>,
+}
+
+/// One recording's review state in a bundle — everything portable, nothing
+/// per-device.
+#[derive(Debug, Serialize)]
+pub struct BundleRecording {
+    /// Library-relative path (ADR 0011); resolves against the recipient's own
+    /// mount of the same shared library.
+    pub path: String,
+    pub quick_hash: String,
+    pub file_size: i64,
+    pub capture_day: String,
+    pub duration_ms: Option<i64>,
+    pub waveform: Vec<f32>,
+    pub rallies: Vec<BundleRally>,
+    pub annotations: Vec<BundleAnnotation>,
+}
+
+/// A whole session's review state as handed off (ADR 0012). `format`/`version`
+/// tag the wire format for backward-readable evolution.
+#[derive(Debug, Serialize)]
+pub struct SessionBundle {
+    pub format: String,
+    pub version: u32,
+    pub capture_day: String,
+    /// Who shared it — names the bundle alongside the session, so one person's
+    /// re-share overwrites only their own bundle (ADR 0012).
+    pub sharer_label: String,
+    pub recordings: Vec<BundleRecording>,
+}
+
+/// Build the bundle for a session by its row id, drawing every recording's
+/// timeline (rallies + waveform + duration) and annotations straight from the
+/// DB. Returns `None` when the session id does not exist. Reads by id, not by
+/// absolute path, so it is independent of which library is mounted where.
+pub fn build_session_bundle(
+    conn: &Connection,
+    session_id: i64,
+    sharer_label: &str,
+) -> rusqlite::Result<Option<SessionBundle>> {
+    let capture_day: Option<String> = conn
+        .query_row(
+            "SELECT capture_day FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(capture_day) = capture_day else {
+        return Ok(None);
+    };
+
+    // One recording row, collected up front so the per-recording rally/annotation
+    // sub-queries below can borrow `conn` again (can't nest prepared statements
+    // while the outer query_map still holds it).
+    struct Row {
+        id: i64,
+        path: String,
+        file_size: i64,
+        quick_hash: String,
+        capture_day: String,
+        duration_ms: Option<i64>,
+        waveform_json: Option<String>,
+    }
+    let mut rstmt = conn.prepare(
+        "SELECT id, path, file_size, quick_hash, capture_day, duration_ms, waveform
+         FROM recordings WHERE session_id = ?1 ORDER BY path",
+    )?;
+    let rows: Vec<Row> = rstmt
+        .query_map([session_id], |row| {
+            Ok(Row {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                file_size: row.get(2)?,
+                quick_hash: row.get(3)?,
+                capture_day: row.get(4)?,
+                duration_ms: row.get(5)?,
+                waveform_json: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut recordings = Vec::with_capacity(rows.len());
+    for Row {
+        id: rid,
+        path,
+        file_size,
+        quick_hash,
+        capture_day: cap_day,
+        duration_ms,
+        waveform_json,
+    } in rows
+    {
+        let mut ral = conn.prepare(
+            "SELECT start_ms, end_ms, confidence, flagged FROM rallies
+             WHERE recording_id = ?1 ORDER BY start_ms",
+        )?;
+        let rallies = ral
+            .query_map([rid], |row| {
+                Ok(BundleRally {
+                    start_ms: row.get(0)?,
+                    end_ms: row.get(1)?,
+                    confidence: row.get(2)?,
+                    flagged: row.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut ann = conn.prepare(
+            "SELECT time_ms, verdict, aspect, note FROM annotations
+             WHERE recording_id = ?1 ORDER BY time_ms, id",
+        )?;
+        let annotations = ann
+            .query_map([rid], |row| {
+                Ok(BundleAnnotation {
+                    time_ms: row.get(0)?,
+                    verdict: row.get(1)?,
+                    aspect: row.get(2)?,
+                    note: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        recordings.push(BundleRecording {
+            path,
+            quick_hash,
+            file_size,
+            capture_day: cap_day,
+            duration_ms,
+            waveform: parse_waveform(waveform_json.as_deref()),
+            rallies,
+            annotations,
+        });
+    }
+
+    Ok(Some(SessionBundle {
+        format: BUNDLE_FORMAT.to_string(),
+        version: BUNDLE_VERSION,
+        capture_day,
+        sharer_label: sharer_label.to_string(),
+        recordings,
+    }))
+}
+
+/// The file name for a bundle in the shared library: session day + sharer label,
+/// so it is identifiable by both and one person's re-share overwrites only their
+/// own (ADR 0012). The label is sanitized to a safe file stem.
+pub fn bundle_file_name(capture_day: &str, sharer_label: &str) -> String {
+    let safe: String = sharer_label
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let safe = safe.trim_matches('-');
+    let safe = if safe.is_empty() { "unnamed" } else { safe };
+    format!("{capture_day}__{safe}.vbundle")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2725,6 +2936,65 @@ mod tests {
         assert_eq!(
             recording_annotations(&conn, "/r.mp4").unwrap()[0].id,
             b
+        );
+    }
+
+    /// A bundle carries every portable field of every recording in a session —
+    /// relative path, hash + size, capture day, duration, waveform, timeline
+    /// (with confidence + flag), and annotations — and nothing per-device.
+    #[test]
+    fn bundle_carries_a_session_review() {
+        let (conn, rid) = db_with_rallies("r.mp4", &[(1000, 5000), (8000, 12000)]);
+        // Flag one rally and annotate, so both travel in the bundle.
+        let tl = recording_timeline(&conn, "r.mp4").unwrap().unwrap();
+        set_rally_flag(&conn, "r.mp4", tl.rallies[0].id, true).unwrap();
+        add_annotation(&conn, "r.mp4", 2000, "good").unwrap();
+
+        let bundle = build_session_bundle(&conn, 1, "alice").unwrap().unwrap();
+        assert_eq!(bundle.format, BUNDLE_FORMAT);
+        assert_eq!(bundle.version, BUNDLE_VERSION);
+        assert_eq!(bundle.capture_day, "2026-01-01");
+        assert_eq!(bundle.sharer_label, "alice");
+        assert_eq!(bundle.recordings.len(), 1);
+        let rec = &bundle.recordings[0];
+        assert_eq!(rec.path, "r.mp4"); // library-relative, not absolute
+        assert_eq!(rec.rallies.len(), 2);
+        assert!(rec.rallies[0].flagged);
+        assert!(!rec.rallies[1].flagged);
+        assert_eq!(rec.annotations.len(), 1);
+        assert_eq!(rec.annotations[0].verdict, "good");
+        assert_eq!(rec.duration_ms, Some(100_000));
+        let _ = rid;
+
+        // Round-trips through JSON (the on-disk form).
+        let json = serde_json::to_string(&bundle).unwrap();
+        assert!(json.contains("\"format\":\"voloph-session-bundle\""));
+
+        // A missing session id yields no bundle.
+        assert!(build_session_bundle(&conn, 999, "alice").unwrap().is_none());
+    }
+
+    /// The bundle file name keys on session day + sharer label and sanitizes the
+    /// label into a safe stem, so a re-share overwrites only that sharer's file.
+    #[test]
+    fn bundle_file_name_keys_on_day_and_sharer() {
+        assert_eq!(
+            bundle_file_name("2026-01-01", "alice"),
+            "2026-01-01__alice.vbundle"
+        );
+        assert_eq!(
+            bundle_file_name("2026-01-01", "Bob's phone"),
+            "2026-01-01__Bob-s-phone.vbundle"
+        );
+        // Two sharers on the same day produce two distinct files.
+        assert_ne!(
+            bundle_file_name("2026-01-01", "alice"),
+            bundle_file_name("2026-01-01", "bob")
+        );
+        // An empty/garbage label still yields a usable stem.
+        assert_eq!(
+            bundle_file_name("2026-01-01", "///"),
+            "2026-01-01__unnamed.vbundle"
         );
     }
 }

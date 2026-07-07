@@ -170,6 +170,77 @@ async fn carry_review(
     db::carry_review(&mut conn, &from_path, &to_path).map_err(|e| e.to_string())
 }
 
+/// The sharer label this device signs its bundles with (ADR 0012) — the name the
+/// user gives themselves once. `None` until they name themselves. Persisted per
+/// device in `meta`.
+#[tauri::command]
+async fn sharer_label(db: State<'_, Db>) -> Result<Option<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::meta_get(&conn, "sharer_label").map_err(|e| e.to_string())
+}
+
+/// Share a session as a metadata-only bundle written into the **shared** library
+/// (ADR 0012, issue #65). The file lands in the shared root, named by the
+/// session's capture day + `sharer_label`, so it is identifiable by both and
+/// re-sharing the same session overwrites only this sharer's previous bundle —
+/// another sharer's bundle for the same session is untouched. The label is
+/// remembered so the user names themselves only once. Refused while the local
+/// library is active (recipients cannot reach local files). Returns the bundle's
+/// absolute path.
+#[tauri::command]
+async fn share_session_bundle(
+    db: State<'_, Db>,
+    session_id: i64,
+    sharer_label: String,
+) -> Result<String, String> {
+    let label = sharer_label.trim().to_string();
+    if label.is_empty() {
+        return Err("please enter a name to share under".into());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    if db::active_kind(&conn).map_err(|e| e.to_string())? != "shared" {
+        return Err("switch to the shared library to share a session".into());
+    }
+    let root = db::library_path(&conn)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the shared library is not designated".to_string())?;
+    let bundle = db::build_session_bundle(&conn, session_id, &label)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "session not found".to_string())?;
+    db::meta_set(&conn, "sharer_label", &label).map_err(|e| e.to_string())?;
+
+    let file = db::bundle_file_name(&bundle.capture_day, &label);
+    let path = std::path::Path::new(&root).join(&file);
+    let json = serde_json::to_vec_pretty(&bundle).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("could not write bundle: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// "Save bundle as…": write the identical session bundle artifact to an arbitrary
+/// path the user picks (ADR 0012 fallback). Same bytes as [`share_session_bundle`];
+/// available regardless of the active library since it does not touch the shared
+/// root.
+#[tauri::command]
+async fn save_session_bundle_as(
+    db: State<'_, Db>,
+    session_id: i64,
+    sharer_label: String,
+    output: String,
+) -> Result<(), String> {
+    let label = sharer_label.trim().to_string();
+    if label.is_empty() {
+        return Err("please enter a name to share under".into());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let bundle = db::build_session_bundle(&conn, session_id, &label)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "session not found".to_string())?;
+    db::meta_set(&conn, "sharer_label", &label).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec_pretty(&bundle).map_err(|e| e.to_string())?;
+    std::fs::write(&output, json).map_err(|e| format!("could not write bundle: {e}"))?;
+    Ok(())
+}
+
 /// Resolve the draft timeline (rallies + per-region confidence) for the
 /// recording at `path` (ADR 0002). While segmentation is still running the
 /// `segment_state` is `unknown` and `rallies` is empty; the player polls until
@@ -755,6 +826,9 @@ pub fn run() {
             list_sessions,
             carry_offers,
             carry_review,
+            sharer_label,
+            share_session_bundle,
+            save_session_bundle_as,
             recording_timeline,
             reanalyze_recording,
             rescan_library,
