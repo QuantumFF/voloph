@@ -99,6 +99,20 @@ function kindLabel(kind: string): string {
   return kind === "shared" ? "Shared" : "Local"
 }
 
+/**
+ * A cross-library carry-over offer (ADR 0011): the same content exists in both
+ * libraries (a copy) and exactly one side has hand-touched review state. The app
+ * offers — never silently — to carry that review to the other, un-touched copy.
+ */
+interface CarryOffer {
+  /** Absolute path of the copy that has the review. */
+  from_path: string
+  /** Absolute path of the copy that would receive it. */
+  to_path: string
+  /** Library kind ("local" | "shared") of the receiving copy. */
+  to_kind: string
+}
+
 interface ScanResult {
   registered: number
   skipped: number
@@ -172,20 +186,46 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   // Retained in the DB with their review state; listed here so the user can put
   // them back (they re-link automatically) rather than losing the work silently.
   const [unresolved, setUnresolved] = useState<string[]>([])
+  // Cross-library carry-over offers (ADR 0011): the same content sits in both
+  // libraries and only one side has hand-touched review. The app offers — never
+  // silently — to carry that review to the other copy; the user accepts or declines
+  // per offer, and declining leaves both sides untouched.
+  const [carryOffers, setCarryOffers] = useState<CarryOffer[]>([])
 
   const refresh = useCallback(async () => {
     try {
-      const [next, state] = await Promise.all([
+      const [next, state, offers] = await Promise.all([
         trackedInvoke<Session[]>("list_sessions"),
         trackedInvoke<[Library[], string]>("library_state"),
+        trackedInvoke<CarryOffer[]>("carry_offers"),
       ])
       setSessions(next)
       setLibraries(state[0])
       setActive(state[1])
+      setCarryOffers(offers)
     } catch (e) {
       setError(String(e))
     }
   }, [])
+
+  // Accept an offer: carry the review to the other copy, then refresh (the offer
+  // disappears once both sides match). Declining is just dismissing the row.
+  async function handleCarry(offer: CarryOffer) {
+    setError(null)
+    try {
+      await trackedInvoke("carry_review", {
+        fromPath: offer.from_path,
+        toPath: offer.to_path,
+      })
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  function handleDecline(offer: CarryOffer) {
+    setCarryOffers((prev) => prev.filter((o) => o !== offer))
+  }
 
   // The active library's own record (mount path + locality), or undefined until
   // its kind is designated on this device.
@@ -480,6 +520,34 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
               </ul>
             </div>
           ) : null}
+          {carryOffers.map((offer) => (
+            <div
+              key={`${offer.from_path}→${offer.to_path}`}
+              className="rounded-lg border border-sky-500/50 bg-sky-500/5 px-4 py-3 text-sm"
+            >
+              <div className="font-medium text-sky-700 dark:text-sky-400">
+                Carry your review to the {kindLabel(offer.to_kind).toLowerCase()}{" "}
+                library?
+              </div>
+              <p className="mt-1 text-muted-foreground">
+                <span className="font-medium">{fileName(offer.to_path)}</span> is
+                the same recording as one you have already reviewed. Bring that
+                review — timeline, annotations, and flags — over to this copy?
+              </p>
+              <div className="mt-2 flex gap-2">
+                <Button size="sm" onClick={() => void handleCarry(offer)}>
+                  Carry review over
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => handleDecline(offer)}
+                >
+                  Not now
+                </Button>
+              </div>
+            </div>
+          ))}
           {sessions.length === 0 ? (
             <div className="rounded-xl border border-dashed px-6 py-16 text-center">
               <p className="font-medium">

@@ -564,6 +564,41 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
             .collect()
     };
 
+    // Cross-library re-home candidates (ADR 0011): recordings of the *other*
+    // library whose own file has gone missing from *its* folder. A vanished
+    // recording that reappears (hash + size) under this library was moved between
+    // libraries — re-home it, carrying its review state and re-homing its session.
+    // A recording whose file still exists in its own library is a copy, not a move,
+    // and is left for the explicit carry-over offer (`carry_offers`), never
+    // re-homed silently. Keyed by id so the walk can match against them too.
+    let mut cross_missing: Vec<i64> = {
+        let mut ids = Vec::new();
+        let mut stmt = tx.prepare("SELECT kind, path FROM libraries")?;
+        let others: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        for (other_kind, other_folder) in others {
+            if other_kind == kind {
+                continue;
+            }
+            let other_root = Path::new(&other_folder);
+            let mut rstmt =
+                tx.prepare("SELECT id, path FROM recordings WHERE library = ?1")?;
+            let rows: Vec<(i64, String)> = rstmt
+                .query_map([&other_kind], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for (id, rel) in rows {
+                if !Path::new(&rel).is_absolute() && !other_root.join(&rel).exists() {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    };
+
     for entry in walkdir::WalkDir::new(folder)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -626,6 +661,30 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
             continue;
         }
 
+        // Cross-library re-home (ADR 0011): an unregistered file matching a
+        // recording of the *other* library whose own file is gone is that
+        // recording moved between libraries. Re-home the row into this library —
+        // rewrite its `path`, `library`, and session — so its whole review state
+        // follows it, and garbage-collect the session it emptied in the other
+        // library. Only fires for a genuine move (the source file is gone); a copy
+        // (both files present) is left for the explicit carry-over offer.
+        let rehomed = cross_missing.iter().find(|&&id| {
+            let (o_size, o_hash): (i64, String) = tx
+                .query_row(
+                    "SELECT file_size, quick_hash FROM recordings WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((-1, String::new()));
+            o_size == file_size as i64 && o_hash == hash
+        });
+        if let Some(&id) = rehomed {
+            rehome_recording(&tx, id, &kind, &rel)?;
+            cross_missing.retain(|&x| x != id);
+            relocated += 1;
+            continue;
+        }
+
         let day = capture_day(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
 
         // Session grouping is per-library (a session never spans libraries).
@@ -660,6 +719,199 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
         relocated,
         unresolved,
     })
+}
+
+/// Re-home a recording (identified by row `id`) into the `kind` library at the
+/// library-relative key `rel`, carrying its review state (ADR 0011). Rewrites the
+/// row's `path`, `library`, and moves it under a session of its own capture day in
+/// the target library — creating that session if needed and garbage-collecting the
+/// source session it emptied. Rallies and annotations key off the recording row,
+/// so they travel untouched. Runs inside the caller's transaction.
+fn rehome_recording(
+    tx: &rusqlite::Transaction,
+    id: i64,
+    kind: &str,
+    rel: &str,
+) -> rusqlite::Result<()> {
+    let (old_session, day): (i64, String) = tx.query_row(
+        "SELECT session_id, capture_day FROM recordings WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO sessions (capture_day, library) VALUES (?1, ?2)",
+        rusqlite::params![&day, kind],
+    )?;
+    let new_session: i64 = tx.query_row(
+        "SELECT id FROM sessions WHERE capture_day = ?1 AND library = ?2",
+        rusqlite::params![&day, kind],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "UPDATE recordings SET path = ?1, library = ?2, session_id = ?3 WHERE id = ?4",
+        rusqlite::params![rel, kind, new_session, id],
+    )?;
+    if old_session != new_session {
+        tx.execute(
+            "DELETE FROM sessions WHERE id = ?1
+             AND NOT EXISTS (SELECT 1 FROM recordings WHERE session_id = ?1)",
+            [old_session],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether a recording carries **hand-touched** review state (ADR 0011): a
+/// flagged rally, a hand-corrected rally (confidence bumped to
+/// `CORRECTED_CONFIDENCE` by an inline edit), or any annotation. Pure
+/// machine-produced segmentation (uncertain rallies, no flags, no annotations)
+/// does not count — the cross-library carry-over only ever moves work a human did.
+fn is_hand_touched(conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+    let touched: bool = conn.query_row(
+        "SELECT
+            EXISTS(SELECT 1 FROM rallies WHERE recording_id = ?1
+                   AND (flagged = 1 OR confidence >= ?2))
+            OR EXISTS(SELECT 1 FROM annotations WHERE recording_id = ?1)",
+        rusqlite::params![id, CORRECTED_CONFIDENCE],
+        |r| Ok(r.get::<_, i64>(0)? != 0),
+    )?;
+    Ok(touched)
+}
+
+/// A cross-library carry-over offer (ADR 0011): the same content (quick hash +
+/// size) exists as a recording in *both* libraries — a copy, not a move — and
+/// exactly one side has hand-touched review state while the other has none. The
+/// app offers to carry that review to the other copy; it never migrates silently,
+/// and never offers when both sides are hand-touched (no merge — out of scope).
+#[derive(Debug, Serialize)]
+pub struct CarryOffer {
+    /// Absolute path of the copy that *has* the review, resolved on this device.
+    pub from_path: String,
+    /// Absolute path of the copy that would *receive* it.
+    pub to_path: String,
+    /// Library kind of the copy that would receive the carried-over review.
+    pub to_kind: String,
+}
+
+/// Cross-library carry-over offers (ADR 0011): find every pair of recordings —
+/// one in each library — that share a quick hash + size (identical content copied
+/// across, both files present) where exactly one side is hand-touched. Each is
+/// surfaced as an offer to carry the review to the un-touched copy; the caller
+/// applies an accepted one with [`carry_review`]. Only pairs whose *both* files
+/// currently resolve under their libraries are offered (a vanished side is a
+/// re-home, handled on scan, not a copy). Returns nothing when either library is
+/// undesignated.
+pub fn carry_offers(conn: &Connection) -> rusqlite::Result<Vec<CarryOffer>> {
+    let (Some(local), Some(shared)) = (
+        library_path_of(conn, "local")?,
+        library_path_of(conn, "shared")?,
+    ) else {
+        return Ok(Vec::new());
+    };
+    // Same content in both libraries: join local vs shared recordings on hash+size.
+    let mut stmt = conn.prepare(
+        "SELECT l.id, l.path, s.id, s.path
+         FROM recordings l JOIN recordings s
+           ON l.quick_hash = s.quick_hash AND l.file_size = s.file_size
+         WHERE l.library = 'local' AND s.library = 'shared'",
+    )?;
+    let pairs: Vec<(i64, String, i64, String)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    let mut offers = Vec::new();
+    for (l_id, l_rel, s_id, s_rel) in pairs {
+        // Both copies must currently exist on disk — a missing side is a move,
+        // re-homed on scan, never a copy offer (AC: offer only when both exist).
+        if Path::new(&l_rel).is_absolute() || Path::new(&s_rel).is_absolute() {
+            continue;
+        }
+        if !Path::new(&local).join(&l_rel).exists()
+            || !Path::new(&shared).join(&s_rel).exists()
+        {
+            continue;
+        }
+        let l_touched = is_hand_touched(conn, l_id)?;
+        let s_touched = is_hand_touched(conn, s_id)?;
+        // Offer only when exactly one side is hand-touched (no merge; never silent).
+        match (l_touched, s_touched) {
+            (true, false) => offers.push(CarryOffer {
+                from_path: absolute(&local, &l_rel),
+                to_path: absolute(&shared, &s_rel),
+                to_kind: "shared".to_string(),
+            }),
+            (false, true) => offers.push(CarryOffer {
+                from_path: absolute(&shared, &s_rel),
+                to_path: absolute(&local, &l_rel),
+                to_kind: "local".to_string(),
+            }),
+            _ => {}
+        }
+    }
+    Ok(offers)
+}
+
+/// Apply an accepted carry-over offer (ADR 0011): copy the review state (draft
+/// timeline rallies with their flags, and annotations) from the recording at
+/// `from_path` onto the copy at `to_path` in the other library. The receiving
+/// copy's own state is replaced (it had none — the offer is only made when one
+/// side is un-touched), so this is idempotent. A no-op when either path is not a
+/// registered recording. Returns whether anything was carried.
+pub fn carry_review(conn: &mut Connection, from_path: &str, to_path: &str) -> rusqlite::Result<bool> {
+    // Either side may lie in the non-active library, so resolve both against
+    // every library's folder rather than only the active one.
+    let (Some(from_id), Some(to_id)) = (
+        recording_id_any_library(conn, from_path)?,
+        recording_id_any_library(conn, to_path)?,
+    ) else {
+        return Ok(false);
+    };
+    let tx = conn.transaction()?;
+    // Replace the receiver's (empty) timeline + annotations with the source's.
+    tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [to_id])?;
+    tx.execute("DELETE FROM annotations WHERE recording_id = ?1", [to_id])?;
+    tx.execute(
+        "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+         SELECT ?1, start_ms, end_ms, confidence, flagged FROM rallies WHERE recording_id = ?2",
+        rusqlite::params![to_id, from_id],
+    )?;
+    tx.execute(
+        "INSERT INTO annotations (recording_id, time_ms, verdict, aspect, note)
+         SELECT ?1, time_ms, verdict, aspect, note FROM annotations WHERE recording_id = ?2",
+        rusqlite::params![to_id, from_id],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The database id of the recording at absolute `path` in *whichever* library it
+/// lies under — the cross-library counterpart of [`recording_id`], which resolves
+/// only against the active library. Used by carry-over, whose receiving copy is by
+/// definition in the non-active library.
+fn recording_id_any_library(conn: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT kind, path FROM libraries")?;
+    let libs: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    for (kind, folder) in libs {
+        if let Some(rel) = relative(&folder, path) {
+            let id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM recordings WHERE library = ?1 AND path = ?2",
+                    rusqlite::params![&kind, &rel],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if id.is_some() {
+                return Ok(id);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Re-derive a recording's capture day from its embedded metadata (falling back
@@ -1963,6 +2215,143 @@ mod tests {
     fn designate_library_then_scan(conn: &mut Connection, folder: &Path) -> ScanResult {
         designate_library(conn, "local", folder, "local").unwrap();
         scan_library(conn).unwrap()
+    }
+
+    /// Flag the recording's first rally so it counts as hand-touched review state.
+    fn flag_first_rally(conn: &Connection, abs: &str) {
+        let id = recording_id(conn, abs).unwrap().unwrap();
+        conn.execute(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+             VALUES (?1, 0, 5000, 0.3, 1)",
+            [id],
+        )
+        .unwrap();
+    }
+
+    /// Cross-library re-home (issue #63): a recording deleted from the local
+    /// library and reappearing (hash + size) under the shared library re-homes
+    /// automatically, its review state and session moving to the shared library.
+    /// The reverse direction works too.
+    #[test]
+    fn cross_library_rehome_follows_a_moved_recording() {
+        let local = TempLib::new();
+        let shared = TempLib::new();
+        let mut conn = open(Path::new(":memory:")).unwrap();
+
+        // A recording in the local library, reviewed (a flagged rally).
+        local.write("day1/game.mp4", b"the-bytes");
+        designate_library(&mut conn, "local", &local.0, "local").unwrap();
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 1);
+        let local_abs = absolute(&local.0.to_string_lossy(), "day1/game.mp4");
+        flag_first_rally(&conn, &local_abs);
+        let rec_id = recording_id(&conn, &local_abs).unwrap().unwrap();
+
+        // Designate shared. The file is *moved* to the shared library: gone from
+        // local, present (same content) under shared.
+        designate_library(&mut conn, "shared", &shared.0, "network").unwrap();
+        std::fs::remove_file(local.0.join("day1/game.mp4")).unwrap();
+        shared.write("archive/game.mp4", b"the-bytes");
+
+        // Scanning shared (now active) re-homes the recording rather than
+        // registering a fresh one.
+        let result = scan_library(&mut conn).unwrap();
+        assert_eq!(result.registered, 0);
+        assert_eq!(result.relocated, 1);
+
+        // Same row, now in the shared library at its new relative key, review intact.
+        assert_eq!(rec_id, recording_id(&conn, &absolute(&shared.0.to_string_lossy(), "archive/game.mp4")).unwrap().unwrap());
+        let lib: String = conn
+            .query_row("SELECT library FROM recordings WHERE id = ?1", [rec_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lib, "shared");
+        let shared_abs = absolute(&shared.0.to_string_lossy(), "archive/game.mp4");
+        assert!(recording_timeline(&conn, &shared_abs).unwrap().unwrap().rallies[0].flagged);
+        // Its session travelled: the shared library holds it, local is emptied.
+        assert!(!list_sessions(&conn).unwrap().is_empty());
+        set_active_kind(&conn, "local").unwrap();
+        assert!(list_sessions(&conn).unwrap().is_empty());
+
+        // Reverse: move it back to local. Scanning local re-homes it back.
+        std::fs::remove_file(shared.0.join("archive/game.mp4")).unwrap();
+        local.write("back/game.mp4", b"the-bytes");
+        let result = scan_library(&mut conn).unwrap();
+        assert_eq!(result.relocated, 1);
+        assert_eq!(result.registered, 0);
+        let back_abs = absolute(&local.0.to_string_lossy(), "back/game.mp4");
+        assert_eq!(rec_id, recording_id(&conn, &back_abs).unwrap().unwrap());
+        assert!(recording_timeline(&conn, &back_abs).unwrap().unwrap().rallies[0].flagged);
+    }
+
+    /// A copy — the same content present in *both* libraries — is never re-homed
+    /// silently (issue #63): it stays a distinct recording in each library, and the
+    /// carry-over is only ever offered.
+    #[test]
+    fn copy_present_in_both_is_not_rehomed() {
+        let local = TempLib::new();
+        let shared = TempLib::new();
+        let mut conn = open(Path::new(":memory:")).unwrap();
+
+        local.write("game.mp4", b"same");
+        designate_library(&mut conn, "local", &local.0, "local").unwrap();
+        scan_library(&mut conn).unwrap();
+        let local_id = recording_id(&conn, &absolute(&local.0.to_string_lossy(), "game.mp4"))
+            .unwrap()
+            .unwrap();
+
+        designate_library(&mut conn, "shared", &shared.0, "network").unwrap();
+        shared.write("game.mp4", b"same"); // a copy — local still has its own
+        let result = scan_library(&mut conn).unwrap();
+        // Both files present → a fresh registration under shared, not a re-home.
+        assert_eq!(result.registered, 1);
+        assert_eq!(result.relocated, 0);
+        let shared_id = recording_id(&conn, &absolute(&shared.0.to_string_lossy(), "game.mp4"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(local_id, shared_id); // two distinct recordings, one per library
+    }
+
+    /// Carry-over offer (issue #63): same content in both libraries, one side
+    /// hand-touched and the other not → an offer to carry the review to the
+    /// un-touched copy; accepting copies the review; both-touched offers nothing.
+    #[test]
+    fn carry_offer_and_apply() {
+        let local = TempLib::new();
+        let shared = TempLib::new();
+        let mut conn = open(Path::new(":memory:")).unwrap();
+
+        local.write("game.mp4", b"same");
+        designate_library(&mut conn, "local", &local.0, "local").unwrap();
+        scan_library(&mut conn).unwrap();
+        let local_abs = absolute(&local.0.to_string_lossy(), "game.mp4");
+        // Hand-touch the local copy: a flagged rally plus an annotation.
+        flag_first_rally(&conn, &local_abs);
+        add_annotation(&conn, &local_abs, 1000, "mistake").unwrap();
+
+        designate_library(&mut conn, "shared", &shared.0, "network").unwrap();
+        shared.write("game.mp4", b"same");
+        scan_library(&mut conn).unwrap(); // registers the shared copy (un-touched)
+        let shared_abs = absolute(&shared.0.to_string_lossy(), "game.mp4");
+
+        // Exactly one offer, carrying local's review to the shared copy.
+        let offers = carry_offers(&conn).unwrap();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].from_path, local_abs);
+        assert_eq!(offers[0].to_path, shared_abs);
+        assert_eq!(offers[0].to_kind, "shared");
+
+        // Declining (not calling carry_review) leaves the shared copy untouched.
+        set_active_kind(&conn, "shared").unwrap();
+        assert!(recording_timeline(&conn, &shared_abs).unwrap().unwrap().rallies.is_empty());
+        assert!(recording_annotations(&conn, &shared_abs).unwrap().is_empty());
+
+        // Accepting carries the review over: the shared copy now has the flagged
+        // rally and the annotation.
+        assert!(carry_review(&mut conn, &offers[0].from_path, &offers[0].to_path).unwrap());
+        assert!(recording_timeline(&conn, &shared_abs).unwrap().unwrap().rallies[0].flagged);
+        assert_eq!(recording_annotations(&conn, &shared_abs).unwrap()[0].verdict, "mistake");
+
+        // Now both sides are hand-touched → no more offers (no merge; out of scope).
+        assert!(carry_offers(&conn).unwrap().is_empty());
     }
 
     use crate::media::CaptureDate;

@@ -141,6 +141,29 @@ async fn list_sessions(db: State<'_, Db>) -> Result<Vec<db::Session>, String> {
     db::list_sessions(&conn).map_err(|e| e.to_string())
 }
 
+/// Cross-library carry-over offers (ADR 0011): the same content exists in both
+/// libraries (a copy) and exactly one side has hand-touched review state. The app
+/// offers — never silently — to carry that review to the other copy. Surfaced to
+/// the user, who accepts via [`carry_review`] or declines (leaving both untouched).
+#[tauri::command]
+async fn carry_offers(db: State<'_, Db>) -> Result<Vec<db::CarryOffer>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::carry_offers(&conn).map_err(|e| e.to_string())
+}
+
+/// Accept a cross-library carry-over offer (ADR 0011): copy the review state from
+/// the copy at `from_path` onto the other-library copy at `to_path`. Returns
+/// whether anything was carried.
+#[tauri::command]
+async fn carry_review(
+    db: State<'_, Db>,
+    from_path: String,
+    to_path: String,
+) -> Result<bool, String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::carry_review(&mut conn, &from_path, &to_path).map_err(|e| e.to_string())
+}
+
 /// Resolve the draft timeline (rallies + per-region confidence) for the
 /// recording at `path` (ADR 0002). While segmentation is still running the
 /// `segment_state` is `unknown` and `rallies` is empty; the player polls until
@@ -630,6 +653,8 @@ pub fn run() {
             designate_library,
             switch_library,
             list_sessions,
+            carry_offers,
+            carry_review,
             recording_timeline,
             reanalyze_recording,
             rescan_library,
