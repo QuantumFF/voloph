@@ -2,6 +2,7 @@ mod db;
 mod export;
 mod media;
 mod segment;
+mod staging;
 
 // Embedded libmpv playback (ADR 0008). Linux-only — it links libmpv and drives
 // GTK directly; other targets get inert stubs so the crate still builds.
@@ -68,6 +69,11 @@ struct Db(Arc<Mutex<Connection>>);
 /// (ADR 0002) — before exiting, so anything registered while it runs is picked
 /// up on the same pass; a scan that arrives after it exits starts a fresh worker.
 struct MediaWorker(Arc<AtomicBool>);
+
+/// Where analysis stages recordings copied off a network-declared mount (ADR
+/// 0011). A per-run local scratch area, wiped on launch so an interrupted run
+/// leaves no orphaned copies; empty until the first stage.
+struct StagingDir(std::path::PathBuf);
 
 /// The active library's folder on this device (ADR 0011), or `None` when the
 /// active kind has not been designated yet — the frontend prompts for designation
@@ -447,8 +453,9 @@ fn spawn_media_worker(app: &AppHandle) {
     }
 
     let conn = app.state::<Db>().0.clone();
+    let staging_dir = app.state::<StagingDir>().0.clone();
     std::thread::spawn(move || {
-        run_media_worker(&conn);
+        run_media_worker(&conn, &staging_dir);
         running.store(false, Ordering::SeqCst);
     });
 }
@@ -456,7 +463,13 @@ fn spawn_media_worker(app: &AppHandle) {
 /// Drain the media-work queue (see [`db::next_media_work`]) until none remains.
 /// Each DB touch takes the lock only briefly; the ffmpeg probe and the audio
 /// extraction + segmentation run unlocked.
-fn run_media_worker(conn: &Mutex<Connection>) {
+///
+/// On a network-declared mount (ADR 0011) the probe+segment phases route through
+/// [`run_staged_analysis`] instead of streaming each file: every recording is
+/// copied once into `staging_dir`, analyzed locally, then evicted. The
+/// capture-date phase always streams — it reads only container headers, so
+/// staging would not save a network crossing.
+fn run_media_worker(conn: &Mutex<Connection>, staging_dir: &std::path::Path) {
     loop {
         let work = match conn.lock() {
             Ok(c) => db::next_media_work(&c),
@@ -476,27 +489,109 @@ fn run_media_worker(conn: &Mutex<Connection>) {
 
         match work {
             db::MediaWork::CaptureDate(id, path) => refine_recording_date(conn, id, &path),
-            db::MediaWork::Probe(id, path) => {
-                // libmpv plays any codec and seeks sparse GOPs (ADR 0008), so the
-                // recording is playable immediately — the probe only confirms the
-                // file is readable and marks the recording `ready`. A probe failure
-                // marks it `failed` instead.
-                let next = match media::probe(&path) {
-                    Ok(()) => "ready",
-                    Err(e) => {
-                        log::warn!("media worker: probe failed for {path}: {e}");
-                        "failed"
-                    }
-                };
-                if let Ok(c) = conn.lock() {
-                    if let Err(e) = db::set_probe_result(&c, id, next) {
-                        log::error!("media worker: could not record probe for {path}: {e}");
+            db::MediaWork::Probe(_, _) | db::MediaWork::Segment(_, _) => {
+                if is_network_mount(conn) {
+                    // Stage the whole pending batch once (copy-ahead overlaps the
+                    // next copy with the current analysis), then loop to pick up
+                    // any capture-date work or newly-arrived recordings.
+                    run_staged_analysis(conn, staging_dir);
+                } else {
+                    match work {
+                        db::MediaWork::Probe(id, path) => {
+                            probe_recording(conn, id, &path);
+                        }
+                        db::MediaWork::Segment(id, path) => segment_recording(conn, id, &path),
+                        db::MediaWork::CaptureDate(..) => unreachable!(),
                     }
                 }
             }
-            db::MediaWork::Segment(id, path) => segment_recording(conn, id, &path),
         }
     }
+}
+
+/// Whether the active library's mount is declared network (ADR 0011); errors and
+/// an absent library both read as "not network" (analyze in place).
+fn is_network_mount(conn: &Mutex<Connection>) -> bool {
+    conn.lock()
+        .ok()
+        .and_then(|c| db::active_mount(&c).ok().flatten())
+        .as_deref()
+        == Some("network")
+}
+
+/// Stage every pending recording in the active library once, run its remaining
+/// probe/segment phases against the local copy, and evict it (ADR 0011). Copy-
+/// ahead stages the next recording while the current one is analyzed. Returns
+/// after one pass over the snapshot; the caller loops to catch new work.
+fn run_staged_analysis(conn: &Mutex<Connection>, staging_dir: &std::path::Path) {
+    let pending = match conn.lock() {
+        Ok(c) => db::pending_analysis(&c).unwrap_or_default(),
+        Err(e) => {
+            log::error!("media worker: db lock poisoned listing pending analysis: {e}");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let mut cache = staging::StagingCache::new(staging_dir.to_path_buf(), staging::budget_bytes());
+    for i in 0..pending.len() {
+        let item = &pending[i];
+        // A re-analyze or fresh scan can flip the active library mid-batch; bail so
+        // the outer loop re-decides. (The cache drops here, evicting any prefetch.)
+        if !is_network_mount(conn) {
+            return;
+        }
+        let next = pending.get(i + 1).map(|n| std::path::Path::new(&n.path));
+        let staged = match cache.stage(std::path::Path::new(&item.path), next) {
+            Ok(s) => s,
+            Err(e) => {
+                // Staging failed (mount vanished, disk full): mark this recording
+                // failed so the pipeline does not loop, and move on.
+                log::warn!("media worker: staging failed for {}: {e}", item.path);
+                if item.needs_probe {
+                    if let Ok(c) = conn.lock() {
+                        let _ = db::set_probe_result(&c, item.id, "failed");
+                    }
+                } else {
+                    set_segment_state(conn, item.id, "failed", &item.path);
+                }
+                continue;
+            }
+        };
+        let local = staged.path().to_string_lossy().into_owned();
+        // Probe first; segmentation is gated on the probe marking the file
+        // playable, exactly as the streamed pipeline gates it.
+        let probe_ok = if item.needs_probe {
+            probe_recording(conn, item.id, &local) == "ready"
+        } else {
+            true
+        };
+        if item.needs_segment && probe_ok {
+            segment_recording(conn, item.id, &local);
+        }
+        // `staged` drops here → the copy is evicted before the next iteration.
+    }
+}
+
+/// Confirm a recording is readable and record the outcome (ADR 0008): `ready`
+/// once probed, `failed` otherwise. Returns the state it recorded so a staged
+/// pipeline can gate segmentation on it. `path` is whatever local path the caller
+/// wants ffprobe to read — the original, or a staged copy.
+fn probe_recording(conn: &Mutex<Connection>, id: i64, path: &str) -> &'static str {
+    let state = match media::probe(path) {
+        Ok(()) => "ready",
+        Err(e) => {
+            log::warn!("media worker: probe failed for {path}: {e}");
+            "failed"
+        }
+    };
+    if let Ok(c) = conn.lock() {
+        if let Err(e) = db::set_probe_result(&c, id, state) {
+            log::error!("media worker: could not record probe for {path}: {e}");
+        }
+    }
+    state
 }
 
 /// Extract the recording's audio and motion tracks and run the hybrid segmenter
@@ -636,6 +731,11 @@ pub fn run() {
             let conn = db::open(&dir.join("voloph.db"))?;
             app.manage(Db(Arc::new(Mutex::new(conn))));
             app.manage(MediaWorker(Arc::new(AtomicBool::new(false))));
+            // Wipe any staged copies an interrupted run left behind (ADR 0011); the
+            // staging area holds only in-flight copies, never durable state.
+            let staging_dir = dir.join("staging");
+            staging::clean(&staging_dir);
+            app.manage(StagingDir(staging_dir));
             // Resume any media work left unfinished by a previous run (recordings
             // still needing a probe or segmentation) so every recording gets its
             // frame rate and draft timeline.

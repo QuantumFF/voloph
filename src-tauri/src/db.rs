@@ -1113,6 +1113,69 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     Ok(segment.map(|(id, rel)| MediaWork::Segment(id, absolute(&library, &rel))))
 }
 
+/// The declared locality ('local' or 'network') of the **active** library's mount
+/// on this device (ADR 0011), or `None` when no library is designated. Analysis
+/// stages recordings only when this is `network`; local mounts analyze in place.
+pub fn active_mount(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    let kind = active_kind(conn)?;
+    conn.query_row(
+        "SELECT mount FROM libraries WHERE kind = ?1",
+        [&kind],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// A recording in the active library still needing analysis, with its absolute
+/// path on this device (ADR 0011) and which phases remain. Used by the staged
+/// network pipeline, which stages the file once and runs every remaining phase
+/// against the copy — so it needs the whole per-recording picture up front,
+/// unlike [`next_media_work`]'s one-item-at-a-time queue.
+#[derive(Debug, PartialEq)]
+pub struct PendingAnalysis {
+    pub id: i64,
+    pub path: String,
+    pub needs_probe: bool,
+    pub needs_segment: bool,
+}
+
+/// Every recording in the active library still needing a probe or segmentation,
+/// lowest id first, with absolute paths resolved against the active mount. Drives
+/// the staged network pipeline (copy-ahead needs to see the next recording). The
+/// capture-date phase is intentionally excluded — it reads only container headers,
+/// so it never benefits from staging and runs unstaged in the ordinary queue.
+pub fn pending_analysis(conn: &Connection) -> rusqlite::Result<Vec<PendingAnalysis>> {
+    let kind = active_kind(conn)?;
+    let Some(library) = library_path_of(conn, &kind)? else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, path, probe_state, segment_state FROM recordings
+         WHERE library = ?1
+           AND (probe_state = 'unknown'
+                OR (probe_state = 'ready' AND segment_state = 'unknown'))
+         ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([&kind], |row| {
+            let id: i64 = row.get(0)?;
+            let rel: String = row.get(1)?;
+            let probe_state: String = row.get(2)?;
+            let segment_state: String = row.get(3)?;
+            Ok(PendingAnalysis {
+                id,
+                path: absolute(&library, &rel),
+                needs_probe: probe_state == "unknown",
+                // Segment when it hasn't been done — after the probe, if the probe
+                // marks the file playable. `unknown` here means either already
+                // probed-ready (probe skipped) or about to be probed this pass.
+                needs_segment: segment_state == "unknown",
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Record a probe's outcome (issue #19): the playability state — `ready` once
 /// probed, since libmpv plays the original directly (ADR 0008), or `failed`.
 pub fn set_probe_result(conn: &Connection, id: i64, state: &str) -> rusqlite::Result<()> {
@@ -2119,6 +2182,51 @@ mod tests {
             recording_timeline(&conn, &shared_abs).unwrap().unwrap().rallies[0].flagged,
             true
         );
+    }
+
+    /// The staged network pipeline (issue #64) reads the active library's declared
+    /// locality and the list of recordings still needing analysis. `active_mount`
+    /// reflects the active library ('network' vs 'local'); `pending_analysis`
+    /// lists exactly the recordings needing a probe or segment, with the phases
+    /// each still needs, and empties as they complete.
+    #[test]
+    fn active_mount_and_pending_analysis_drive_staging() {
+        let local = TempLib::new();
+        let shared = TempLib::new();
+        local.write("a.mp4", b"local-a");
+        shared.write("s1.mp4", b"shared-1");
+        shared.write("s2.mp4", b"shared-2");
+        let mut conn = open(Path::new(":memory:")).unwrap();
+
+        // Local library: mount is always local, so nothing stages.
+        designate_library(&mut conn, "local", &local.0, "local").unwrap();
+        scan_library(&mut conn).unwrap();
+        assert_eq!(active_mount(&conn).unwrap().as_deref(), Some("local"));
+
+        // Shared library declared network: active_mount reports network, and both
+        // freshly-scanned recordings are pending both phases.
+        designate_library(&mut conn, "shared", &shared.0, "network").unwrap();
+        scan_library(&mut conn).unwrap();
+        assert_eq!(active_mount(&conn).unwrap().as_deref(), Some("network"));
+        let pending = pending_analysis(&conn).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|p| p.needs_probe && p.needs_segment));
+        // Paths are absolute under the shared mount.
+        assert!(pending
+            .iter()
+            .all(|p| p.path.starts_with(&*shared.0.to_string_lossy())));
+
+        // Probe one recording ready: it now needs only segmentation, not a probe.
+        set_probe_result(&conn, pending[0].id, "ready").unwrap();
+        let after_probe = pending_analysis(&conn).unwrap();
+        let first = after_probe.iter().find(|p| p.id == pending[0].id).unwrap();
+        assert!(!first.needs_probe && first.needs_segment);
+
+        // Segment it: it drops out of the pending list entirely.
+        save_rallies(&mut conn, pending[0].id, 1000, &[], &[]).unwrap();
+        let remaining = pending_analysis(&conn).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, pending[1].id);
     }
 
     /// A throwaway directory under the OS temp dir, removed on drop — enough for the
