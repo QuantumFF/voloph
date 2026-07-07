@@ -48,6 +48,14 @@ _Avoid_: highlight, star, favourite, bookmark
 Every rally is classified **long** or **short** by its duration against a threshold. Purely objective and automatic — derived from the timeline, carrying no judgment of quality. Used to filter and surface rallies (e.g. "show me the long rallies"). Quality (good/bad) is never inferred from length; it is only ever set manually.
 _Avoid_: good/bad, quality, rating
 
+**Library**:
+A folder that is the app's whole world of recordings while active — every recording lives under the active library; a video outside it does not exist to the app. There are at most two: one **shared library** on common storage (NAS, cloud-drive mount) that other people and devices reach, and one **local library**, private to this device. A switcher makes one active at a time; the session list, filters, and review all see only the active library, and a session never spans libraries. The user puts files in a library; the app only references them (reference-in-place, ADR 0003, is unchanged). Identity inside a library is by location relative to its folder. For the shared library, each device declares where it is mounted and whether that mount is local or network — per-device knowledge, never shared. Session bundles exist only in the shared library.
+_Avoid_: library root, managed library, sync folder, cloud folder, central storage, scanned folder, network library (how a device reaches the shared library is per-device)
+
+**Session bundle**:
+A shareable snapshot of one session's review state — timeline, annotations, flags — carrying no video. Its recordings are referenced by their place within the shared library, so a bundle is useful only to a recipient who reaches the same shared storage. **Share** produces a bundle; **receive** applies one: the state becomes the recipient's own review, with no attribution or provenance (a note can carry a signature). Where the recipient has already hand-touched a recording's review, they choose keep-mine-or-take-theirs per recording; nothing merges. A snapshot handed over, not a collaboration channel. Distinct from Export, which renders a watchable video.
+_Avoid_: export/import (for metadata), sync, backup, snapshot (alone)
+
 **Review**:
 Watching back a recorded game to study one's own play. The primary activity the app exists to support. Non-destructive: navigating and annotating over the original file, never altering it.
 
