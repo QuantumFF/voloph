@@ -1,9 +1,10 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { open, save } from "@tauri-apps/plugin-dialog"
 import {
   AlertTriangleIcon,
+  CheckCircle2Icon,
   ClapperboardIcon,
   DownloadIcon,
   FilterIcon,
@@ -254,14 +255,38 @@ export function SessionList({
   } | null>(null)
   // Draft name in the share dialog, seeded from the persisted label.
   const [shareName, setShareName] = useState<string>("")
-  // One-line confirmation after a successful share, cleared on the next action.
-  const [shareNote, setShareNote] = useState<string | null>(null)
+  // Transient top-center toasts for share/receive confirmations (issue): a
+  // shared or received bundle used to leave a line of grey text that lingered;
+  // a toast surfaces the outcome where the eye is and clears itself. Each has a
+  // monotonic id (a ref counter, never reused) so removal targets the right one.
+  const [toasts, setToasts] = useState<
+    { id: number; message: string }[]
+  >([])
+  const toastSeq = useRef(0)
+  const showToast = useCallback((message: string) => {
+    const id = (toastSeq.current += 1)
+    setToasts((prev) => [...prev, { id, message }])
+    setTimeout(
+      () => setToasts((prev) => prev.filter((t) => t.id !== id)),
+      3500
+    )
+  }, [])
   // The bundle file currently being received (ADR 0012): its path, the outcome
-  // of the receive, and which hand-touched recordings still need a keep-mine-or-
-  // take-theirs choice. Null until the user opens a bundle.
+  // of the receive, which hand-touched recordings still need a keep-mine-or-
+  // take-theirs choice, and how many of those the user has taken-theirs on so
+  // far. `resolved` matters for the final count: an updated session's recordings
+  // arrive as conflicts (they carry the review from the first receive, so they
+  // read as hand-touched), so `applied` is 0 and only the resolutions count.
+  // Null until the user opens a bundle.
   const [receiving, setReceiving] = useState<{
     bundlePath: string
     result: ReceiveResult
+    resolved: number
+    // Remaining bundle paths of an "Accept all" run to process after this one,
+    // and the recordings already tallied earlier in that run. Both empty/zero
+    // for a lone receive.
+    queue: string[]
+    tally: number
   } | null>(null)
 
   const refresh = useCallback(async () => {
@@ -313,29 +338,96 @@ export function SessionList({
     }
   }
 
-  // Accept a discovered bundle offer (ADR 0012, issue #67): run the receive flow
-  // on it, which registers the covered recordings straight from the bundle (no
-  // probe/segmentation/staging). Surfaces the same conflict/refusal resolution
-  // dialog as a manually-opened bundle when anything needs the user's choice.
+  // Receive a run of bundles in order (ADR 0012, issue #67), tallying the
+  // recordings whose review changed. Clean bundles apply straight from disk (no
+  // probe/segmentation/staging) and are acknowledged so their offer retires; the
+  // first bundle that needs a conflict/refusal choice hands off to the dialog,
+  // parking the rest of the run in `receiving.queue` — the dialog resumes them
+  // via `finishReceive` once the user is done. `tally` carries the count already
+  // accrued earlier in the run. This one function backs a single offer, a
+  // manually-opened bundle, and "Accept all" alike.
+  async function runReceives(paths: string[], tally: number) {
+    for (let i = 0; i < paths.length; i++) {
+      const bundlePath = paths[i]
+      let result: ReceiveResult
+      try {
+        result = await trackedInvoke<ReceiveResult>("receive_session_bundle", {
+          bundlePath,
+        })
+      } catch (e) {
+        setError(String(e))
+        return
+      }
+      if (result.conflicts.length > 0 || result.refused.length > 0) {
+        await refresh()
+        setReceiving({
+          bundlePath,
+          result,
+          resolved: 0,
+          queue: paths.slice(i + 1),
+          tally,
+        })
+        return
+      }
+      try {
+        await trackedInvoke("acknowledge_bundle", { bundlePath })
+      } catch (e) {
+        setError(String(e))
+      }
+      tally += result.applied
+    }
+    await refresh()
+    toastReceived(tally)
+  }
+
+  // Accept one discovered offer.
   async function handleReceiveOffer(offer: BundleOffer) {
     setError(null)
-    setShareNote(null)
+    await runReceives([offer.bundle_path], 0)
+  }
+
+  // Accept every discovered offer at once: receive them in listed order, each
+  // conflict/refusal dialog resolved before the next bundle is touched.
+  async function handleReceiveAll() {
+    setError(null)
+    const paths = bundleOffers.map((o) => o.bundle_path)
+    if (paths.length === 0) return
+    await runReceives(paths, 0)
+  }
+
+  // Conclude the current dialog bundle (ADR 0012): acknowledge it so its offer
+  // retires (only a re-share re-offers it, as an update), then either resume the
+  // rest of an "Accept all" run or, when the run is done, refresh and toast the
+  // batch total. `resolved` is the count of conflicts the user took-theirs on.
+  async function finishReceive(r: {
+    bundlePath: string
+    result: ReceiveResult
+    resolved: number
+    queue: string[]
+    tally: number
+  }) {
     try {
-      const result = await trackedInvoke<ReceiveResult>(
-        "receive_session_bundle",
-        { bundlePath: offer.bundle_path }
-      )
-      await refresh()
-      if (result.conflicts.length > 0 || result.refused.length > 0) {
-        setReceiving({ bundlePath: offer.bundle_path, result })
-      } else {
-        setShareNote(
-          `Received ${result.applied} recording${result.applied === 1 ? "" : "s"}.`
-        )
-      }
+      await trackedInvoke("acknowledge_bundle", { bundlePath: r.bundlePath })
     } catch (e) {
       setError(String(e))
     }
+    const tally = r.tally + r.result.applied + r.resolved
+    if (r.queue.length > 0) {
+      await runReceives(r.queue, tally)
+    } else {
+      await refresh()
+      toastReceived(tally)
+    }
+  }
+
+  // Toast the outcome of a receive run: the true number of recordings whose
+  // review changed (taken silently plus every take-theirs), or a no-change note.
+  function toastReceived(count: number) {
+    showToast(
+      count > 0
+        ? `Received ${count} recording${count === 1 ? "" : "s"}.`
+        : "No changes — kept your existing review."
+    )
   }
 
   // Decline a discovered bundle offer (ADR 0012, issue #67): record it so it
@@ -345,6 +437,20 @@ export function SessionList({
     setError(null)
     try {
       await trackedInvoke("decline_bundle", { bundlePath: offer.bundle_path })
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // Dismiss every discovered offer at once: decline each, then refresh so the
+  // combined box disappears.
+  async function handleDeclineAll() {
+    setError(null)
+    try {
+      for (const offer of bundleOffers) {
+        await trackedInvoke("decline_bundle", { bundlePath: offer.bundle_path })
+      }
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -492,7 +598,6 @@ export function SessionList({
   // Seeds the name field with the persisted label so the user confirms it once.
   function openShare(session: Session, saveAs: boolean) {
     setError(null)
-    setShareNote(null)
     setShareName(sharerLabel)
     setShareTarget({ session, saveAs })
   }
@@ -520,13 +625,13 @@ export function SessionList({
           sharerLabel: name,
           output,
         })
-        setShareNote("Bundle saved.")
+        showToast("Bundle saved.")
       } else {
         await trackedInvoke("share_session_bundle", {
           sessionId: session.id,
           sharerLabel: name,
         })
-        setShareNote("Shared to the shared library.")
+        showToast("Shared to the shared library.")
       }
       setSharerLabel(name)
     } catch (e) {
@@ -540,25 +645,13 @@ export function SessionList({
   // keep-mine-or-take-theirs conflicts. Refreshes so applied state appears at once.
   async function handleReceive() {
     setError(null)
-    setShareNote(null)
     try {
       const picked = await open({
         multiple: false,
         filters: [{ name: "Voloph bundle", extensions: ["vbundle"] }],
       })
       if (typeof picked !== "string") return
-      const result = await trackedInvoke<ReceiveResult>(
-        "receive_session_bundle",
-        { bundlePath: picked }
-      )
-      await refresh()
-      if (result.conflicts.length > 0 || result.refused.length > 0) {
-        setReceiving({ bundlePath: picked, result })
-      } else {
-        setShareNote(
-          `Received ${result.applied} recording${result.applied === 1 ? "" : "s"}.`
-        )
-      }
+      await runReceives([picked], 0)
     } catch (e) {
       setError(String(e))
     }
@@ -577,16 +670,21 @@ export function SessionList({
           path,
           takeTheirs: true,
         })
-        await refresh()
       }
-      setReceiving((prev) => {
-        if (!prev) return prev
-        const conflicts = prev.result.conflicts.filter((c) => c !== path)
-        if (conflicts.length === 0 && prev.result.refused.length === 0) {
-          return null
-        }
-        return { ...prev, result: { ...prev.result, conflicts } }
-      })
+      const conflicts = receiving.result.conflicts.filter((c) => c !== path)
+      const resolved = receiving.resolved + (takeTheirs ? 1 : 0)
+      if (conflicts.length === 0 && receiving.result.refused.length === 0) {
+        // Last one resolved: close this dialog and conclude — acknowledge, then
+        // either resume the rest of an "Accept all" run or toast the total.
+        setReceiving(null)
+        await finishReceive({ ...receiving, resolved })
+      } else {
+        setReceiving({
+          ...receiving,
+          result: { ...receiving.result, conflicts },
+          resolved,
+        })
+      }
     } catch (e) {
       setError(String(e))
     }
@@ -613,6 +711,23 @@ export function SessionList({
 
   return (
     <div className="flex h-full flex-col">
+      {/* Top-center toast stack: transient share/receive confirmations. Fixed
+          and pointer-transparent so it floats over the library without stealing
+          clicks; each toast clears itself after a few seconds. */}
+      {toasts.length > 0 ? (
+        <div className="pointer-events-none fixed inset-x-0 top-4 z-50 flex flex-col items-center gap-2 px-4">
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              className="flex items-center gap-2 rounded-md border bg-popover px-3 py-2 text-sm font-medium text-popover-foreground shadow-md"
+            >
+              <CheckCircle2Icon className="size-4 text-emerald-600 dark:text-emerald-400" />
+              {t.message}
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       <AlertDialog
         open={confirmAction !== null}
         onOpenChange={(o) => {
@@ -727,7 +842,15 @@ export function SessionList({
       <AlertDialog
         open={receiving !== null}
         onOpenChange={(o) => {
-          if (!o) setReceiving(null)
+          // Closing with conflicts/refusals still listed keeps mine for the
+          // rest — conclude the receive here (toast + acknowledge) so it does
+          // not linger. A programmatic close from resolveConflict already
+          // finished and does not re-enter this handler.
+          if (!o && receiving) {
+            const snapshot = receiving
+            setReceiving(null)
+            void finishReceive(snapshot)
+          }
         }}
       >
         <AlertDialogContent>
@@ -924,9 +1047,6 @@ export function SessionList({
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-4xl space-y-4 px-4 py-6">
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
-          {shareNote ? (
-            <p className="text-sm text-muted-foreground">{shareNote}</p>
-          ) : null}
           {unresolved.length > 0 ? (
             <div className="rounded-lg border border-amber-500/50 bg-amber-500/5 px-4 py-3 text-sm">
               <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-500">
@@ -964,39 +1084,73 @@ export function SessionList({
               offer stays available (with a dismiss) instead of expiring. */}
           {/* Discovered shared reviews (ADR 0012, issue #67): bundles other people
               dropped into the shared library, offered before analysis runs on the
-              recordings they cover. Accept receives; decline stops the nagging. */}
-          {bundleOffers.map((offer) => (
-            <div
-              key={offer.bundle_path}
-              className="rounded-lg border border-emerald-500/50 bg-emerald-500/5 px-4 py-3 text-sm"
-            >
-              <div className="font-medium text-emerald-700 dark:text-emerald-400">
-                {offer.is_update ? "An updated shared" : "A shared"} review of{" "}
-                {formatCaptureDay(offer.capture_day)} from{" "}
-                <span className="font-medium">{offer.sharer_label}</span> is
-                available — receive it?
+              recordings they cover. One combined box lists every offer with a per-
+              row Receive/dismiss and, when more than one is waiting, Accept/Dismiss
+              all. Accept receives; decline stops the nagging until a re-share. */}
+          {bundleOffers.length > 0 ? (
+            <div className="rounded-lg border border-emerald-500/50 bg-emerald-500/5 px-4 py-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <div className="font-medium text-emerald-700 dark:text-emerald-400">
+                  {bundleOffers.length} shared review
+                  {bundleOffers.length === 1 ? "" : "s"} available
+                </div>
+                {bundleOffers.length > 1 ? (
+                  <div className="flex shrink-0 gap-2">
+                    <Button size="sm" onClick={() => void handleReceiveAll()}>
+                      Accept all
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void handleDeclineAll()}
+                    >
+                      Dismiss all
+                    </Button>
+                  </div>
+                ) : null}
               </div>
               <p className="mt-1 text-muted-foreground">
                 Applies their timeline, annotations, and flags. No video is
                 copied, and the covered recordings are not re-analyzed.
               </p>
-              <div className="mt-2 flex gap-2">
-                <Button
-                  size="sm"
-                  onClick={() => void handleReceiveOffer(offer)}
-                >
-                  Receive review
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void handleDeclineOffer(offer)}
-                >
-                  Not now
-                </Button>
-              </div>
+              <ul className="mt-2 space-y-1.5">
+                {bundleOffers.map((offer) => (
+                  <li
+                    key={offer.bundle_path}
+                    className="flex items-center gap-2"
+                  >
+                    <span className="min-w-0 flex-1 truncate">
+                      {offer.is_update ? (
+                        <span className="mr-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                          Updated
+                        </span>
+                      ) : null}
+                      {formatCaptureDay(offer.capture_day)} from{" "}
+                      <span className="font-medium">{offer.sharer_label}</span>
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 shrink-0"
+                      onClick={() => void handleReceiveOffer(offer)}
+                    >
+                      Receive
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="size-7 shrink-0 text-muted-foreground"
+                      onClick={() => void handleDeclineOffer(offer)}
+                      title="Not now — stop offering this until it is re-shared"
+                    >
+                      <XIcon className="size-3.5" />
+                      <span className="sr-only">Dismiss this shared review</span>
+                    </Button>
+                  </li>
+                ))}
+              </ul>
             </div>
-          ))}
+          ) : null}
           {sessions.length === 0 ? (
             <div className="rounded-xl border border-dashed px-6 py-16 text-center">
               <p className="font-medium">

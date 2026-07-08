@@ -331,6 +331,18 @@ async fn decline_bundle(app: AppHandle, db: State<'_, Db>, bundle_path: String) 
     Ok(())
 }
 
+/// Record a received bundle's on-disk signature so `discover_bundles` stops
+/// offering it (ADR 0012). Once the user has taken this exact bundle — and
+/// resolved any conflicts — the offer should not reappear; only a re-share (a
+/// new signature) surfaces it again, as an update. Shares the "seen" ledger with
+/// [`decline_bundle`], but there is nothing to release back to analysis: the
+/// covered recordings were just registered from the bundle as ready.
+#[tauri::command]
+async fn acknowledge_bundle(db: State<'_, Db>, bundle_path: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::decline_bundle(&conn, &bundle_path)
+}
+
 /// Resolve the draft timeline (rallies + per-region confidence) for the
 /// recording at `path` (ADR 0002). While segmentation is still running the
 /// `segment_state` is `unknown` and `rallies` is empty; the player polls until
@@ -934,6 +946,7 @@ pub fn run() {
             resolve_bundle_conflict,
             discover_bundles,
             decline_bundle,
+            acknowledge_bundle,
             aspect_vocabulary,
             recording_timeline,
             reanalyze_recording,

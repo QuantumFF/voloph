@@ -2614,9 +2614,11 @@ fn pending_bundle_paths(conn: &Connection) -> std::collections::HashSet<String> 
     covered
 }
 
-/// Record that the user declined the bundle at `bundle_path`: store its current
-/// signature so it stops nagging until it changes (ADR 0012). Re-declining a
-/// changed bundle simply overwrites the stored signature.
+/// Record `bundle_path`'s current signature in the "seen" ledger so it stops
+/// nagging until it changes (ADR 0012). Both declining an offer and finishing
+/// its receive land here — either way the user has dealt with this exact bundle,
+/// and only a re-share (a new signature) should surface it again, as an update.
+/// Re-recording a changed bundle simply overwrites the stored signature.
 pub fn decline_bundle(conn: &Connection, bundle_path: &str) -> Result<(), String> {
     let signature = bundle_signature(Path::new(bundle_path))
         .ok_or_else(|| "bundle file could not be read".to_string())?;
