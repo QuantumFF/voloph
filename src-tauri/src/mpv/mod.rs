@@ -1,79 +1,57 @@
-//! Embedded libmpv playback (ADR 0008).
+//! Embedded libmpv playback (ADR 0008, ADR 0014).
 //!
 //! Recordings are decoded and rendered by **libmpv linked in-process**, drawing
-//! into a native `GtkGLArea` overlaid on the Tauri webview — not an HTML
-//! `<video>` element. This is the tracer slice (issue #34): one recording,
-//! play/pause only. Seeking, frame-step, speed and the session orchestration are
-//! later slices.
+//! into a native surface tiled beside the webview UI — not an HTML `<video>`
+//! element. This module is the platform-neutral core: the libmpv *client* API
+//! (load/seek/pause/speed and the property-change event stream) is identical on
+//! every platform, so the Tauri commands and the event loop live here. Only the
+//! *surface* — where mpv's video actually lands and how it is slaved to the
+//! frontend-reported rect — is platform work, delegated to one backend:
 //!
-//! ## Why the OpenGL render API rather than `--wid`
+//! - [`linux`]: mpv's OpenGL render API drawing into a `GtkGLArea` overlaid on
+//!   the webview (ADR 0008 — `--wid` is unsupported on Wayland).
+//! - [`windows`]: a child `HWND` mpv adopts via `--wid` and renders into
+//!   itself (ADR 0014 — no render plumbing needed where `--wid` works).
 //!
-//! mpv can embed into a foreign window via `--wid` on X11, but this host runs
-//! Wayland (where `--wid` is unsupported). So we drive mpv's **render API**: mpv
-//! decodes and hands us frames to draw with OpenGL into a `GtkGLArea` we own.
-//! GTK composites that area *above* the webview (ADR 0008 "Family A": the webview
-//! never draws over the video rect), and the GL path stays usable on NVIDIA even
-//! though WebKitGTK's own DMA-BUF renderer is disabled here (ADR + issue #33).
+//! Each backend exposes the same two hooks: `init` (create the surface and the
+//! configured mpv handle) and [`SurfaceTx`] (rect/show/hide, marshalled to the
+//! platform's UI thread).
 //!
 //! ## Threads
 //!
-//! libmpv's client API is thread-safe, so the play/pause/load Tauri commands call
-//! it directly from their worker threads ([`MpvState`]). Everything touching GTK
-//! (showing, moving and rendering the `GtkGLArea`) must run on the GTK main
-//! thread, so it is funnelled through a glib channel ([`SurfaceTx`]) whose
-//! receiver is attached to the main loop in [`init`]. mpv's render-update
-//! callback (which fires from mpv's own thread when a new frame is ready) posts a
-//! `Render` message down the same channel, which calls `queue_render` on the main
-//! thread.
-
-#![cfg(target_os = "linux")]
+//! libmpv's client API is thread-safe, so the play/pause/load Tauri commands
+//! call it directly from their worker threads ([`MpvState`]). Surface
+//! manipulation must run on the platform UI thread; [`SurfaceTx`] hides the
+//! marshalling (a glib channel on Linux, `run_on_main_thread` on Windows).
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
-use gtk::prelude::*;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as platform;
+
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows as platform;
+
+pub use platform::SurfaceTx;
+
 // ---------------------------------------------------------------------------
-// libmpv FFI (client.h + render_gl.h). Only the handful of entry points this
-// slice needs are declared; layouts mirror the system headers exactly.
+// libmpv FFI (client.h). Only the handful of entry points this app needs are
+// declared; layouts mirror the system headers exactly. The render API
+// (render_gl.h) is Linux-only and declared in the linux backend.
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-struct MpvHandle {
+pub(crate) struct MpvHandle {
     _private: [u8; 0],
 }
-#[repr(C)]
-struct MpvRenderContext {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-struct MpvRenderParam {
-    id: c_int,
-    data: *mut c_void,
-}
-
-#[repr(C)]
-struct MpvOpenglInitParams {
-    get_proc_address: extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
-    get_proc_address_ctx: *mut c_void,
-}
-
-#[repr(C)]
-struct MpvOpenglFbo {
-    fbo: c_int,
-    w: c_int,
-    h: c_int,
-    internal_format: c_int,
-}
-
-const MPV_RENDER_PARAM_INVALID: c_int = 0;
-const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
-const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
-const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
-const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 
 // --- Event API (client.h). Only what the playhead/end stream needs. ---
 
@@ -137,17 +115,14 @@ const MUTE_USERDATA: u64 = 5;
 /// playback at 0). `None` opens the file at its start. The last load wins.
 static PENDING_START_MS: Mutex<Option<f64>> = Mutex::new(None);
 
-// libmpv refuses to initialize unless `LC_NUMERIC` is the C locale (it parses
-// floats with `.` decimals); GTK sets a localized one, so we pin it before
-// creating the handle. `LC_NUMERIC` is 1 on glibc.
-const LC_NUMERIC: c_int = 1;
+// On Linux this resolves via the `-lmpv` emitted by build.rs. On Windows,
+// `raw-dylib` makes the linker synthesize the import stubs for libmpv-2.dll
+// directly — no import library (.lib/.dll.a) is needed; the DLL itself ships
+// beside the exe (fetched by scripts/fetch-libmpv.sh, bundled as a resource).
+#[cfg_attr(target_os = "windows", link(name = "libmpv-2", kind = "raw-dylib"))]
 extern "C" {
-    fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char;
-}
-
-extern "C" {
-    fn mpv_create() -> *mut MpvHandle;
-    fn mpv_initialize(ctx: *mut MpvHandle) -> c_int;
+    pub(crate) fn mpv_create() -> *mut MpvHandle;
+    pub(crate) fn mpv_initialize(ctx: *mut MpvHandle) -> c_int;
     fn mpv_set_option_string(
         ctx: *mut MpvHandle,
         name: *const c_char,
@@ -168,91 +143,16 @@ extern "C" {
         format: c_int,
     ) -> c_int;
     fn mpv_wait_event(ctx: *mut MpvHandle, timeout: f64) -> *mut MpvEvent;
-
-    fn mpv_render_context_create(
-        res: *mut *mut MpvRenderContext,
-        mpv: *mut MpvHandle,
-        params: *mut MpvRenderParam,
-    ) -> c_int;
-    fn mpv_render_context_set_update_callback(
-        ctx: *mut MpvRenderContext,
-        callback: extern "C" fn(*mut c_void),
-        callback_ctx: *mut c_void,
-    );
-    fn mpv_render_context_render(ctx: *mut MpvRenderContext, params: *mut MpvRenderParam) -> c_int;
-}
-
-// ---------------------------------------------------------------------------
-// GL symbol resolution. mpv asks us to resolve GL entry points by name. The
-// right resolver is the platform's GL loader: this host is Wayland/EGL, where
-// `eglGetProcAddress` resolves both core and extension functions on NVIDIA
-// (which advertises EGL_KHR_get_all_proc_addresses). We do *not* dlsym out of
-// libepoxy — it exposes the GL names only as header macros over `epoxy_*`
-// dispatchers, so `dlsym(libepoxy, "glGetString")` is NULL and mpv would report
-// the GL backend unusable. A global `dlsym` is kept as a fallback for any symbol
-// EGL misses. Both are resolved out of the already-loaded driver libraries via
-// `RTLD_DEFAULT`, so no extra link dependency is needed.
-// ---------------------------------------------------------------------------
-
-const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
-/// `RTLD_DEFAULT` is the null handle on glibc — search every loaded object.
-const RTLD_DEFAULT: *mut c_void = ptr::null_mut();
-
-extern "C" {
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-}
-
-/// `eglGetProcAddress`, resolved once from the loaded EGL library.
-unsafe fn egl_get_proc_address(name: *const c_char) -> *mut c_void {
-    type GetProc = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-    static ADDR: OnceLock<usize> = OnceLock::new();
-    let addr = *ADDR.get_or_init(|| dlsym(RTLD_DEFAULT, c"eglGetProcAddress".as_ptr()) as usize);
-    if addr == 0 {
-        return ptr::null_mut();
-    }
-    let func: GetProc = std::mem::transmute(addr);
-    func(name)
-}
-
-/// Resolve a GL function by NUL-terminated C name: EGL loader first, global
-/// `dlsym` fallback.
-unsafe fn gl_symbol(name: *const c_char) -> *mut c_void {
-    let via_egl = egl_get_proc_address(name);
-    if !via_egl.is_null() {
-        return via_egl;
-    }
-    dlsym(RTLD_DEFAULT, name)
 }
 
 /// Human-readable form of an mpv error code (`mpv_error_string`), for logs.
-fn mpv_err(code: c_int) -> String {
+pub(crate) fn mpv_err(code: c_int) -> String {
     let p = unsafe { mpv_error_string(code) };
     if p.is_null() {
         return format!("error {code}");
     }
     let msg = unsafe { CStr::from_ptr(p) }.to_string_lossy();
     format!("{msg} ({code})")
-}
-
-/// mpv's OpenGL `get_proc_address` callback.
-extern "C" fn get_proc_address(_ctx: *mut c_void, name: *const c_char) -> *mut c_void {
-    if name.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe { gl_symbol(name) }
-}
-
-/// Query the FBO id GtkGLArea has bound for this frame, via `glGetIntegerv`.
-fn current_framebuffer() -> c_int {
-    type GetIntegerv = unsafe extern "C" fn(u32, *mut c_int);
-    let sym = unsafe { gl_symbol(c"glGetIntegerv".as_ptr()) };
-    if sym.is_null() {
-        return 0;
-    }
-    let func: GetIntegerv = unsafe { std::mem::transmute(sym) };
-    let mut value: c_int = 0;
-    unsafe { func(GL_FRAMEBUFFER_BINDING, &mut value) };
-    value
 }
 
 // ---------------------------------------------------------------------------
@@ -268,242 +168,20 @@ pub struct MpvState {
 unsafe impl Send for MpvState {}
 unsafe impl Sync for MpvState {}
 
-/// Messages to the GTK main thread that manipulate the video surface. The
-/// receiver (attached to the main loop in [`init`]) owns the `GtkGLArea`.
-enum SurfaceMsg {
-    /// mpv has a new frame ready — ask the area to redraw.
-    Render,
-    /// Slave the surface to the video pane's bounding rect (CSS px, top-left
-    /// origin), reported by the frontend's `ResizeObserver`.
-    Rect { x: i32, y: i32, w: i32, h: i32 },
-    /// Reveal the surface (player view mounted).
-    Show,
-    /// Hide the surface (back to the session list — no orphan window).
-    Hide,
-}
-
-/// Sender end of the surface channel, stored in Tauri state. `glib::Sender` is
-/// `Send` but not `Sync`, so it is wrapped in a `Mutex` to be shareable state.
-pub struct SurfaceTx(Mutex<glib::Sender<SurfaceMsg>>);
-
-impl SurfaceTx {
-    fn send(&self, msg: SurfaceMsg) {
-        if let Ok(tx) = self.0.lock() {
-            let _ = tx.send(msg);
-        }
-    }
-}
-
-/// Boxed-and-leaked sender pointer handed to mpv's render-update callback as its
-/// opaque context. Leaked because the callback may fire for the whole process
-/// lifetime.
-extern "C" fn on_mpv_render_update(ctx: *mut c_void) {
-    let tx = unsafe { &*(ctx as *const glib::Sender<SurfaceMsg>) };
-    let _ = tx.send(SurfaceMsg::Render);
-}
-
 // ---------------------------------------------------------------------------
-// Setup: create mpv, build the overlaid GtkGLArea, wire rendering.
+// Setup: platform surface + mpv handle, then the shared event loop.
 // ---------------------------------------------------------------------------
 
 /// Embed libmpv in the main window and register the playback state/commands.
-/// Must run on the GTK main thread (Tauri's `setup` does).
+/// Must run on the platform's UI thread (Tauri's `setup` does).
 ///
-/// Re-parents the webview's container into a `GtkOverlay` and adds a
-/// `GtkGLArea` as an overlay child positioned with margins, so it can be slaved
-/// to the frontend-reported video rect and composited above the webview.
+/// The platform backend creates the native surface, creates and configures the
+/// mpv handle to render into it, and manages its [`SurfaceTx`]; the shared core
+/// then owns the handle ([`MpvState`]) and pumps mpv's event stream.
 pub fn init(app: &AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or("main window not found")?;
-    let gtk_window = window.gtk_window().map_err(|e| e.to_string())?;
-    let vbox = window.default_vbox().map_err(|e| e.to_string())?;
-
-    // Pin LC_NUMERIC to C for the process — libmpv requires it (see above).
-    if let Ok(c) = CString::new("C") {
-        unsafe { setlocale(LC_NUMERIC, c.as_ptr()) };
-    }
-
-    // Create and initialize mpv. The render API is selected later by creating a
-    // render context; here we only set client-level options.
-    let handle = unsafe { mpv_create() };
-    if handle.is_null() {
-        return Err("mpv_create returned null".into());
-    }
-    // Route video through the render API into our GtkGLArea. `vo=libmpv` is the
-    // built-in output that draws via the render context we create below; without
-    // it mpv keeps its default `vo=gpu` and opens its *own* window, ignoring our
-    // surface (creating a render context alone does not redirect output in
-    // libmpv 2.x). `force-window=no` keeps mpv from ever spawning a window.
-    set_option(handle, "vo", "libmpv");
-    set_option(handle, "force-window", "no");
-    // Hardware decoding where available (NVIDIA), and keep mpv off the terminal.
-    set_option(handle, "hwdec", "auto-safe");
-    set_option(handle, "terminal", "no");
-    if unsafe { mpv_initialize(handle) } < 0 {
-        return Err("mpv_initialize failed".into());
-    }
-
-    // Pull the webview out of Tauri's vbox and make it the base child of a
-    // GtkOverlay, with our GLArea as the overlay child:
-    //
-    //   GtkApplicationWindow → GtkOverlay → { WebKitWebView (base), GLArea }
-    //
-    // The webview must stay *exactly two levels* below the window: tauri's wry
-    // runtime attaches a resize handler that walks two parents up from the
-    // webview and `downcast`s to `GtkWindow` with an `unwrap` (it does this on
-    // every Linux webview, decorated or not). Wrapping the vbox in the overlay
-    // added a third level and panicked on the first click; reparenting the
-    // webview directly under the overlay keeps the two-level invariant.
-    let webview_widget = vbox
-        .children()
-        .into_iter()
-        .next()
-        .ok_or("webview not found in the window's vbox")?;
-    gtk_window.remove(&vbox);
-    vbox.remove(&webview_widget);
-
-    let overlay = gtk::Overlay::new();
-    overlay.add(&webview_widget);
-
-    let gl_area = gtk::GLArea::new();
-    gl_area.set_halign(gtk::Align::Start);
-    gl_area.set_valign(gtk::Align::Start);
-    gl_area.set_size_request(16, 16);
-    // The area is shown with the overlay so it realizes as soon as the window
-    // maps — which creates the mpv render context *before* any file can load.
-    // That ordering is load-bearing: if `loadfile` reaches mpv before the render
-    // context exists, mpv has no render output and falls back to its default
-    // `vo=gpu`, opening its *own* window instead of drawing into our surface.
-    // The realize handler hides it again once the context exists; the player
-    // view reveals it via `mpv_show`.
-    overlay.add_overlay(&gl_area);
-
-    gtk_window.add(&overlay);
-    overlay.show_all();
-
-    // The render context is created once the GL context is realized, and shared
-    // with the render handler. Both closures run on the GTK main thread, so an
-    // `Rc<Cell<…>>` is sound.
-    let render_ctx: std::rc::Rc<std::cell::Cell<*mut MpvRenderContext>> =
-        std::rc::Rc::new(std::cell::Cell::new(ptr::null_mut()));
-
-    // Channel for main-thread surface ops. The sender is cloned for mpv's render
-    // callback (boxed + leaked so it outlives this scope). glib's sync channel is
-    // deprecated in favour of async-channel, but suffices for this slice's
-    // fire-and-forget surface messages.
-    #[allow(deprecated)]
-    let (tx, rx) = glib::MainContext::channel::<SurfaceMsg>(glib::Priority::DEFAULT);
-    let render_tx: &'static glib::Sender<SurfaceMsg> = Box::leak(Box::new(tx.clone()));
-
-    {
-        let render_ctx = render_ctx.clone();
-        gl_area.connect_realize(move |area| {
-            // Realize can fire again after a hide/show cycle; the render context
-            // is created once and reused, so skip if it already exists (creating
-            // it twice on one mpv handle errors and would leak the first).
-            if !render_ctx.get().is_null() {
-                return;
-            }
-            area.make_current();
-            if let Some(err) = area.error() {
-                log::error!("mpv: GLArea realize failed: {err}");
-                return;
-            }
-            let api = CString::new("opengl").expect("static str");
-            let mut init_params = MpvOpenglInitParams {
-                get_proc_address,
-                get_proc_address_ctx: ptr::null_mut(),
-            };
-            let mut params = [
-                MpvRenderParam {
-                    id: MPV_RENDER_PARAM_API_TYPE,
-                    data: api.as_ptr() as *mut c_void,
-                },
-                MpvRenderParam {
-                    id: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
-                    data: &mut init_params as *mut _ as *mut c_void,
-                },
-                MpvRenderParam {
-                    id: MPV_RENDER_PARAM_INVALID,
-                    data: ptr::null_mut(),
-                },
-            ];
-            let mut ctx: *mut MpvRenderContext = ptr::null_mut();
-            let rc = unsafe { mpv_render_context_create(&mut ctx, handle, params.as_mut_ptr()) };
-            if rc < 0 || ctx.is_null() {
-                log::error!("mpv: render context creation failed: {}", mpv_err(rc));
-                return;
-            }
-            unsafe {
-                mpv_render_context_set_update_callback(
-                    ctx,
-                    on_mpv_render_update,
-                    render_tx as *const _ as *mut c_void,
-                );
-            }
-            render_ctx.set(ctx);
-            log::info!("mpv: render context created");
-            // Realized only to create the context eagerly; start hidden until the
-            // player view calls `mpv_show`. Hiding unmaps but does not unrealize,
-            // so the context (and this GL context) persist.
-            area.hide();
-        });
-    }
-
-    {
-        let render_ctx = render_ctx.clone();
-        gl_area.connect_render(move |area, _gl_ctx| {
-            let ctx = render_ctx.get();
-            if ctx.is_null() {
-                return glib::Propagation::Proceed;
-            }
-            let scale = area.scale_factor();
-            let mut fbo = MpvOpenglFbo {
-                fbo: current_framebuffer(),
-                w: area.allocated_width() * scale,
-                h: area.allocated_height() * scale,
-                internal_format: 0,
-            };
-            // GtkGLArea's framebuffer has a top-left origin, opposite mpv's GL
-            // default, so flip vertically.
-            let mut flip: c_int = 1;
-            let mut params = [
-                MpvRenderParam {
-                    id: MPV_RENDER_PARAM_OPENGL_FBO,
-                    data: &mut fbo as *mut _ as *mut c_void,
-                },
-                MpvRenderParam {
-                    id: MPV_RENDER_PARAM_FLIP_Y,
-                    data: &mut flip as *mut _ as *mut c_void,
-                },
-                MpvRenderParam {
-                    id: MPV_RENDER_PARAM_INVALID,
-                    data: ptr::null_mut(),
-                },
-            ];
-            unsafe { mpv_render_context_render(ctx, params.as_mut_ptr()) };
-            glib::Propagation::Stop
-        });
-    }
-
-    // Drain surface messages on the GTK main thread. The receiver owns `gl_area`.
-    rx.attach(None, move |msg| {
-        match msg {
-            SurfaceMsg::Render => gl_area.queue_render(),
-            SurfaceMsg::Rect { x, y, w, h } => {
-                gl_area.set_margin_start(x);
-                gl_area.set_margin_top(y);
-                gl_area.set_size_request(w.max(1), h.max(1));
-            }
-            SurfaceMsg::Show => gl_area.show(),
-            SurfaceMsg::Hide => gl_area.hide(),
-        }
-        glib::ControlFlow::Continue
-    });
+    let handle = platform::init(app)?;
 
     app.manage(MpvState { handle });
-    app.manage(SurfaceTx(Mutex::new(tx)));
 
     // Drive the playhead and end/error UI states from mpv's own event stream
     // (ADR 0008): observe `time-pos` and forward each tick — plus end-of-file and
@@ -672,7 +350,7 @@ fn prop_flag(prop: &MpvEventProperty) -> Option<bool> {
 
 /// Set an mpv option, logging (but not failing) on error — a missing option
 /// (e.g. `hwdec` on a build without it) should not abort startup.
-fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
+pub(crate) fn set_option(handle: *mut MpvHandle, name: &str, value: &str) {
     let (Ok(name_c), Ok(value_c)) = (CString::new(name), CString::new(value)) else {
         return;
     };
@@ -768,14 +446,14 @@ pub fn mpv_set_mute(state: State<'_, MpvState>, muted: bool) -> Result<(), Strin
 /// by the frontend on mount and on resize.
 #[tauri::command]
 pub fn mpv_set_rect(tx: State<'_, SurfaceTx>, x: i32, y: i32, w: i32, h: i32) {
-    tx.send(SurfaceMsg::Rect { x, y, w, h });
+    tx.rect(x, y, w, h);
 }
 
 /// Reveal the native surface (player view mounted, or a full-area modal closed /
 /// the window restored — see [`mpv_suppress_surface`]). Playback is untouched.
 #[tauri::command]
 pub fn mpv_show(tx: State<'_, SurfaceTx>) {
-    tx.send(SurfaceMsg::Show);
+    tx.show();
 }
 
 /// Hide the native surface *without* stopping playback, for the one constraint of
@@ -789,18 +467,18 @@ pub fn mpv_show(tx: State<'_, SurfaceTx>) {
 /// HTML overlay over the video rect, precisely so it does not trip this hide.
 #[tauri::command]
 pub fn mpv_suppress_surface(tx: State<'_, SurfaceTx>, suppressed: bool) {
-    tx.send(if suppressed {
-        SurfaceMsg::Hide
+    if suppressed {
+        tx.hide();
     } else {
-        SurfaceMsg::Show
-    });
+        tx.show();
+    }
 }
 
 /// Hide the native surface and stop playback (back to the session list — no
 /// orphan window, and no audio left playing from the unloaded recording).
 #[tauri::command]
 pub fn mpv_hide(tx: State<'_, SurfaceTx>, state: State<'_, MpvState>) {
-    tx.send(SurfaceMsg::Hide);
+    tx.hide();
     let cmd = c"stop";
     let args: [*const c_char; 2] = [cmd.as_ptr(), ptr::null()];
     unsafe { mpv_command(state.handle, args.as_ptr()) };

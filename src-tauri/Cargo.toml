@@ -44,13 +44,26 @@ panic = "abort"   # Higher performance by disabling panic handlers.
 strip = true      # Ensures debug symbols are removed.
 
 # Embedded libmpv playback (ADR 0008). libmpv is linked in-process and rendered
-# into a GtkGLArea overlaid on the Tauri webview; Linux-only (the app ships on
-# Linux). gtk/glib come transitively from Tauri 2 — pinned here so mpv.rs can use
-# them directly. GL symbols for the mpv render API are resolved at runtime via
-# the platform EGL loader (dlsym), so no GL crate is needed.
+# into a GtkGLArea overlaid on the Tauri webview. gtk/glib come transitively
+# from Tauri 2 — pinned here so mpv/linux.rs can use them directly. GL symbols
+# for the mpv render API are resolved at runtime via the platform EGL loader
+# (dlsym), so no GL crate is needed.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 glib = "0.18"
+
+# Embedded libmpv playback on Windows (ADR 0014): the same client API, linked
+# from libmpv-2.dll via `raw-dylib` (no import library) and rendered by mpv
+# itself into a child HWND handed over with --wid. windows-sys carries only the
+# few Win32 window calls the surface needs; raw-window-handle extracts the
+# parent HWND from Tauri without coupling to its `windows` crate version.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_HiDpi",
+] }
+raw-window-handle = "0.6"
 
 # Vendored wry 0.55.1 with one patch (see ADR 0009): IPC custom-protocol
 # responses are delivered at glib DEFAULT priority instead of DEFAULT_IDLE,

@@ -3765,6 +3765,7 @@ dependencies = [
  "glib",
  "gtk",
  "log",
+ "raw-window-handle",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3775,6 +3776,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-opener",
  "walkdir",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
