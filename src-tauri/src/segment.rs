@@ -440,7 +440,10 @@ mod tests {
         let mid = WAVEFORM_BUCKETS / 2;
         let front_max = peaks[..mid].iter().fold(0.0f32, |m, &p| m.max(p));
         let back_max = peaks[mid..].iter().fold(0.0f32, |m, &p| m.max(p));
-        assert!(back_max > front_max * 2.0, "front {front_max} back {back_max}");
+        assert!(
+            back_max > front_max * 2.0,
+            "front {front_max} back {back_max}"
+        );
         assert!((back_max - 1.0).abs() < 1e-6, "normalized to 1: {back_max}");
     }
 
@@ -450,7 +453,9 @@ mod tests {
         assert_eq!(peaks.len(), WAVEFORM_BUCKETS);
         // Faint hum normalizes to a non-flat shape but never to a huge value;
         // mainly: no panic, fixed length, finite.
-        assert!(peaks.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p)));
+        assert!(peaks
+            .iter()
+            .all(|p| p.is_finite() && (0.0..=1.0).contains(p)));
     }
 
     #[test]

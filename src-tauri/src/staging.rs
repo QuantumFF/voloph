@@ -87,8 +87,8 @@ fn copy_in(dir: &Path, src: &Path) -> Result<Staged, String> {
     // staged copies never collide.
     let unique = format!("{}-{}", next_seq(), name.to_string_lossy());
     let dest = dir.join(unique);
-    let bytes = std::fs::copy(src, &dest)
-        .map_err(|e| format!("could not stage {}: {e}", src.display()))?;
+    let bytes =
+        std::fs::copy(src, &dest).map_err(|e| format!("could not stage {}: {e}", src.display()))?;
     Ok(Staged { path: dest, bytes })
 }
 
@@ -151,11 +151,12 @@ impl StagingCache {
     /// otherwise `None`.
     fn take_pending(&mut self, path: &Path) -> Option<Result<Staged, String>> {
         match self.pending.take() {
-            Some((p, prefetch)) if p == path => {
-                Some(prefetch.handle.join().unwrap_or_else(|_| {
-                    Err("staging: copy-ahead thread panicked".to_string())
-                }))
-            }
+            Some((p, prefetch)) if p == path => Some(
+                prefetch
+                    .handle
+                    .join()
+                    .unwrap_or_else(|_| Err("staging: copy-ahead thread panicked".to_string())),
+            ),
             // Prefetch was for a different path (queue changed) — discard it. Its
             // Staged drops here, evicting the wasted copy.
             other => {
@@ -226,7 +227,10 @@ mod tests {
             assert!(staged_path.exists(), "staged copy should exist during use");
             assert_eq!(s.bytes(), 128);
         }
-        assert!(!staged_path.exists(), "staged copy should be evicted on drop");
+        assert!(
+            !staged_path.exists(),
+            "staged copy should be evicted on drop"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -246,7 +250,10 @@ mod tests {
         let mut cache = StagingCache::new(stage_dir.clone(), 300);
         let sa = cache.stage(&a, Some(&b)).unwrap();
         assert!(sa.path().exists());
-        assert!(cache.pending.is_some(), "next should be prefetched within budget");
+        assert!(
+            cache.pending.is_some(),
+            "next should be prefetched within budget"
+        );
         drop(sa);
         let sb = cache.stage(&b, None).unwrap();
         assert!(sb.path().exists());
@@ -257,7 +264,10 @@ mod tests {
         let remaining: Vec<_> = std::fs::read_dir(&stage_dir)
             .map(|rd| rd.filter_map(|e| e.ok()).collect())
             .unwrap_or_default();
-        assert!(remaining.is_empty(), "staging area should be empty after use");
+        assert!(
+            remaining.is_empty(),
+            "staging area should be empty after use"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -276,7 +286,10 @@ mod tests {
         // Budget fits one but not both.
         let mut cache = StagingCache::new(stage_dir.clone(), 150);
         let sa = cache.stage(&a, Some(&b)).unwrap();
-        assert!(cache.pending.is_none(), "pair over budget must not prefetch");
+        assert!(
+            cache.pending.is_none(),
+            "pair over budget must not prefetch"
+        );
         drop(sa);
         let sb = cache.stage(&b, None).unwrap();
         assert!(sb.path().exists(), "next is staged on demand instead");

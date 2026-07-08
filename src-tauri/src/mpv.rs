@@ -148,8 +148,16 @@ extern "C" {
 extern "C" {
     fn mpv_create() -> *mut MpvHandle;
     fn mpv_initialize(ctx: *mut MpvHandle) -> c_int;
-    fn mpv_set_option_string(ctx: *mut MpvHandle, name: *const c_char, data: *const c_char) -> c_int;
-    fn mpv_set_property_string(ctx: *mut MpvHandle, name: *const c_char, data: *const c_char) -> c_int;
+    fn mpv_set_option_string(
+        ctx: *mut MpvHandle,
+        name: *const c_char,
+        data: *const c_char,
+    ) -> c_int;
+    fn mpv_set_property_string(
+        ctx: *mut MpvHandle,
+        name: *const c_char,
+        data: *const c_char,
+    ) -> c_int;
     fn mpv_command(ctx: *mut MpvHandle, args: *const *const c_char) -> c_int;
     fn mpv_error_string(error: c_int) -> *const c_char;
 
@@ -198,9 +206,7 @@ extern "C" {
 unsafe fn egl_get_proc_address(name: *const c_char) -> *mut c_void {
     type GetProc = unsafe extern "C" fn(*const c_char) -> *mut c_void;
     static ADDR: OnceLock<usize> = OnceLock::new();
-    let addr = *ADDR.get_or_init(|| {
-        dlsym(RTLD_DEFAULT, c"eglGetProcAddress".as_ptr()) as usize
-    });
+    let addr = *ADDR.get_or_init(|| dlsym(RTLD_DEFAULT, c"eglGetProcAddress".as_ptr()) as usize);
     if addr == 0 {
         return ptr::null_mut();
     }
@@ -728,7 +734,11 @@ pub fn mpv_seek(state: State<'_, MpvState>, ms: f64) -> Result<(), String> {
 /// deleted JPEG-overlay path.
 #[tauri::command]
 pub fn mpv_frame_step(state: State<'_, MpvState>, forward: bool) -> Result<(), String> {
-    let cmd = if forward { "frame-step" } else { "frame-back-step" };
+    let cmd = if forward {
+        "frame-step"
+    } else {
+        "frame-back-step"
+    };
     run_command(state.handle, &[cmd])
 }
 
@@ -741,7 +751,11 @@ pub fn mpv_set_speed(state: State<'_, MpvState>, speed: f64) -> Result<(), Strin
 /// Set the output volume (0–100).
 #[tauri::command]
 pub fn mpv_set_volume(state: State<'_, MpvState>, volume: f64) -> Result<(), String> {
-    set_property(state.handle, "volume", &volume.clamp(0.0, 100.0).to_string())
+    set_property(
+        state.handle,
+        "volume",
+        &volume.clamp(0.0, 100.0).to_string(),
+    )
 }
 
 /// Mute or unmute the audio.

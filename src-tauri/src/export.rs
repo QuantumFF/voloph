@@ -64,7 +64,12 @@ const HW_ENCODERS: &[EncoderPlan] = &[
         codec: &["-c:v", "h264_qsv", "-global_quality", "23"],
     },
     EncoderPlan {
-        global: &["-init_hw_device", "vaapi=va:/dev/dri/renderD128", "-filter_hw_device", "va"],
+        global: &[
+            "-init_hw_device",
+            "vaapi=va:/dev/dri/renderD128",
+            "-filter_hw_device",
+            "va",
+        ],
         vfilter: Some("format=nv12,hwupload"),
         codec: &["-c:v", "h264_vaapi", "-qp", "23"],
     },
@@ -102,7 +107,13 @@ fn plan_works(plan: &EncoderPlan) -> bool {
 /// roughly a third of software time.
 fn video_encoder() -> EncoderPlan {
     static CHOSEN: OnceLock<EncoderPlan> = OnceLock::new();
-    *CHOSEN.get_or_init(|| HW_ENCODERS.iter().find(|p| plan_works(p)).copied().unwrap_or(SOFTWARE))
+    *CHOSEN.get_or_init(|| {
+        HW_ENCODERS
+            .iter()
+            .find(|p| plan_works(p))
+            .copied()
+            .unwrap_or(SOFTWARE)
+    })
 }
 
 /// Tauri event carrying export progress as a fraction in `[0, 1]`.
@@ -198,7 +209,9 @@ pub fn export(app: &AppHandle, srcs: &[&str], dest: &str, cuts: &[Cut]) -> Resul
         }
     }
 
-    let status = child.wait().map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
     if !status.success() {
         let stderr = child
             .stderr
@@ -235,8 +248,16 @@ mod tests {
     #[test]
     fn total_duration_sums_cuts() {
         let cuts = [
-            Cut { src: 0, start_ms: 0, end_ms: 1000 },
-            Cut { src: 1, start_ms: 5000, end_ms: 5500 },
+            Cut {
+                src: 0,
+                start_ms: 0,
+                end_ms: 1000,
+            },
+            Cut {
+                src: 1,
+                start_ms: 5000,
+                end_ms: 5500,
+            },
         ];
         let total: i64 = cuts.iter().map(|c| (c.end_ms - c.start_ms).max(0)).sum();
         assert_eq!(total, 1500);
@@ -255,6 +276,8 @@ mod tests {
             // A device/upload filter appears together, and only for GPU-surface encoders.
             assert_eq!(plan.vfilter.is_some(), !plan.global.is_empty());
         }
-        assert!(HW_ENCODERS.iter().any(|p| p.codec.contains(&"h264_vaapi") && p.vfilter.is_some()));
+        assert!(HW_ENCODERS
+            .iter()
+            .any(|p| p.codec.contains(&"h264_vaapi") && p.vfilter.is_some()));
     }
 }

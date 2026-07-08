@@ -21,13 +21,7 @@ import {
   type FilteredRally,
   type Verdict,
 } from "@/components/recording-player-transport"
-import { LONG_RALLY_MS } from "@/components/recording-player"
-
-const VERDICT_DOT = {
-  good: "bg-emerald-500",
-  bad: "bg-amber-500",
-  mistake: "bg-red-500",
-} as const
+import { LONG_RALLY_MS, VERDICT_DOT } from "@/components/recording-player"
 
 /** One recording in a session, enough to build a jump playlist. */
 interface Recording {

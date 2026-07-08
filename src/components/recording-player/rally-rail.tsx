@@ -1,7 +1,12 @@
 "use client"
 
 import { useEffect, useMemo, useRef } from "react"
-import { FlagIcon, Loader2Icon, TimerIcon, TriangleAlertIcon } from "lucide-react"
+import {
+  FlagIcon,
+  Loader2Icon,
+  TimerIcon,
+  TriangleAlertIcon,
+} from "lucide-react"
 
 import { fileName, formatClock } from "@/lib/format"
 import {
@@ -13,14 +18,7 @@ import {
   type SessionRally,
   type Verdict,
 } from "@/components/recording-player-transport"
-import { LONG_RALLY_MS } from "./index"
-
-/** Marker colour per verdict (issue #8), matching the inspector's verdict dots. */
-const VERDICT_DOT: Record<Verdict, string> = {
-  good: "bg-emerald-500",
-  bad: "bg-amber-500",
-  mistake: "bg-red-500",
-}
+import { LONG_RALLY_MS, VERDICT_DOT } from "./constants"
 
 /**
  * The left rail of the studio layout (issue #48): the session's table of
