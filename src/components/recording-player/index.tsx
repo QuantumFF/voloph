@@ -1,28 +1,11 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import {
-  ArrowLeftIcon,
-  CrosshairIcon,
-  DownloadIcon,
-  KeyboardIcon,
-  Loader2Icon,
-  RotateCwIcon,
-  ZoomInIcon,
-  ZoomOutIcon,
-} from "lucide-react"
+import { ArrowLeftIcon } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
 import { fileName } from "@/lib/format"
 import { formatCaptureDay } from "@/lib/utils"
-import { useExport } from "@/components/use-export"
 import {
   SPEED_LADDER,
   UNCERTAIN_CONFIDENCE,
@@ -34,19 +17,35 @@ import {
   type Verdict,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
+import {
+  LONG_RALLY_MS,
+  SESSION_PX_PER_SEC_DEFAULT,
+  SESSION_PX_PER_SEC_MAX,
+  SESSION_PX_PER_SEC_MIN,
+  VERDICT_DOT,
+} from "./constants"
 import { useAnnotations } from "./use-annotations"
 import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
 import { useMpvTransport } from "./use-mpv-transport"
+import { useSessionExport } from "./use-session-export"
 import { useSessionPlayback } from "./use-session-playback"
 import { useSessionTimelines } from "./use-session-timelines"
 import { useTimelineEdits } from "./use-timeline-edits"
 import { CheatSheet } from "./cheat-sheet"
+import { ExportMenu } from "./export-menu"
 import { RallyInspector } from "./rally-inspector"
 import { RallyRail } from "./rally-rail"
 import { SessionTimeline, type SessionTimelineHandle } from "./session-timeline"
+import { StatusBar } from "./status-bar"
 import { TransportBar } from "./transport-bar"
 
 export type { PlaylistRecording }
+export {
+  LONG_RALLY_MS,
+  SESSION_PX_PER_SEC_MAX,
+  SESSION_PX_PER_SEC_MIN,
+  VERDICT_DOT,
+}
 
 interface RecordingPlayerProps {
   /**
@@ -67,24 +66,6 @@ interface RecordingPlayerProps {
   /** Return to the session list. */
   onBack: () => void
 }
-
-/**
- * Horizontal scale of the session timeline strip in pixels-per-second, so the
- * whole session is one long, horizontally-scrollable strip. The zoom buttons
- * step it between MIN (a whole long session at a glance) and MAX (frame-level
- * detail), each press scaling by `SESSION_ZOOM_FACTOR`.
- */
-const SESSION_PX_PER_SEC_DEFAULT = 3
-export const SESSION_PX_PER_SEC_MIN = 1
-export const SESSION_PX_PER_SEC_MAX = 240
-const SESSION_ZOOM_FACTOR = 1.5
-
-/**
- * Rally length threshold (CONTEXT.md: every rally is classified long or short
- * by duration, objectively and automatically). UI-only until length filtering
- * lands; 15s reads as a sustained exchange.
- */
-export const LONG_RALLY_MS = 15_000
 
 /**
  * Plays a whole **session** as one continuous playlist (the North Star) on
@@ -275,85 +256,20 @@ export function RecordingPlayer({
 
   const toggleCheatSheet = useCallback(() => setShowCheatSheet((s) => !s), [])
 
-  // The Export engine, driven from the player (issues #12/#13/#14): the four
-  // Export items point one engine at a different rally selection. The save
-  // dialog, live progress readout, and error surfacing live in the shared hook.
   const {
     progress: exportProgress,
     error: exportError,
-    setError: setExportError,
-    runExport,
-  } = useExport()
-
-  const paths = useMemo(() => recordings.map((r) => r.path), [recordings])
-
-  // Condensed recording (#12): every rally of the open recording, gaps removed.
-  const exportCondensed = useCallback(() => {
-    if (!path) return
-    return runExport(
-      "Export condensed recording",
-      `${fileName(path).replace(/\.[^.]+$/, "")}-condensed`,
-      "export_rallies",
-      { path }
-    )
-  }, [path, runExport])
-
-  // Condensed session (#13): every rally across all the session's recordings,
-  // gaps removed, concatenated across file boundaries into one portable MP4.
-  const exportSession = useCallback(
-    () =>
-      runExport(
-        "Export condensed session",
-        `${day ?? "session"}-condensed`,
-        "export_session",
-        { paths, rallyIds: null }
-      ),
-    [day, paths, runExport]
-  )
-
-  // A targeted reel (#14): the same session engine pointed at a rally-id
-  // selection. An empty selection never reaches ffmpeg — we surface it instead.
-  const exportReel = useCallback(
-    (label: string, name: string, rallyIds: number[]) => {
-      if (rallyIds.length === 0) {
-        setExportError(`No ${label} in this session to export.`)
-        return
-      }
-      return runExport(
-        `Export ${label}`,
-        `${day ?? "session"}-${name}`,
-        "export_session",
-        { paths, rallyIds }
-      )
-    },
-    [day, paths, runExport, setExportError]
-  )
-
-  // Flagged rallies (#14): the rallies the user marked as ones that matter.
-  const exportFlagged = useCallback(
-    () =>
-      exportReel(
-        "flagged rallies",
-        "flagged",
-        session.rallies.filter((r) => r.flagged).map((r) => r.id)
-      ),
-    [exportReel, session]
-  )
-
-  // Rallies with mistakes (#14): a rally owns the annotations in its span
-  // (glossary), so a rally is a "mistake" rally if a `mistake` verdict falls
-  // inside it. Reuses the session annotations already lifted onto the axis (#11).
-  const exportMistakes = useCallback(() => {
-    const mistakeMs = sessionAnnotations
-      .filter((a) => a.verdict === "mistake")
-      .map((a) => a.globalMs)
-    const ids = session.rallies
-      .filter((r) =>
-        mistakeMs.some((ms) => ms >= r.globalStart && ms < r.globalEnd)
-      )
-      .map((r) => r.id)
-    return exportReel("rallies with mistakes", "mistakes", ids)
-  }, [exportReel, session, sessionAnnotations])
+    exportCondensed,
+    exportSession,
+    exportFlagged,
+    exportMistakes,
+  } = useSessionExport({
+    session,
+    sessionAnnotations,
+    recordings,
+    path,
+    day,
+  })
 
   // The keymap array is rebuilt only when an action's closure changes; the
   // window key handler lives in `useGlobalKeymap`.
@@ -401,13 +317,13 @@ export function RecordingPlayer({
   // Annotations whose timestamp falls inside the rally under the playhead
   // (glossary: a rally owns the annotations in its span), for the inspector.
   const rallyAnnotations = useMemo(() => {
-    const rally =
-      currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
-    if (!rally) return []
+    if (!currentRally) return []
     return sessionAnnotations.filter(
-      (a) => a.globalMs >= rally.globalStart && a.globalMs < rally.globalEnd
+      (a) =>
+        a.globalMs >= currentRally.globalStart &&
+        a.globalMs < currentRally.globalEnd
     )
-  }, [currentRallyIndex, session, sessionAnnotations])
+  }, [currentRally, sessionAnnotations])
 
   // Status-bar readouts: how segmentation stands across the whole session.
   const segmentingNow =
@@ -450,51 +366,15 @@ export function RecordingPlayer({
           {day && path ? fileName(path) : null}
         </span>
         <div className="ml-auto flex shrink-0 items-center">
-          {/* Export engine: the condensed recording (#12), the condensed
-              *session* (#13), and targeted reels (#14 — flagged rallies, rallies
-              with mistakes) all point the one engine at a different selection. */}
-          {exportError ? (
-            <span className="mr-3 text-sm text-destructive" role="alert">
-              {exportError}
-            </span>
-          ) : null}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={exportProgress != null || sessionRallyCount === 0}
-                title="Render one new video from a selection of rallies."
-              >
-                {exportProgress != null ? (
-                  <>
-                    <Loader2Icon className="size-4 animate-spin" />
-                    Exporting… {Math.round(exportProgress * 100)}%
-                  </>
-                ) : (
-                  <>
-                    <DownloadIcon className="size-4" />
-                    Export
-                  </>
-                )}
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Export</DropdownMenuLabel>
-              <DropdownMenuItem onSelect={() => void exportSession()}>
-                Condensed session (gaps removed)
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => void exportCondensed()}>
-                Condensed recording (gaps removed)
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => void exportFlagged()}>
-                Flagged rallies
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => void exportMistakes()}>
-                Rallies with mistakes
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <ExportMenu
+            progress={exportProgress}
+            error={exportError}
+            disabled={exportProgress != null || sessionRallyCount === 0}
+            onExportSession={() => void exportSession()}
+            onExportCondensed={() => void exportCondensed()}
+            onExportFlagged={() => void exportFlagged()}
+            onExportMistakes={() => void exportMistakes()}
+          />
         </div>
       </header>
 
@@ -568,9 +448,7 @@ export function RecordingPlayer({
         </main>
 
         <RallyInspector
-          rally={
-            currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
-          }
+          rally={currentRally}
           rallyNumber={currentRallyIndex + 1}
           annotations={rallyAnnotations}
           onAnnotate={annotate}
@@ -582,110 +460,26 @@ export function RecordingPlayer({
 
       {/* The status bar: less important info and actions, and a visual footer
           so the timeline doesn't sit on the window edge. */}
-      <footer className="flex h-9 shrink-0 items-center gap-3 border-t px-4 text-xs text-muted-foreground">
-        {session.totalMs === 0 && segmentingNow ? (
-          <span className="flex items-center gap-1.5">
-            <Loader2Icon className="size-3.5 animate-spin" />
-            Detecting rallies…
-          </span>
-        ) : sessionRallyCount === 0 && failedCount > 0 ? (
-          <span>Couldn&apos;t detect rallies for this session.</span>
-        ) : sessionRallyCount === 0 ? (
-          <span>No rallies detected.</span>
-        ) : (
-          <span className="tabular-nums">
-            {sessionRallyCount} {sessionRallyCount === 1 ? "rally" : "rallies"}{" "}
-            across the session
-            {uncertainCount > 0 ? (
-              <>
-                {" · "}
-                <button
-                  type="button"
-                  onClick={goToUncertain}
-                  className="text-amber-600 hover:underline dark:text-amber-500"
-                  title="Low-confidence spans the segmenter is unsure about — click to jump to the next one (U)."
-                >
-                  {uncertainCount} uncertain
-                </button>
-              </>
-            ) : null}
-          </span>
-        )}
-        {unprocessed > 0 ? (
-          <span className="flex items-center gap-1.5">
-            <Loader2Icon className="size-3.5 animate-spin" />
-            {unprocessed} more {unprocessed === 1 ? "recording" : "recordings"}{" "}
-            preparing
-          </span>
-        ) : null}
-        {recordings.length > 1 ? (
-          <span className="tabular-nums">
-            Recording {index + 1} of {recordings.length}
-          </span>
-        ) : null}
-        <div className="ml-auto flex items-center gap-0.5">
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => zoomTimeline(1 / SESSION_ZOOM_FACTOR)}
-            disabled={pxPerSec <= SESSION_PX_PER_SEC_MIN}
-            title="Zoom the timeline out — fit more of the session on screen."
-          >
-            <ZoomOutIcon className="size-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => zoomTimeline(SESSION_ZOOM_FACTOR)}
-            disabled={pxPerSec >= SESSION_PX_PER_SEC_MAX}
-            title="Zoom the timeline in — see finer detail around the playhead."
-          >
-            <ZoomInIcon className="size-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-xs"
-            onClick={() => setPxPerSec(SESSION_PX_PER_SEC_DEFAULT)}
-            disabled={pxPerSec === SESSION_PX_PER_SEC_DEFAULT}
-            title="Reset the timeline zoom."
-          >
-            Reset
-          </Button>
-          <Button
-            variant={following ? "ghost" : "outline"}
-            size="sm"
-            className="text-xs"
-            onClick={jumpToPlayhead}
-            disabled={globalPlayheadMs === null}
-            title="Scroll the timeline back to the playhead and follow it again (F)."
-          >
-            <CrosshairIcon className="size-3.5" />
-            Playhead
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-xs"
-            onClick={handleReanalyze}
-            disabled={segmentingNow}
-            title="Re-run rally detection for the current recording in place (for tuning the segmenter)."
-          >
-            <RotateCwIcon
-              className={`size-3.5 ${reanalyzing ? "animate-spin" : ""}`}
-            />
-            Re-analyze
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => setShowCheatSheet(true)}
-            title="Keyboard shortcuts (?)"
-          >
-            <KeyboardIcon className="size-3.5" />
-          </Button>
-        </div>
-      </footer>
+      <StatusBar
+        totalMs={session.totalMs}
+        segmentingNow={segmentingNow}
+        failedCount={failedCount}
+        sessionRallyCount={sessionRallyCount}
+        uncertainCount={uncertainCount}
+        unprocessed={unprocessed}
+        recordingCount={recordings.length}
+        recordingIndex={index}
+        pxPerSec={pxPerSec}
+        following={following}
+        canJumpToPlayhead={globalPlayheadMs !== null}
+        reanalyzing={reanalyzing}
+        onGoToUncertain={goToUncertain}
+        onZoom={zoomTimeline}
+        onResetZoom={() => setPxPerSec(SESSION_PX_PER_SEC_DEFAULT)}
+        onJumpToPlayhead={jumpToPlayhead}
+        onReanalyze={handleReanalyze}
+        onShowCheatSheet={() => setShowCheatSheet(true)}
+      />
       {showCheatSheet ? (
         <CheatSheet keymap={keymap} onClose={() => setShowCheatSheet(false)} />
       ) : null}

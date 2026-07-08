@@ -28,6 +28,11 @@ interface Playing {
 export default function App() {
   const [playing, setPlaying] = useState<Playing | null>(null)
   const [browsing, setBrowsing] = useState(false)
+  // Set when leaving the player so the sessions homepage re-scans the library
+  // folder on its next mount (not just re-reads the DB) — recordings added while
+  // reviewing then appear without a manual Refresh. Cleared on the next
+  // navigation away from the homepage so a return from the browser stays cheap.
+  const [rescanOnReturn, setRescanOnReturn] = useState(false)
 
   return (
     <TooltipProvider>
@@ -38,7 +43,10 @@ export default function App() {
             startIndex={playing.startIndex}
             startMs={playing.startMs}
             day={playing.day}
-            onBack={() => setPlaying(null)}
+            onBack={() => {
+              setPlaying(null)
+              setRescanOnReturn(true)
+            }}
           />
         ) : browsing ? (
           <MomentBrowser
@@ -50,10 +58,15 @@ export default function App() {
           />
         ) : (
           <SessionList
-            onBrowse={() => setBrowsing(true)}
-            onPlay={(recordings, startIndex, day) =>
+            rescanOnMount={rescanOnReturn}
+            onBrowse={() => {
+              setRescanOnReturn(false)
+              setBrowsing(true)
+            }}
+            onPlay={(recordings, startIndex, day) => {
+              setRescanOnReturn(false)
               setPlaying({ recordings, startIndex, day })
-            }
+            }}
           />
         )}
       </div>

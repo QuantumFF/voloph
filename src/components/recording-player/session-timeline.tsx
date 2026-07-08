@@ -10,18 +10,6 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react"
-import {
-  ChevronLeftIcon,
-  ChevronRightIcon,
-  FlagIcon,
-  PencilIcon,
-  PlusIcon,
-  ScissorsIcon,
-  Trash2Icon,
-  TriangleAlertIcon,
-} from "lucide-react"
-
-import { Button } from "@/components/ui/button"
 import { fileName, formatClock } from "@/lib/format"
 import {
   UNCERTAIN_CONFIDENCE,
@@ -31,17 +19,16 @@ import {
   type SessionModel,
   type SessionRally,
 } from "@/components/recording-player-transport"
-import { SESSION_PX_PER_SEC_MAX, SESSION_PX_PER_SEC_MIN } from "./index"
+import {
+  SESSION_PX_PER_SEC_MAX,
+  SESSION_PX_PER_SEC_MIN,
+  VERDICT_DOT,
+} from "./constants"
+import { RallyBlock, type DragState } from "./rally-block"
+import { EditToolbar, TimelineNav } from "./timeline-toolbar"
 
 /** How much each Alt+scroll notch over the timeline zooms. */
 const ALT_SCROLL_ZOOM_FACTOR = 1.15
-
-/** Marker colour per verdict (issue #8), matching the inspector's verdict dots. */
-const VERDICT_MARKER = {
-  good: "bg-emerald-500",
-  bad: "bg-amber-500",
-  mistake: "bg-red-500",
-} as const
 
 /** Imperative surface of the timeline strip the player drives (jump-to-playhead). */
 export interface SessionTimelineHandle {
@@ -124,14 +111,7 @@ export const SessionTimeline = forwardRef<
   // The selected rally, by "path:id" so a row id shared across recordings can
   // never be ambiguous.
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
-  const [drag, setDrag] = useState<{
-    key: string
-    edge: "start" | "end"
-    anchorGlobalMs: number
-    globalMs: number
-    minGlobalMs: number
-    maxGlobalMs: number
-  } | null>(null)
+  const [drag, setDrag] = useState<DragState | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
   // `following`: whether the strip auto-scrolls to keep the playhead in view.
@@ -317,111 +297,39 @@ export const SessionTimeline = forwardRef<
 
   return (
     <div className="shrink-0 space-y-2">
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onPrevRally}
-            disabled={!hasRallies && !canPrev}
-            title="Jump to the previous rally."
-          >
-            <ChevronLeftIcon className="size-4" />
-            Prev rally
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onNextRally}
-            disabled={!hasRallies && !canNext}
-            title="Jump to the next rally."
-          >
-            Next rally
-            <ChevronRightIcon className="size-4" />
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onNextUncertain}
-            disabled={uncertainCount === 0}
-            title="Jump to the next uncertain region — a span the segmenter doubts, worth checking."
-          >
-            <TriangleAlertIcon className="size-4" />
-            Next uncertain
-          </Button>
-          <Button
-            variant={editing ? "default" : "outline"}
-            size="sm"
-            onClick={onToggleEditing}
-            disabled={!hasRallies}
-            title="Correct the draft timeline: drag rally edges, split, merge, add, or delete."
-          >
-            <PencilIcon className="size-4" />
-            {editing ? "Done editing" : "Edit timeline"}
-          </Button>
-        </div>
-      </div>
+      <TimelineNav
+        hasRallies={hasRallies}
+        canPrev={canPrev}
+        canNext={canNext}
+        uncertainCount={uncertainCount}
+        editing={editing}
+        onPrevRally={onPrevRally}
+        onNextRally={onNextRally}
+        onNextUncertain={onNextUncertain}
+        onToggleEditing={onToggleEditing}
+      />
       {editing ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
-          <span>
-            {selected
-              ? `Rally ${selectedIndex + 1} selected (${formatClock(
-                  selected.globalStart
-                )}–${formatClock(selected.globalEnd)} · ${fileName(selected.path)})`
-              : "Drag a rally's edge to adjust it, or click a rally to select it."}
-          </span>
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onAddAtPlayhead}
-              title="Add a rally over a span the segmenter missed (around the playhead, in the current recording)."
-            >
-              <PlusIcon className="size-4" />
-              Add at playhead
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                selected &&
-                globalPlayheadMs !== null &&
-                onSplitRally(selected, globalPlayheadMs)
-              }
-              disabled={!canSplit}
-              title="Split the selected rally in two at the playhead."
-            >
-              <ScissorsIcon className="size-4" />
-              Split at playhead
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                selected && mergeTarget && onMergeRallies(selected, mergeTarget)
-              }
-              disabled={!canMerge}
-              title="Merge the selected rally with the next one in the same recording."
-            >
-              Merge with next
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                if (selected) {
-                  onDeleteRally(selected)
-                  setSelectedKey(null)
-                }
-              }}
-              disabled={!selected}
-              title="Delete the selected rally (its span becomes a gap)."
-            >
-              <Trash2Icon className="size-4" />
-              Delete
-            </Button>
-          </div>
-        </div>
+        <EditToolbar
+          selected={selected}
+          selectedIndex={selectedIndex}
+          canSplit={canSplit}
+          canMerge={canMerge}
+          onAddAtPlayhead={onAddAtPlayhead}
+          onSplit={() =>
+            selected &&
+            globalPlayheadMs !== null &&
+            onSplitRally(selected, globalPlayheadMs)
+          }
+          onMerge={() =>
+            selected && mergeTarget && onMergeRallies(selected, mergeTarget)
+          }
+          onDelete={() => {
+            if (selected) {
+              onDeleteRally(selected)
+              setSelectedKey(null)
+            }
+          }}
+        />
       ) : null}
       {hasRallies ? (
         <>
@@ -463,101 +371,38 @@ export const SessionTimeline = forwardRef<
               })}
               {session.rallies.map((rally, i) => {
                 const key = rallyKey(rally)
-                const dragging = drag?.key === key ? drag : null
-                const gStart = dragging
-                  ? dragging.edge === "start"
-                    ? dragging.globalMs
-                    : dragging.anchorGlobalMs
-                  : rally.globalStart
-                const gEnd = dragging
-                  ? dragging.edge === "end"
-                    ? dragging.globalMs
-                    : dragging.anchorGlobalMs
-                  : rally.globalEnd
-                const lo = Math.min(gStart, gEnd)
-                const hi = Math.max(gStart, gEnd)
-                const left = (lo / 1000) * pxPerSec
-                const width = ((hi - lo) / 1000) * pxPerSec
-                const uncertain = rally.confidence < UNCERTAIN_CONFIDENCE
-                const isSelected = editing && key === selectedKey
                 const seg = session.segments.find(
                   (s) => s.index === rally.recordingIndex
                 )
                 const minGlobalMs = seg?.offsetMs ?? 0
                 const maxGlobalMs = minGlobalMs + (seg?.durationMs ?? 0)
                 return (
-                  <button
+                  <RallyBlock
                     key={key}
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      if (editing) {
-                        setSelectedKey(key)
-                      } else {
-                        onSeekGlobal(rally.globalStart)
-                      }
-                    }}
-                    className={`absolute inset-y-0 rounded-sm transition-opacity hover:opacity-80 focus:outline-none ${
-                      uncertain
-                        ? "border border-amber-500/70 bg-amber-500/40"
-                        : "bg-primary/70"
-                    } ${rally.flagged ? "ring-2 ring-sky-400" : ""} ${isSelected ? "ring-2 ring-foreground ring-offset-1 ring-offset-muted" : ""}`}
-                    style={{
-                      left: `${left}px`,
-                      width: `${Math.max(width, 3)}px`,
-                    }}
-                    title={`Rally ${i + 1}: ${formatClock(rally.globalStart)}–${formatClock(
-                      rally.globalEnd
-                    )}${uncertain ? " (uncertain)" : ""}${rally.flagged ? " · flagged" : ""} · confidence ${Math.round(
-                      rally.confidence * 100
-                    )}% · ${fileName(rally.path)}`}
-                  >
-                    {rally.flagged ? (
-                      <FlagIcon className="pointer-events-none absolute top-0.5 left-0.5 size-2.5 fill-sky-400 text-sky-400" />
-                    ) : null}
-                    {editing ? (
-                      <>
-                        <span
-                          role="separator"
-                          aria-label="Drag rally start"
-                          onClick={(e) => e.stopPropagation()}
-                          onPointerDown={(e) => {
-                            e.stopPropagation()
-                            e.preventDefault()
-                            setSelectedKey(key)
-                            setDrag({
-                              key,
-                              edge: "start",
-                              anchorGlobalMs: rally.globalEnd,
-                              globalMs: rally.globalStart,
-                              minGlobalMs,
-                              maxGlobalMs,
-                            })
-                          }}
-                          className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize rounded-l-sm bg-foreground/70 hover:bg-foreground"
-                        />
-                        <span
-                          role="separator"
-                          aria-label="Drag rally end"
-                          onClick={(e) => e.stopPropagation()}
-                          onPointerDown={(e) => {
-                            e.stopPropagation()
-                            e.preventDefault()
-                            setSelectedKey(key)
-                            setDrag({
-                              key,
-                              edge: "end",
-                              anchorGlobalMs: rally.globalStart,
-                              globalMs: rally.globalEnd,
-                              minGlobalMs,
-                              maxGlobalMs,
-                            })
-                          }}
-                          className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize rounded-r-sm bg-foreground/70 hover:bg-foreground"
-                        />
-                      </>
-                    ) : null}
-                  </button>
+                    rally={rally}
+                    number={i}
+                    pxPerSec={pxPerSec}
+                    editing={editing}
+                    selected={editing && key === selectedKey}
+                    drag={drag?.key === key ? drag : null}
+                    minGlobalMs={minGlobalMs}
+                    maxGlobalMs={maxGlobalMs}
+                    onSelect={() => setSelectedKey(key)}
+                    onSeek={() => onSeekGlobal(rally.globalStart)}
+                    onStartDrag={(edge, anchorGlobalMs, minMs, maxMs) =>
+                      setDrag({
+                        key,
+                        edge,
+                        anchorGlobalMs,
+                        globalMs:
+                          edge === "start"
+                            ? rally.globalStart
+                            : rally.globalEnd,
+                        minGlobalMs: minMs,
+                        maxGlobalMs: maxMs,
+                      })
+                    }
+                  />
                 )
               })}
               {annotations.map((a) => {
@@ -565,7 +410,7 @@ export const SessionTimeline = forwardRef<
                 return (
                   <div
                     key={a.id}
-                    className={`pointer-events-none absolute top-0 h-2.5 w-0.5 -translate-x-1/2 rounded-b ${VERDICT_MARKER[a.verdict]}`}
+                    className={`pointer-events-none absolute top-0 h-2.5 w-0.5 -translate-x-1/2 rounded-b ${VERDICT_DOT[a.verdict]}`}
                     style={{ left: `${left}px` }}
                     title={`${a.verdict} at ${formatClock(a.globalMs)}`}
                   />

@@ -13,13 +13,7 @@ import {
   type SessionRally,
   type Verdict,
 } from "@/components/recording-player-transport"
-import { LONG_RALLY_MS } from "./index"
-
-const VERDICT_DOT = {
-  good: "bg-emerald-500",
-  bad: "bg-amber-500",
-  mistake: "bg-red-500",
-} as const
+import { LONG_RALLY_MS, VERDICT_DOT } from "./constants"
 
 /**
  * The right inspector of the studio layout (issue #48): everything about the
@@ -114,7 +108,9 @@ export function RallyInspector({
               <h3 className="text-xs font-medium text-muted-foreground">
                 Verdict at playhead
               </h3>
-              <span className="text-xs text-muted-foreground/70">1 · 2 · 3</span>
+              <span className="text-xs text-muted-foreground/70">
+                1 · 2 · 3
+              </span>
             </div>
             <div className="grid grid-cols-3 gap-1.5">
               {VERDICTS.map((verdict) => (
@@ -166,7 +162,7 @@ export function RallyInspector({
                           {a.aspect}
                         </span>
                       ) : null}
-                      <span className="ml-auto tabular-nums text-muted-foreground">
+                      <span className="ml-auto text-muted-foreground tabular-nums">
                         {formatClock(a.globalMs)}
                       </span>
                     </button>

@@ -24,6 +24,10 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
+# Session bundles (ADR 0012) are a versioned JSON interchange file a receiver
+# (#66) must parse back robustly — worth a real JSON codec, unlike the timeline's
+# hand-rolled waveform array.
+serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 walkdir = "2"

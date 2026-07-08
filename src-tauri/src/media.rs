@@ -27,13 +27,12 @@ pub fn extract_pcm(path: &str) -> Result<Vec<f32>, String> {
     let rate = SEGMENT_SAMPLE_RATE.to_string();
     let output = Command::new(sidecar_path("ffmpeg"))
         .args([
-            "-v", "error", "-nostats",
-            "-i", path,
+            "-v", "error", "-nostats", "-i", path,
             "-vn", // drop video; we only want the audio track
             "-ac", "1", // downmix to mono
             "-ar", &rate, // resample
             "-f", "f32le", // raw little-endian float samples
-            "-", // write to stdout
+            "-",     // write to stdout
         ])
         .stdin(Stdio::null())
         .output()
@@ -77,13 +76,9 @@ pub fn extract_motion(path: &str) -> Result<Vec<f64>, String> {
     let vf = format!("fps={MOTION_FPS},scale={MOTION_WIDTH}:{MOTION_HEIGHT},format=gray");
     let output = Command::new(sidecar_path("ffmpeg"))
         .args([
-            "-v", "error", "-nostats",
-            "-i", path,
+            "-v", "error", "-nostats", "-i", path,
             "-an", // drop audio; the motion track is video-only
-            "-vf", &vf,
-            "-f", "rawvideo",
-            "-pix_fmt", "gray",
-            "-",
+            "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "-",
         ])
         .stdin(Stdio::null())
         .output()

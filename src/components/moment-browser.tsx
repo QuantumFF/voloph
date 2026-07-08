@@ -21,13 +21,7 @@ import {
   type FilteredRally,
   type Verdict,
 } from "@/components/recording-player-transport"
-import { LONG_RALLY_MS } from "@/components/recording-player"
-
-const VERDICT_DOT = {
-  good: "bg-emerald-500",
-  bad: "bg-amber-500",
-  mistake: "bg-red-500",
-} as const
+import { LONG_RALLY_MS, VERDICT_DOT } from "@/components/recording-player"
 
 /** One recording in a session, enough to build a jump playlist. */
 interface Recording {
@@ -83,6 +77,10 @@ export function MomentBrowser({
   const [results, setResults] = useState<FilteredRally[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [error, setError] = useState<string | null>(null)
+  // Aspects actually present in the active library's annotations (issue #66) —
+  // includes any a received bundle imported that lie outside the seeded list
+  // (ADR 0012). Unioned with ASPECTS below so every real aspect is filterable.
+  const [importedAspects, setImportedAspects] = useState<string[]>([])
 
   // Sessions are the source for building a jump playlist (all of a session's
   // recordings in order). Loaded once; the results carry the rally coordinates.
@@ -90,7 +88,16 @@ export function MomentBrowser({
     trackedInvoke<Session[]>("list_sessions")
       .then(setSessions)
       .catch((e) => setError(String(e)))
+    trackedInvoke<string[]>("aspect_vocabulary")
+      .then(setImportedAspects)
+      .catch((e) => setError(String(e)))
   }, [])
+
+  // Seeded vocabulary plus any imported aspects, de-duplicated, seeds first.
+  const aspectOptions = [
+    ...ASPECTS,
+    ...importedAspects.filter((a) => !ASPECTS.includes(a as never)),
+  ]
 
   const runFilter = useCallback((f: Filters) => {
     trackedInvoke<FilteredRally[]>("filter_moments", {
@@ -218,7 +225,7 @@ export function MomentBrowser({
               ))}
             </FilterRow>
             <FilterRow label="Aspect">
-              {ASPECTS.map((a) => (
+              {aspectOptions.map((a) => (
                 <Chip
                   key={a}
                   on={filters.aspect === a}

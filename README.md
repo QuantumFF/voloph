@@ -193,3 +193,6 @@ CONTEXT.md                    Domain model and shared vocabulary
   segmentation, capture-date-from-metadata, and more.
 - **[docs/tuning-segmentation.md](docs/tuning-segmentation.md)** — the
   human-in-the-loop loop for tuning the segmenter against real footage.
+- **[docs/google-drive-mount.md](docs/google-drive-mount.md)** — using Google
+  Drive (or any cloud storage) as a shared library by mounting it as a folder,
+  including mount setup, the network-mount/staging choice, and playback tuning.
