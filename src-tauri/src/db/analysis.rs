@@ -54,31 +54,39 @@ fn analysis_file_name(quick_hash: &str, file_size: i64) -> String {
     format!("{quick_hash}_{file_size}.vanalysis")
 }
 
-/// Publish (overwrite) the Analysis for recording `id` at segmentation completion
-/// (ADR 0013). A no-op for a local-library recording, or when the shared library
-/// is not designated. Reads the pristine machine output straight from the DB —
-/// the caller has just committed it — and writes it temp-then-rename so a
-/// half-written file can never be adopted. Every failure (read-only mount,
-/// dropped NAS, missing row) is logged and swallowed: the analysis already lives
-/// in the DB, and an Analysis is plumbing the user never knew existed.
-pub fn publish_analysis(conn: &Connection, id: i64) {
-    // Only shared-library recordings publish — no one else can reach the local
-    // library's bytes (ADR 0013).
-    struct Row {
-        library: String,
-        file_size: i64,
-        quick_hash: String,
-        capture_day: String,
-        duration_ms: Option<i64>,
-        waveform_json: Option<String>,
-    }
+struct AnalysisRow {
+    library: String,
+    file_size: i64,
+    quick_hash: String,
+    capture_day: String,
+    duration_ms: Option<i64>,
+    waveform_json: Option<String>,
+}
+
+/// Read the DB row + rallies for recording `id` and assemble its pristine machine
+/// Analysis (ADR 0013), or `None` when the row vanished or is not a shared-library
+/// recording (only shared recordings publish — no one else can reach the local
+/// library's bytes). Returns the recording's content key alongside so the caller
+/// can name the file.
+fn analysis_of(conn: &Connection, id: i64) -> Option<(String, i64, Analysis)> {
+    analysis_of_impl(conn, id, true)
+}
+
+/// As [`analysis_of`] but without the shared-library gate — for the invariant's
+/// local→shared copy journey, where the pristine analysis lives on the *local*
+/// row while its identical bytes already exist in the shared library (ADR 0013).
+fn analysis_of_any_library(conn: &Connection, id: i64) -> Option<(String, i64, Analysis)> {
+    analysis_of_impl(conn, id, false)
+}
+
+fn analysis_of_impl(conn: &Connection, id: i64, require_shared: bool) -> Option<(String, i64, Analysis)> {
     let row = conn
         .query_row(
             "SELECT library, file_size, quick_hash, capture_day, duration_ms, waveform
              FROM recordings WHERE id = ?1",
             [id],
             |r| {
-                Ok(Row {
+                Ok(AnalysisRow {
                     library: r.get(0)?,
                     file_size: r.get(1)?,
                     quick_hash: r.get(2)?,
@@ -90,16 +98,12 @@ pub fn publish_analysis(conn: &Connection, id: i64) {
         )
         .optional();
     let row = match row {
-        Ok(Some(r)) if r.library == "shared" => r,
-        Ok(_) => return, // local recording, or the row vanished — nothing to publish
+        Ok(Some(r)) if !require_shared || r.library == "shared" => r,
+        Ok(_) => return None, // local recording, or the row vanished — nothing to publish
         Err(e) => {
             log::error!("analysis: could not read recording {id} to publish: {e}");
-            return;
+            return None;
         }
-    };
-
-    let Ok(Some(root)) = library_path_of(conn, "shared") else {
-        return; // shared library not designated on this device
     };
 
     let rallies = match conn
@@ -117,7 +121,7 @@ pub fn publish_analysis(conn: &Connection, id: i64) {
         Ok(r) => r,
         Err(e) => {
             log::error!("analysis: could not read rallies for recording {id}: {e}");
-            return;
+            return None;
         }
     };
 
@@ -130,12 +134,93 @@ pub fn publish_analysis(conn: &Connection, id: i64) {
         waveform: parse_waveform(row.waveform_json.as_deref()),
         rallies,
     };
+    Some((row.quick_hash, row.file_size, analysis))
+}
 
+/// Publish (overwrite) the Analysis for recording `id` at segmentation completion
+/// (ADR 0013). A no-op for a local-library recording, or when the shared library
+/// is not designated. Reads the pristine machine output straight from the DB —
+/// the caller has just committed it — and writes it temp-then-rename so a
+/// half-written file can never be adopted. Every failure (read-only mount,
+/// dropped NAS, missing row) is logged and swallowed: the analysis already lives
+/// in the DB, and an Analysis is plumbing the user never knew existed.
+pub fn publish_analysis(conn: &Connection, id: i64) {
+    let Some((quick_hash, file_size, analysis)) = analysis_of(conn, id) else {
+        return;
+    };
+    let Ok(Some(root)) = library_path_of(conn, "shared") else {
+        return; // shared library not designated on this device
+    };
     let dir = Path::new(&root).join(".voloph").join("analysis");
-    let name = analysis_file_name(&row.quick_hash, row.file_size);
+    let name = analysis_file_name(&quick_hash, file_size);
     if let Err(e) = write_analysis(&dir, &name, &analysis) {
         // Silent to the user (ADR 0013): the analysis is already in the DB.
         log::warn!("analysis: could not publish {name}: {e}");
+    }
+}
+
+/// Restore the publication invariant (ADR 0013): every shared-library recording
+/// whose analysis in the local DB is still machine-pristine (`ready` and not
+/// hand-touched) has its `.vanalysis` file on disk. Write-if-absent — an existing
+/// readable file is left alone, a missing or unreadable one is (re)written. Called
+/// after any scan or analysis pass, so day-one backfill, publish-failure retry, and
+/// the local→shared copy journey all fall out of this one rule. A no-op outside a
+/// designated shared library; the existence check touches only the analysis folder,
+/// adding no per-recording network reads beyond it.
+pub fn publish_missing_analyses(conn: &Connection) {
+    let Ok(Some(root)) = library_path_of(conn, "shared") else {
+        return; // shared library not designated — nothing to publish into
+    };
+
+    // Machine-pristine analyzed recordings whose bytes live in the shared library:
+    // `ready` (the compute is spent), not hand-touched (hand-work is review state
+    // and never enters an Analysis), and content-keyed to a shared row. The self-join
+    // also catches the local→shared copy — a `ready` *local* original whose identical
+    // bytes were copied into the shared library — so its Analysis publishes without
+    // re-analysis (ADR 0013). A hand-touched local original has no pristine draft
+    // left, so `is_hand_touched` below drops it; that path stays with the carry offer.
+    let ids: Vec<i64> = match conn
+        .prepare(
+            "SELECT DISTINCT r.id FROM recordings r
+             JOIN recordings s
+               ON s.library = 'shared'
+              AND s.quick_hash = r.quick_hash
+              AND s.file_size = r.file_size
+             WHERE r.segment_state = 'ready'",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        }) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log::error!("analysis: could not list recordings to publish: {e}");
+            return;
+        }
+    };
+
+    let dir = Path::new(&root).join(".voloph").join("analysis");
+    for id in ids {
+        match is_hand_touched(conn, id) {
+            Ok(true) => continue, // hand-touched never publishes (ADR 0013)
+            Ok(false) => {}
+            Err(e) => {
+                log::error!("analysis: could not check hand-touch for {id}: {e}");
+                continue;
+            }
+        }
+        let Some((quick_hash, file_size, analysis)) = analysis_of_any_library(conn, id) else {
+            continue;
+        };
+        // Present and readable → invariant already holds, leave it alone. Missing or
+        // unreadable (wrong version, truncated) counts as absent and is (re)written.
+        if read_analysis(&root, &quick_hash, file_size).is_some() {
+            continue;
+        }
+        let name = analysis_file_name(&quick_hash, file_size);
+        if let Err(e) = write_analysis(&dir, &name, &analysis) {
+            log::warn!("analysis: could not publish {name}: {e}");
+        }
     }
 }
 

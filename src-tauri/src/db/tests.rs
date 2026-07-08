@@ -1813,6 +1813,180 @@ fn segmenting_a_local_recording_publishes_nothing() {
     assert!(read_published_analysis(&lib.0, &abs).is_none());
 }
 
+// --- Publication invariant: backfill/retry on scan (ADR 0013, issue #71) --
+
+/// Set up a shared library with one `ready`, machine-analyzed recording whose
+/// `.vanalysis` has been removed — simulating pre-feature compute or a failed
+/// publish. Returns the connection, the recording's abs path, and its id.
+fn shared_analyzed_without_file() -> (Connection, TempLib, std::path::PathBuf, i64) {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4,
+        }],
+        &[0.1, 0.2],
+    )
+    .unwrap();
+    // Drop whatever save_rallies/completion published, so the file is absent.
+    std::fs::remove_dir_all(lib.0.join(".voloph").join("analysis")).ok();
+    (conn, lib, abs, id)
+}
+
+#[test]
+fn scan_backfills_missing_analysis_for_a_pristine_recording() {
+    let (mut conn, lib, abs, _id) = shared_analyzed_without_file();
+    assert!(read_published_analysis(&lib.0, &abs).is_none());
+
+    scan_library(&mut conn).unwrap();
+
+    let a = read_published_analysis(&lib.0, &abs).expect("backfilled on scan");
+    assert_eq!(a.duration_ms, Some(60000));
+    assert_eq!(
+        a.rallies,
+        vec![AnalysisRally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4
+        }]
+    );
+}
+
+#[test]
+fn scan_never_publishes_a_hand_touched_recording() {
+    let (mut conn, lib, abs, id) = shared_analyzed_without_file();
+    // Hand-correct a rally (confidence bumped to CORRECTED) — now hand-touched.
+    conn.execute(
+        "UPDATE rallies SET confidence = 1.0 WHERE recording_id = ?1",
+        [id],
+    )
+    .unwrap();
+
+    scan_library(&mut conn).unwrap();
+
+    assert!(read_published_analysis(&lib.0, &abs).is_none());
+}
+
+#[test]
+fn scan_replaces_an_unreadable_file() {
+    let (mut conn, lib, abs, _id) = shared_analyzed_without_file();
+    let dir = lib.0.join(".voloph").join("analysis");
+    let meta = std::fs::metadata(&abs).unwrap();
+    let hash = quick_hash(&abs, meta.len()).unwrap();
+    let name = format!("{hash}_{}.vanalysis", meta.len());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&name), b"not json").unwrap();
+
+    scan_library(&mut conn).unwrap();
+
+    // The garbage was treated as absent and replaced with a readable Analysis.
+    let a = read_published_analysis(&lib.0, &abs).expect("unreadable replaced");
+    assert_eq!(a.duration_ms, Some(60000));
+}
+
+#[test]
+fn scan_leaves_a_valid_existing_file_alone() {
+    let (mut conn, lib, abs, _id) = shared_analyzed_without_file();
+    // A valid file already on disk, carrying a distinct duration the DB does not.
+    publish_test_analysis(&lib, &abs, vec![]);
+    let before = read_published_analysis(&lib.0, &abs).unwrap();
+    assert_eq!(before.duration_ms, Some(42_000)); // publish_test_analysis's marker
+
+    scan_library(&mut conn).unwrap();
+
+    // Untouched — not overwritten with the DB's 60000-ms analysis.
+    let after = read_published_analysis(&lib.0, &abs).unwrap();
+    assert_eq!(after.duration_ms, Some(42_000));
+}
+
+#[test]
+fn scan_publishes_a_pristine_local_recording_copied_into_shared() {
+    let local = TempLib::new();
+    let shared = TempLib::new();
+    let l_abs = local.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+
+    // Analyze the recording in the local library — pristine, machine `ready`.
+    designate_library(&mut conn, "local", &local.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let l_id = recording_id(&conn, &l_abs.to_string_lossy()).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        l_id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4,
+        }],
+        &[0.1, 0.2],
+    )
+    .unwrap();
+
+    // The identical bytes are copied into the shared library and scanned.
+    let s_abs = shared.write("copy.mp4", b"aaaa");
+    designate_library(&mut conn, "shared", &shared.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+
+    // The content-keyed Analysis is published from the local original — no
+    // re-analysis. Keyed by hash+size, it is readable at the shared copy's key.
+    let a = read_published_analysis(&shared.0, &s_abs).expect("published from local copy");
+    assert_eq!(a.duration_ms, Some(60000));
+    assert_eq!(
+        a.rallies,
+        vec![AnalysisRally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4
+        }]
+    );
+}
+
+#[test]
+fn scan_does_not_publish_a_hand_touched_local_original() {
+    let local = TempLib::new();
+    let shared = TempLib::new();
+    let l_abs = local.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &local.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let l_id = recording_id(&conn, &l_abs.to_string_lossy()).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        l_id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4,
+        }],
+        &[],
+    )
+    .unwrap();
+    // Hand-correct it — the pristine draft no longer exists (ADR 0013).
+    conn.execute(
+        "UPDATE rallies SET confidence = 1.0 WHERE recording_id = ?1",
+        [l_id],
+    )
+    .unwrap();
+
+    let s_abs = shared.write("copy.mp4", b"aaaa");
+    designate_library(&mut conn, "shared", &shared.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+
+    // Nothing published — that path stays with the carry-over offer.
+    assert!(read_published_analysis(&shared.0, &s_abs).is_none());
+}
+
 // --- Adopting a published Analysis on scan (ADR 0013, issue #70) ---------
 
 /// Publish an Analysis into the shared library for the file at `abs`, keyed by its

@@ -269,6 +269,12 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
 
     tx.commit()?;
 
+    // Restore the publication invariant (ADR 0013): after this scan, every
+    // machine-pristine shared recording has its `.vanalysis` on disk. This heals
+    // day-one backfill, an earlier publish failure, and a local→shared copy — all
+    // write-if-absent, no re-analysis. Silent; a no-op outside a shared library.
+    super::publish_missing_analyses(conn);
+
     // Whatever known recordings are still missing after the walk could not be
     // re-linked — report them (as absolute paths) rather than delete them.
     let mut unresolved: Vec<String> = missing.keys().map(|rel| absolute(&library, rel)).collect();
