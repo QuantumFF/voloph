@@ -17,6 +17,7 @@ import {
   RotateCwIcon,
   Share2Icon,
   Trash2Icon,
+  UsersIcon,
   VideoIcon,
   XIcon,
 } from "lucide-react"
@@ -132,6 +133,23 @@ interface BundleOffer {
   sharer_label: string
   /** A changed re-share of a bundle the user previously declined. */
   is_update: boolean
+}
+
+/**
+ * A shared bundle as listed for browsing: every foreign bundle in the shared
+ * library, regardless of whether it is still on offer. The per-session bundle
+ * browser lists these so a review can be found and re-received after its offer
+ * has been received or dismissed.
+ */
+interface BundleSummary {
+  bundle_path: string
+  capture_day: string
+  sharer_label: string
+  recording_count: number
+  rally_count: number
+  annotation_count: number
+  /** Already received or declined — no longer a standing offer. */
+  seen: boolean
 }
 
 /**
@@ -287,6 +305,14 @@ export function SessionList({
     // for a lone receive.
     queue: string[]
     tally: number
+  } | null>(null)
+  // The per-session bundle browser (issue): which session day it is open for and
+  // the shared bundles found for that day, once loaded. Lets the user re-open a
+  // shared review after its offer was received or dismissed. Null when closed.
+  const [browsing, setBrowsing] = useState<{
+    day: string
+    loading: boolean
+    bundles: BundleSummary[]
   } | null>(null)
 
   const refresh = useCallback(async () => {
@@ -455,6 +481,34 @@ export function SessionList({
     } catch (e) {
       setError(String(e))
     }
+  }
+
+  // Open the bundle browser for a session day (issue): list every shared review
+  // for that day — including ones already received or dismissed, which no longer
+  // appear as offers — so the user can find and re-receive them. Opens the dialog
+  // straight away with a loading state, then fills it once the list arrives.
+  async function openBundleBrowser(day: string) {
+    setError(null)
+    setBrowsing({ day, loading: true, bundles: [] })
+    try {
+      const all = await trackedInvoke<BundleSummary[]>("list_bundles")
+      setBrowsing({
+        day,
+        loading: false,
+        bundles: all.filter((b) => b.capture_day === day),
+      })
+    } catch (e) {
+      setError(String(e))
+      setBrowsing(null)
+    }
+  }
+
+  // Receive a bundle chosen from the browser: close the browser first so the
+  // receive (and any conflict dialog it opens) is not stacked under it, then run
+  // the same receive flow as an offer.
+  async function receiveFromBrowser(bundlePath: string) {
+    setBrowsing(null)
+    await runReceives([bundlePath], 0)
   }
 
   // The active library's own record (mount path + locality), or undefined until
@@ -913,6 +967,81 @@ export function SessionList({
         </AlertDialogContent>
       </AlertDialog>
 
+      {/* Bundle browser (issue): every shared review for one session day, so a
+          review can be found and re-received after its offer was received or
+          dismissed. A "New" tag marks ones still on offer; the rest were already
+          received or declined and can be pulled again. */}
+      <AlertDialog
+        open={browsing !== null}
+        onOpenChange={(o) => {
+          if (!o) setBrowsing(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Shared reviews
+              {browsing ? ` — ${formatCaptureDay(browsing.day)}` : ""}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Every review shared for this session, including ones you have
+              already received or dismissed. Receiving applies their timeline,
+              annotations, and flags — no video is copied.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {browsing?.loading ? (
+            <p className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
+              <Loader2Icon className="size-4 animate-spin" />
+              Looking for shared reviews…
+            </p>
+          ) : browsing && browsing.bundles.length === 0 ? (
+            <p className="py-2 text-sm text-muted-foreground">
+              No shared reviews for this session yet.
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {browsing?.bundles.map((bundle) => (
+                <li
+                  key={bundle.bundle_path}
+                  className="flex items-center gap-3 rounded-md border px-3 py-2 text-sm"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 font-medium">
+                      <span className="truncate">{bundle.sharer_label}</span>
+                      {!bundle.seen ? (
+                        <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+                          New
+                        </span>
+                      ) : null}
+                    </div>
+                    <p className="text-muted-foreground tabular-nums">
+                      {bundle.recording_count} recording
+                      {bundle.recording_count === 1 ? "" : "s"} ·{" "}
+                      {bundle.rally_count}{" "}
+                      {bundle.rally_count === 1 ? "rally" : "rallies"} ·{" "}
+                      {bundle.annotation_count} verdict
+                      {bundle.annotation_count === 1 ? "" : "s"}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="shrink-0"
+                    onClick={() => void receiveFromBrowser(bundle.bundle_path)}
+                  >
+                    <DownloadIcon className="size-4" />
+                    Receive
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>Close</AlertDialogCancel>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <header className="flex h-11 shrink-0 items-center gap-2.5 border-b px-4">
         <ClapperboardIcon className="size-5" />
         <span className="text-sm font-semibold">Voloph</span>
@@ -1184,6 +1313,27 @@ export function SessionList({
                   >
                     <PlayIcon className="size-4" />
                     Review session
+                  </Button>
+                  {/* Shared reviews for this session (issue): browse every
+                      bundle shared for this day, including ones already received
+                      or dismissed, and re-receive any. Only the shared library
+                      holds bundles, so it is disabled elsewhere. */}
+                  <Button
+                    variant="outline"
+                    size="icon-sm"
+                    className="shrink-0"
+                    disabled={active !== "shared"}
+                    onClick={() => void openBundleBrowser(session.capture_day)}
+                    title={
+                      active === "shared"
+                        ? "Shared reviews for this session"
+                        : "Switch to the shared library to see shared reviews."
+                    }
+                  >
+                    <UsersIcon className="size-4" />
+                    <span className="sr-only">
+                      Shared reviews for this session
+                    </span>
                   </Button>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>

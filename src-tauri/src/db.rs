@@ -2472,6 +2472,25 @@ pub struct BundleOffer {
     pub is_update: bool,
 }
 
+/// A shared bundle as listed for browsing (issue): its identity plus a summary
+/// of what it carries, and whether the user has already acted on it. Unlike
+/// [`BundleOffer`], this describes *every* foreign bundle in the shared library
+/// regardless of the seen ledger — so a review that scrolled past its offer (was
+/// received or declined) can still be found and re-received per session.
+#[derive(Debug, Serialize)]
+pub struct BundleSummary {
+    /// Absolute path of the `.vbundle`, handed straight to [`receive_session_bundle`].
+    pub bundle_path: String,
+    pub capture_day: String,
+    pub sharer_label: String,
+    pub recording_count: usize,
+    pub rally_count: usize,
+    pub annotation_count: usize,
+    /// Already received or declined at its current signature (in the seen
+    /// ledger) — i.e. no longer surfaced as a standing offer.
+    pub seen: bool,
+}
+
 /// A bundle file's change signature: its size and mtime, cheap to read and
 /// enough to notice a re-share without hashing the file. `None` when the file
 /// cannot be stat'd (vanished between listing and here).
@@ -2583,6 +2602,53 @@ pub fn discover_bundles(conn: &Connection) -> Vec<BundleOffer> {
             .then_with(|| a.sharer_label.cmp(&b.sharer_label))
     });
     offers
+}
+
+/// Every foreign shared bundle in the shared library (issue), each summarized —
+/// who shared it, how much review it carries, and whether it has already been
+/// received or declined. Independent of the seen ledger (which only governs what
+/// `discover_bundles` nags about), so the per-session bundle browser can list a
+/// review that has already been accepted and offer to re-receive it. Ordered by
+/// session day then sharer label.
+pub fn list_bundles(conn: &Connection) -> Vec<BundleSummary> {
+    let declined = declined_bundles(conn);
+    let mut out: Vec<BundleSummary> = list_shared_bundles(conn)
+        .into_iter()
+        .map(|d| {
+            let name = d
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let seen = declined.get(&name) == Some(&d.signature);
+            let bundle_path = d.path.to_string_lossy().into_owned();
+            let recording_count = d.bundle.recordings.len();
+            let rally_count: usize =
+                d.bundle.recordings.iter().map(|r| r.rallies.len()).sum();
+            let annotation_count: usize = d
+                .bundle
+                .recordings
+                .iter()
+                .map(|r| r.annotations.len())
+                .sum();
+            BundleSummary {
+                bundle_path,
+                capture_day: d.bundle.capture_day,
+                sharer_label: d.bundle.sharer_label,
+                recording_count,
+                rally_count,
+                annotation_count,
+                seen,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.capture_day
+            .cmp(&b.capture_day)
+            .then_with(|| a.sharer_label.cmp(&b.sharer_label))
+    });
+    out
 }
 
 /// The library-relative paths of every recording covered by a bundle currently

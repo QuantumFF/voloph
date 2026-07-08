@@ -316,6 +316,17 @@ async fn discover_bundles(db: State<'_, Db>) -> Result<Vec<db::BundleOffer>, Str
     Ok(db::discover_bundles(&conn))
 }
 
+/// List every foreign shared bundle in the shared library (issue), each with a
+/// summary of what it carries and whether it has already been received or
+/// declined. Unlike [`discover_bundles`], this ignores the seen ledger, so a
+/// review can be found and re-received after its offer has been dismissed —
+/// backing the per-session bundle browser.
+#[tauri::command]
+async fn list_bundles(db: State<'_, Db>) -> Result<Vec<db::BundleSummary>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    Ok(db::list_bundles(&conn))
+}
+
 /// Decline a discovered bundle offer (ADR 0012, issue #67): record its current
 /// on-disk signature so it stops being offered until the sharer re-shares it.
 /// The recordings it covered are released back to the analysis queue — the user
@@ -945,6 +956,7 @@ pub fn run() {
             receive_session_bundle,
             resolve_bundle_conflict,
             discover_bundles,
+            list_bundles,
             decline_bundle,
             acknowledge_bundle,
             aspect_vocabulary,
