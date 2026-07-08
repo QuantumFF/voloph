@@ -28,6 +28,10 @@ _Avoid_: cut list, EDL, edit
 A span the segmenter marks as low-confidence — where it is unsure whether play is happening or where a rally boundary sits. Surfaced on the timeline during review as "check this," so correcting the draft becomes "visit the few spots the machine doubts" rather than scanning everything. Machine-produced and segmentation-related — distinct from a **Flag** (user-produced, about a rally's review value). Catches *uncertain* errors only, not confident-but-wrong segmentation.
 _Avoid_: flag, low-confidence marker, suspect
 
+**Analysis**:
+The machine-produced output of segmenting one recording, captured the moment segmentation completes — before any human correction: the draft timeline with per-rally confidence (uncertain regions included), the waveform, the duration, and the capture day. Impersonal — a pure function of the recording and the segmenter, carrying no review state and no attribution, which is why another user may adopt it silently. Hand corrections never enter an Analysis; they travel only inside a session bundle.
+_Avoid_: analyzed segments, segmentation results, analysis cache, draft (alone)
+
 **Annotation**:
 A single observation pinned to a precise timestamp within a recording (a moment), not to a whole rally — what matters is the specific shot or moment. Its core is a one-keystroke **verdict**, optionally enriched with an **aspect** and a free-text **note**. The rally it belongs to is implied by its timestamp falling within that rally's range. A moment with mixed verdicts (good decision, poor execution) is recorded as more than one annotation at the same timestamp.
 _Avoid_: comment, label, marker, tag
