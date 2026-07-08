@@ -1812,3 +1812,207 @@ fn segmenting_a_local_recording_publishes_nothing() {
     assert!(!lib.0.join(".voloph").join("analysis").exists());
     assert!(read_published_analysis(&lib.0, &abs).is_none());
 }
+
+// --- Adopting a published Analysis on scan (ADR 0013, issue #70) ---------
+
+/// Publish an Analysis into the shared library for the file at `abs`, keyed by its
+/// quick hash + size, carrying the given draft. Simulates another user having
+/// already analyzed these exact bytes.
+fn publish_test_analysis(lib: &TempLib, abs: &Path, rallies: Vec<AnalysisRally>) {
+    let meta = std::fs::metadata(abs).unwrap();
+    let hash = quick_hash(abs, meta.len()).unwrap();
+    let analysis = Analysis {
+        format: ANALYSIS_FORMAT.to_string(),
+        version: ANALYSIS_VERSION,
+        segmenter_version: crate::segment::SEGMENTER_VERSION,
+        capture_day: "2026-01-01".to_string(),
+        duration_ms: Some(42_000),
+        waveform: vec![0.3, 0.7],
+        rallies,
+    };
+    let dir = lib.0.join(".voloph").join("analysis");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = format!("{hash}_{}.vanalysis", meta.len());
+    std::fs::write(dir.join(name), serde_json::to_vec(&analysis).unwrap()).unwrap();
+}
+
+/// A fresh device scanning a shared library with a published Analysis adopts it:
+/// the recording arrives probed + segmented with the carried draft, so nothing is
+/// left in the probe/segment queue for it.
+#[test]
+fn fresh_scan_adopts_a_published_analysis() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    publish_test_analysis(
+        &lib,
+        &abs,
+        vec![AnalysisRally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4,
+        }],
+    );
+
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    assert_eq!(scan_library(&mut conn).unwrap().registered, 1);
+
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(tl.segment_state, "ready");
+    assert_eq!(tl.duration_ms, Some(42_000));
+    assert_eq!(tl.waveform, vec![0.3, 0.7]);
+    assert_eq!(
+        tl.rallies
+            .iter()
+            .map(|r| (r.start_ms, r.end_ms))
+            .collect::<Vec<_>>(),
+        vec![(1000, 5000)]
+    );
+
+    // No staging/probe/segmentation work remains — the whole pipeline was skipped.
+    conn.execute(
+        "UPDATE recordings SET date_state = 'refined' WHERE library = 'shared'",
+        [],
+    )
+    .unwrap();
+    assert!(next_media_work(&conn).unwrap().is_none());
+    assert!(pending_analysis(&conn).unwrap().is_empty());
+}
+
+/// A known-but-unanalyzed recording (registered on an earlier scan, still queued)
+/// adopts an Analysis that appears later and leaves the analysis queue.
+#[test]
+fn known_but_unanalyzed_recording_adopts_on_rescan() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    conn.execute(
+        "UPDATE recordings SET date_state = 'refined', probe_state = 'ready' WHERE library = 'shared'",
+        [],
+    )
+    .unwrap();
+    // Queued for segmentation before any Analysis exists.
+    assert!(matches!(
+        next_media_work(&conn).unwrap(),
+        Some(MediaWork::Segment(..))
+    ));
+
+    // Another user publishes; a re-scan adopts it and the queue drains.
+    publish_test_analysis(
+        &lib,
+        &abs,
+        vec![AnalysisRally {
+            start_ms: 0,
+            end_ms: 2000,
+            confidence: 0.5,
+        }],
+    );
+    scan_library(&mut conn).unwrap();
+    assert_eq!(
+        recording_timeline(&conn, &abs.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .segment_state,
+        "ready"
+    );
+    assert!(next_media_work(&conn).unwrap().is_none());
+}
+
+/// An already-analyzed recording is never churned, even when a differing Analysis
+/// is published — the local draft stands (ADR 0013).
+#[test]
+fn already_analyzed_recording_is_not_churned() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    // Local segmentation lands first.
+    save_rallies(
+        &mut conn,
+        id,
+        99_000,
+        &[crate::segment::Rally {
+            start_ms: 100,
+            end_ms: 200,
+            confidence: 0.6,
+        }],
+        &[0.9],
+    )
+    .unwrap();
+
+    // A differing published Analysis appears; a re-scan must not adopt over it.
+    publish_test_analysis(
+        &lib,
+        &abs,
+        vec![AnalysisRally {
+            start_ms: 5000,
+            end_ms: 9000,
+            confidence: 0.1,
+        }],
+    );
+    scan_library(&mut conn).unwrap();
+
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(tl.duration_ms, Some(99_000));
+    assert_eq!(
+        tl.rallies
+            .iter()
+            .map(|r| (r.start_ms, r.end_ms))
+            .collect::<Vec<_>>(),
+        vec![(100, 200)]
+    );
+}
+
+/// A corrupt or wrong-version `.vanalysis` is skipped silently — the recording is
+/// left unanalyzed for the normal pipeline (ADR 0013's silent-failure inversion).
+#[test]
+fn corrupt_or_wrong_version_analysis_is_ignored() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let meta = std::fs::metadata(&abs).unwrap();
+    let hash = quick_hash(&abs, meta.len()).unwrap();
+    let dir = lib.0.join(".voloph").join("analysis");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = format!("{hash}_{}.vanalysis", meta.len());
+    // A future-version envelope (otherwise well-formed) must not be adopted.
+    let future = serde_json::json!({
+        "format": ANALYSIS_FORMAT,
+        "version": ANALYSIS_VERSION + 1,
+        "segmenter_version": 1,
+        "capture_day": "2026-01-01",
+        "duration_ms": 1000,
+        "waveform": [0.1],
+        "rallies": [],
+    });
+    std::fs::write(dir.join(&name), serde_json::to_vec(&future).unwrap()).unwrap();
+
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    assert_eq!(
+        recording_timeline(&conn, &abs.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .segment_state,
+        "unknown"
+    );
+
+    // Garbage bytes are likewise ignored.
+    std::fs::write(dir.join(&name), b"not json at all").unwrap();
+    scan_library(&mut conn).unwrap();
+    assert_eq!(
+        recording_timeline(&conn, &abs.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .segment_state,
+        "unknown"
+    );
+}

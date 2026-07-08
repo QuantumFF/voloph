@@ -16,7 +16,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::{library_path_of, parse_waveform};
+use super::{is_hand_touched, library_path_of, parse_waveform, waveform_to_json};
 
 /// The on-disk Analysis format tag and current version — the `format`/`version`
 /// envelope (like `.vbundle`) that keeps the file backward-readable across format
@@ -150,6 +150,86 @@ fn write_analysis(dir: &Path, name: &str, analysis: &Analysis) -> std::io::Resul
     let tmp = dir.join(format!(".{name}.tmp"));
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, dir.join(name))
+}
+
+/// Read the published Analysis for a recording keyed by `quick_hash` + `file_size`
+/// (ADR 0013), or `None` when there is no matching file, it cannot be read, or it
+/// is not a readable Analysis (malformed, wrong format, or a newer version). Failure
+/// is silent by design — an Analysis is plumbing the user never knew existed, so an
+/// unreadable file just means the normal pipeline analyzes as if it weren't there.
+fn read_analysis(root: &str, quick_hash: &str, file_size: i64) -> Option<Analysis> {
+    let path = Path::new(root)
+        .join(".voloph")
+        .join("analysis")
+        .join(analysis_file_name(quick_hash, file_size));
+    let bytes = std::fs::read(&path).ok()?;
+    let analysis: Analysis = serde_json::from_slice(&bytes).ok()?;
+    // Format/version envelope check (ADR 0013): a wrong format or a version from a
+    // newer Voloph is ignored, not adopted, so a future format change stays safe.
+    if analysis.format != ANALYSIS_FORMAT || analysis.version > ANALYSIS_VERSION {
+        return None;
+    }
+    Some(analysis)
+}
+
+/// Silently adopt a published Analysis for the shared-library recordings that a
+/// scan just left machine-pristine and unanalyzed (ADR 0013): for each shared
+/// recording still `unknown`/`failed` and not hand-touched, look up its Analysis by
+/// quick hash + size and, if one is readable, register the carried draft timeline,
+/// waveform, duration, and mark it probed + segmented — no staging, no probe, no
+/// segmentation. Already-analyzed (`ready`) and hand-touched recordings are never
+/// consulted or changed. A missing, unreadable, or wrong-version file is skipped
+/// silently, leaving the recording for the normal pipeline. Runs inside the
+/// caller's transaction so a whole scan's adoptions commit atomically.
+pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let Ok(Some(root)) = library_path_of(tx, "shared") else {
+        return Ok(()); // shared library not designated — nothing to adopt into
+    };
+
+    // Candidates: shared recordings the pipeline has not produced a draft for yet.
+    // `ready` is excluded (the compute is spent; ADR 0013 never churns it).
+    let candidates: Vec<(i64, String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, quick_hash, file_size FROM recordings
+             WHERE library = 'shared' AND segment_state IN ('unknown', 'failed')",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+
+    for (id, quick_hash, file_size) in candidates {
+        // A hand-touched recording is never touched and never even asked (ADR 0013).
+        // Belt-and-braces: an unanalyzed recording carries no rallies/annotations, so
+        // this only guards against a future state that resets segmentation but keeps
+        // hand-work.
+        if is_hand_touched(tx, id)? {
+            continue;
+        }
+        let Some(analysis) = read_analysis(&root, &quick_hash, file_size) else {
+            continue;
+        };
+        tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for r in &analysis.rallies {
+                stmt.execute(rusqlite::params![id, r.start_ms, r.end_ms, r.confidence])?;
+            }
+        }
+        // Playable straight away, like a bundle-registered recording: the draft came
+        // from the Analysis, so probe + segment are both satisfied (ADR 0008/0013).
+        tx.execute(
+            "UPDATE recordings
+             SET probe_state = 'ready', segment_state = 'ready', duration_ms = ?1, waveform = ?2
+             WHERE id = ?3",
+            rusqlite::params![analysis.duration_ms, waveform_to_json(&analysis.waveform), id],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

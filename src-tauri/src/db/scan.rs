@@ -260,6 +260,13 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
         register_recording(&tx, &kind, &rel, file_size as i64, &hash, &meta)?;
         registered += 1;
     }
+
+    // Silently adopt any published Analysis (ADR 0013) for recordings this scan
+    // left unanalyzed — freshly registered or known-but-queued — so covered files
+    // arrive playable with their draft timeline, skipping the whole probe/segment
+    // pipeline. A no-op outside the shared library.
+    super::adopt_analyses(&tx)?;
+
     tx.commit()?;
 
     // Whatever known recordings are still missing after the walk could not be
