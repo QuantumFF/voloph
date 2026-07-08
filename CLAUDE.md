@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+Always use Opus for general-purpose agents
+
 ## Agent skills
 
 ### Issue tracker
