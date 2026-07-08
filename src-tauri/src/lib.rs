@@ -420,6 +420,16 @@ async fn delete_rally(db: State<'_, Db>, path: String, rally_id: i64) -> Result<
     db::delete_rally(&conn, &path, rally_id).map_err(|e| e.to_string())
 }
 
+/// Forget a recording and all its review state (the amber "not found" list,
+/// ADR 0011): the file has vanished from the library and the user opts to discard
+/// the retained review rather than wait for the file to return. Returns whether a
+/// recording was actually removed.
+#[tauri::command]
+async fn delete_recording(db: State<'_, Db>, path: String) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::delete_recording(&conn, &path).map_err(|e| e.to_string())
+}
+
 /// Set a rally's flag (issue #10 — "this rally matters", the source material for
 /// an export reel). Scoped to the recording at `path` like the inline edits;
 /// persists immediately so it survives restart. Returns whether a rally was found.
@@ -921,6 +931,7 @@ pub fn run() {
             update_rally,
             add_rally,
             delete_rally,
+            delete_recording,
             set_rally_flag,
             add_annotation,
             recording_annotations,

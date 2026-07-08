@@ -1548,6 +1548,31 @@ pub fn delete_rally(conn: &Connection, path: &str, rally_id: i64) -> rusqlite::R
     Ok(changed > 0)
 }
 
+/// Forget a recording and all its review state (the amber "not found" list,
+/// ADR 0011): a recording whose file has vanished from the library is retained
+/// with its review so it re-links when the file returns, but the user can choose
+/// to discard it instead. Deletes the recording row — rallies and annotations
+/// cascade off it — and garbage-collects the session it emptied, mirroring the
+/// re-home GC. Scoped to the active library via `path`. Returns `false` when the
+/// recording is not found.
+pub fn delete_recording(conn: &Connection, path: &str) -> rusqlite::Result<bool> {
+    let Some(rid) = recording_id(conn, path)? else {
+        return Ok(false);
+    };
+    let session: i64 = conn.query_row(
+        "SELECT session_id FROM recordings WHERE id = ?1",
+        [rid],
+        |r| r.get(0),
+    )?;
+    conn.execute("DELETE FROM recordings WHERE id = ?1", [rid])?;
+    conn.execute(
+        "DELETE FROM sessions WHERE id = ?1
+         AND NOT EXISTS (SELECT 1 FROM recordings WHERE session_id = ?1)",
+        [session],
+    )?;
+    Ok(true)
+}
+
 /// Set a rally's flag (issue #10 — "this rally matters", the export-reel source).
 /// Scoped to the recording at `path` like the inline rally edits, so a stray id
 /// from another recording cannot be touched. Idempotent — setting the current
@@ -2608,6 +2633,34 @@ mod tests {
         let id = recording_timeline(&conn, "/r.mp4").unwrap().unwrap().rallies[0].id;
         assert!(delete_rally(&conn, "/r.mp4", id).unwrap());
         assert_eq!(intervals(&conn, "/r.mp4"), vec![(8000, 12000, 0.3)]);
+    }
+
+    #[test]
+    fn delete_recording_discards_review_and_gcs_the_session() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000), (8000, 12000)]);
+        add_annotation(&conn, "/r.mp4", 2000, "good").unwrap();
+
+        assert!(delete_recording(&conn, "/r.mp4").unwrap());
+
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM recordings"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM rallies"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM annotations"), 0);
+        // The session it emptied is garbage-collected, mirroring the re-home GC.
+        assert_eq!(count("SELECT COUNT(*) FROM sessions"), 0);
+    }
+
+    #[test]
+    fn delete_recording_is_false_when_absent() {
+        let (conn, _) = db_with_rallies("/r.mp4", &[(1000, 5000)]);
+        assert!(!delete_recording(&conn, "/gone.mp4").unwrap());
+        // The real recording is untouched.
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recordings", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

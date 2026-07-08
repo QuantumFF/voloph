@@ -14,6 +14,7 @@ import {
   RefreshCwIcon,
   RotateCwIcon,
   Share2Icon,
+  Trash2Icon,
   VideoIcon,
 } from "lucide-react"
 
@@ -226,6 +227,10 @@ export function SessionList({
   // Retained in the DB with their review state; listed here so the user can put
   // them back (they re-link automatically) rather than losing the work silently.
   const [unresolved, setUnresolved] = useState<string[]>([])
+  // An unresolved recording the user has chosen to forget, awaiting confirmation.
+  // Discarding a retained review is destructive (the file may yet come back), so
+  // it goes through the same confirm gate as the bulk re-analyze.
+  const [forgetPath, setForgetPath] = useState<string | null>(null)
   // Cross-library carry-over offers (ADR 0011): the same content sits in both
   // libraries and only one side has hand-touched review. The app offers — never
   // silently — to carry that review to the other copy; the user accepts or declines
@@ -423,6 +428,20 @@ export function SessionList({
     }
   }
 
+  // Forget an unresolved recording: discard the review state the DB retained for
+  // a file that vanished from the library (ADR 0011). Drops it from the amber list
+  // and refreshes so any session it emptied disappears too.
+  async function handleForget(path: string) {
+    setError(null)
+    try {
+      await trackedInvoke("delete_recording", { path })
+      setUnresolved((prev) => prev.filter((p) => p !== path))
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   // Re-detect rallies for every recording. Discards every draft timeline,
   // including manual corrections, so it is confirmed through the dialog first.
   async function runReanalyzeAll() {
@@ -596,6 +615,40 @@ export function SessionList({
               }
             >
               {copy?.action}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Forget confirm (ADR 0011): discard the retained review for an unresolved
+          recording. Destructive — the file could still come back and re-link — so
+          it is confirmed before the delete. */}
+      <AlertDialog
+        open={forgetPath !== null}
+        onOpenChange={(o) => {
+          if (!o) setForgetPath(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this review?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently discards the saved review for{" "}
+              {forgetPath ? fileName(forgetPath) : "this recording"}. If the file
+              comes back later it will be treated as new, with no review to
+              re-link.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (forgetPath) void handleForget(forgetPath)
+                setForgetPath(null)
+              }}
+              className={buttonVariants({ variant: "destructive" })}
+            >
+              Delete review
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -868,8 +921,19 @@ export function SessionList({
               </p>
               <ul className="mt-2 space-y-0.5 text-muted-foreground">
                 {unresolved.map((path) => (
-                  <li key={path} className="truncate" title={path}>
-                    {fileName(path)}
+                  <li key={path} className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate" title={path}>
+                      {fileName(path)}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 px-2 text-muted-foreground hover:text-destructive"
+                      onClick={() => setForgetPath(path)}
+                    >
+                      <Trash2Icon className="size-3.5" />
+                      Delete review
+                    </Button>
                   </li>
                 ))}
               </ul>
