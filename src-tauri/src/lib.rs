@@ -5,22 +5,23 @@ mod media_worker;
 mod segment;
 mod staging;
 
-// Embedded libmpv playback (ADR 0008). Linux-only — it links libmpv and drives
-// GTK directly; other targets get inert stubs so the crate still builds.
-#[cfg(target_os = "linux")]
+// Embedded libmpv playback (ADR 0008, ADR 0014). Linux and Windows — it links
+// libmpv and drives the platform's native surface (GTK overlay / child HWND)
+// directly; other targets get inert stubs so the crate still builds.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod mpv;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod mpv {
     pub fn init(_app: &tauri::AppHandle) -> Result<(), String> {
         Ok(())
     }
     #[tauri::command]
     pub fn mpv_load(_path: String, _start_ms: Option<f64>) -> Result<(), String> {
-        Err("embedded playback is only available on Linux".into())
+        Err("embedded playback is only available on Linux and Windows".into())
     }
     #[tauri::command]
     pub fn mpv_set_pause(_paused: bool) -> Result<(), String> {
-        Err("embedded playback is only available on Linux".into())
+        Err("embedded playback is only available on Linux and Windows".into())
     }
     #[tauri::command]
     pub fn mpv_set_rect(_x: i32, _y: i32, _w: i32, _h: i32) {}
@@ -32,23 +33,23 @@ mod mpv {
     pub fn mpv_suppress_surface(_suppressed: bool) {}
     #[tauri::command]
     pub fn mpv_seek(_ms: f64) -> Result<(), String> {
-        Err("embedded playback is only available on Linux".into())
+        Err("embedded playback is only available on Linux and Windows".into())
     }
     #[tauri::command]
     pub fn mpv_frame_step(_forward: bool) -> Result<(), String> {
-        Err("embedded playback is only available on Linux".into())
+        Err("embedded playback is only available on Linux and Windows".into())
     }
     #[tauri::command]
     pub fn mpv_set_speed(_speed: f64) -> Result<(), String> {
-        Err("embedded playback is only available on Linux".into())
+        Err("embedded playback is only available on Linux and Windows".into())
     }
     #[tauri::command]
     pub fn mpv_set_volume(_volume: f64) -> Result<(), String> {
-        Err("embedded playback is only available on Linux".into())
+        Err("embedded playback is only available on Linux and Windows".into())
     }
     #[tauri::command]
     pub fn mpv_set_mute(_muted: bool) -> Result<(), String> {
-        Err("embedded playback is only available on Linux".into())
+        Err("embedded playback is only available on Linux and Windows".into())
     }
 }
 

@@ -10,3 +10,7 @@
 # Run `scripts/fetch-sidecars.sh` to populate them (README.md stays tracked).
 /binaries/ffmpeg-*
 /binaries/ffprobe-*
+
+# libmpv-2.dll is fetched for the Windows bundle, not committed (ADR 0014).
+# Run `scripts/fetch-libmpv.sh` to populate it.
+/libmpv-2.dll

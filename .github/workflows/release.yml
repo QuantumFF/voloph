@@ -52,6 +52,16 @@ jobs:
         shell: bash
         run: bash scripts/fetch-sidecars.sh
 
+      # The embedded player links libmpv-2.dll via raw-dylib (ADR 0014); the
+      # DLL ships beside the exe as a bundle resource and is fetched, not
+      # committed. Linux instead links the system libmpv (libmpv-dev above).
+      - name: Fetch libmpv (Windows)
+        if: startsWith(matrix.platform, 'windows')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/fetch-libmpv.sh
+
       - name: Install frontend dependencies
         run: bun install
 

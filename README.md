@@ -46,23 +46,26 @@ video is played in place, exactly as it came off the camera.
 
 ## Platform
 
-**Linux only.** Playback embeds libmpv in-process, rendered into a `GtkGLArea`
-overlaid on the webview (see [ADR 0008](docs/adr/0008-embedded-libmpv-playback.md)),
-so any codec plays and sparse-GOP seeking is fast. Non-Linux targets build with
-inert playback stubs but are not a supported runtime.
+**Linux and Windows.** Playback embeds libmpv in-process, so any codec plays
+and sparse-GOP seeking is fast. On Linux it renders into a `GtkGLArea` overlaid
+on the webview (see [ADR 0008](docs/adr/0008-embedded-libmpv-playback.md)); on
+Windows mpv renders itself into a child window handed over with `--wid` (see
+[ADR 0014](docs/adr/0014-windows-embedded-playback-wid-child-hwnd.md)). Other
+targets build with inert playback stubs but are not a supported runtime.
 
 ---
 
 ## Architecture
 
 Voloph is a [Tauri 2](https://tauri.app) app: a Rust backend behind a React
-frontend rendered in the system webview (WebKitGTK).
+frontend rendered in the system webview (WebKitGTK on Linux, WebView2 on
+Windows).
 
 | Layer          | Stack                                                                        |
 | -------------- | --------------------------------------------------------------------------- |
 | Frontend       | React 19 · TypeScript · Vite · Tailwind CSS v4 · shadcn/ui · lucide-react   |
 | Shell          | Tauri 2 (Rust)                                                              |
-| Playback       | Embedded **libmpv** via `GtkGLArea` (Linux)                                 |
+| Playback       | Embedded **libmpv** — `GtkGLArea` (Linux) / `--wid` child HWND (Windows)    |
 | Metadata store | **SQLite** (`rusqlite`, bundled) in the app data dir                        |
 | Media pipeline | Bundled **ffmpeg / ffprobe** sidecars for probing, segmentation, and export |
 
@@ -125,8 +128,12 @@ Review is keyboard-driven; press `?` in the player for the live cheat-sheet
 
 - [Bun](https://bun.sh) (package manager and script runner)
 - [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
-- Tauri's Linux system dependencies — WebKitGTK, GTK 3, and libmpv development
-  packages. See the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/).
+- On Linux: Tauri's system dependencies — WebKitGTK, GTK 3, and libmpv
+  development packages. See the
+  [Tauri prerequisites guide](https://tauri.app/start/prerequisites/).
+- On Windows: `scripts/fetch-libmpv.sh` installs `libmpv-2.dll` for the bundle;
+  for `tauri dev` the DLL must also sit beside the dev exe or on `PATH`
+  (raw-dylib resolves it at process start — ADR 0014).
 
 `ffmpeg` / `ffprobe` are bundled as sidecars (`src-tauri/binaries/`), so no
 system ffmpeg is required.
@@ -172,7 +179,7 @@ src-tauri/                    Backend (Rust / Tauri)
   src/segment.rs              Rally/gap segmentation
   src/media.rs                ffmpeg/ffprobe probing and extraction
   src/export.rs               Rally-selection export engine
-  src/mpv.rs                  Embedded libmpv playback (Linux)
+  src/mpv/                    Embedded libmpv playback (core + linux/windows surfaces)
   binaries/                   Bundled ffmpeg / ffprobe sidecars
 docs/
   adr/                        Architecture Decision Records
