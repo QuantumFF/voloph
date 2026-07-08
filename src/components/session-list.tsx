@@ -5,6 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog"
 import {
   AlertTriangleIcon,
   ClapperboardIcon,
+  DownloadIcon,
   FilterIcon,
   FolderOpenIcon,
   Loader2Icon,
@@ -114,6 +115,19 @@ interface CarryOffer {
   to_kind: string
 }
 
+/**
+ * The outcome of receiving a session bundle (ADR 0012, issue #66). `applied` is
+ * the count taken silently (registered fresh or replacing machine-only state);
+ * `refused` names files that failed verification; `conflicts` are the library-
+ * relative paths of hand-touched recordings awaiting a keep-mine-or-take-theirs
+ * choice — nothing changed for them until the user decides.
+ */
+interface ReceiveResult {
+  applied: number
+  refused: { path: string; reason: string }[]
+  conflicts: string[]
+}
+
 interface ScanResult {
   registered: number
   skipped: number
@@ -205,6 +219,13 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   const [shareName, setShareName] = useState<string>("")
   // One-line confirmation after a successful share, cleared on the next action.
   const [shareNote, setShareNote] = useState<string | null>(null)
+  // The bundle file currently being received (ADR 0012): its path, the outcome
+  // of the receive, and which hand-touched recordings still need a keep-mine-or-
+  // take-theirs choice. Null until the user opens a bundle.
+  const [receiving, setReceiving] = useState<{
+    bundlePath: string
+    result: ReceiveResult
+  } | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -407,6 +428,64 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
     }
   }
 
+  // Receive a bundle (ADR 0012): pick a .vbundle, apply its review against the
+  // shared library. Unknown recordings register straight from it (self-sufficient);
+  // machine-only state is replaced silently; hand-touched recordings surface as
+  // keep-mine-or-take-theirs conflicts. Refreshes so applied state appears at once.
+  async function handleReceive() {
+    setError(null)
+    setShareNote(null)
+    try {
+      const picked = await open({
+        multiple: false,
+        filters: [{ name: "Voloph bundle", extensions: ["vbundle"] }],
+      })
+      if (typeof picked !== "string") return
+      const result = await trackedInvoke<ReceiveResult>(
+        "receive_session_bundle",
+        { bundlePath: picked }
+      )
+      await refresh()
+      if (result.conflicts.length > 0 || result.refused.length > 0) {
+        setReceiving({ bundlePath: picked, result })
+      } else {
+        setShareNote(
+          `Received ${result.applied} recording${result.applied === 1 ? "" : "s"}.`
+        )
+      }
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // Resolve one keep-mine-or-take-theirs conflict (ADR 0012), whole-recording:
+  // take-theirs replaces the recipient's review with the bundle's; keep-mine
+  // dismisses. Drops the row from the pending list either way; closes the dialog
+  // once none remain.
+  async function resolveConflict(path: string, takeTheirs: boolean) {
+    if (!receiving) return
+    try {
+      if (takeTheirs) {
+        await trackedInvoke("resolve_bundle_conflict", {
+          bundlePath: receiving.bundlePath,
+          path,
+          takeTheirs: true,
+        })
+        await refresh()
+      }
+      setReceiving((prev) => {
+        if (!prev) return prev
+        const conflicts = prev.result.conflicts.filter((c) => c !== path)
+        if (conflicts.length === 0 && prev.result.refused.length === 0) {
+          return null
+        }
+        return { ...prev, result: { ...prev.result, conflicts } }
+      })
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   const confirmCopy = {
     reanalyze: {
       title: "Re-analyze all recordings?",
@@ -489,6 +568,76 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
             >
               {shareTarget?.saveAs ? "Save" : "Share"}
             </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Receive resolution (ADR 0012): after a bundle is received, name any
+          files that failed verification and let the user choose keep-mine or
+          take-theirs per hand-touched recording. Whole-recording granularity —
+          nothing merges. Closing dismisses any unresolved conflicts (keep-mine). */}
+      <AlertDialog
+        open={receiving !== null}
+        onOpenChange={(o) => {
+          if (!o) setReceiving(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Received bundle</AlertDialogTitle>
+            <AlertDialogDescription>
+              Applied {receiving?.result.applied ?? 0} recording
+              {receiving?.result.applied === 1 ? "" : "s"}.
+              {receiving && receiving.result.conflicts.length > 0
+                ? " Choose which review to keep for the recordings you have already edited."
+                : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {receiving && receiving.result.refused.length > 0 ? (
+            <div className="rounded-md border border-amber-500/50 bg-amber-500/5 px-3 py-2 text-sm">
+              <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-500">
+                <AlertTriangleIcon className="size-4" />
+                {receiving.result.refused.length} recording
+                {receiving.result.refused.length === 1 ? "" : "s"} refused
+              </div>
+              <ul className="mt-1 space-y-0.5 text-muted-foreground">
+                {receiving.result.refused.map((r) => (
+                  <li key={r.path} className="truncate" title={r.reason}>
+                    {fileName(r.path)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {receiving && receiving.result.conflicts.length > 0 ? (
+            <ul className="space-y-2">
+              {receiving.result.conflicts.map((path) => (
+                <li
+                  key={path}
+                  className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm"
+                >
+                  <span className="min-w-0 flex-1 truncate" title={path}>
+                    {fileName(path)}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void resolveConflict(path, false)}
+                  >
+                    Keep mine
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => void resolveConflict(path, true)}
+                  >
+                    Take theirs
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          <AlertDialogFooter>
+            <AlertDialogCancel>Done</AlertDialogCancel>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -583,14 +732,24 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
               <Button
                 variant="outline"
                 size="icon-sm"
-                disabled={sessions.length === 0}
                 title="More library actions"
               >
                 <MoreVerticalIcon className="size-4" />
                 <span className="sr-only">More library actions</span>
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-34">
+            <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuLabel>Session bundle</DropdownMenuLabel>
+              {/* Receive a shared review (ADR 0012): only meaningful against the
+                  shared library, where bundles live and resolve. */}
+              <DropdownMenuItem
+                onClick={() => void handleReceive()}
+                disabled={active !== "shared"}
+                className="whitespace-nowrap"
+              >
+                <DownloadIcon className="size-4" />
+                Receive bundle…
+              </DropdownMenuItem>
               <DropdownMenuLabel>All recordings</DropdownMenuLabel>
               <DropdownMenuItem
                 onClick={() => setConfirmAction("reanalyze")}

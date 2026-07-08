@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Video file extensions we register as recordings.
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -1724,6 +1724,23 @@ pub fn filter_moments(
     Ok(out)
 }
 
+/// Distinct aspects present on annotations in the active library — the aspect
+/// vocabulary as it actually exists in the data (CONTEXT.md: a user-editable
+/// vocabulary, not a fixed enum). The frontend unions this with its seeded list
+/// so aspects a received bundle imported (ADR 0012) — which may lie outside the
+/// seeds — still appear as filter options. Sorted for a stable order.
+pub fn aspect_vocabulary(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let kind = active_kind(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT a.aspect FROM annotations a
+         JOIN recordings rec ON rec.id = a.recording_id
+         WHERE rec.library = ?1 AND a.aspect IS NOT NULL
+         ORDER BY a.aspect",
+    )?;
+    let out = stmt.query_map([kind], |row| row.get(0))?.collect();
+    out
+}
+
 /// Parse the stored waveform JSON (a bare array of floats written by
 /// `save_rallies`) back into peaks. A null/absent or malformed value yields an
 /// empty waveform — the strip then just omits the waveform, harmless. Hand-parsed
@@ -1763,7 +1780,7 @@ pub const BUNDLE_VERSION: u32 = 1;
 
 /// A rally in a bundled timeline. Same shape as [`TimelineRally`] but its own
 /// type so the wire format is decoupled from the in-app struct.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BundleRally {
     pub start_ms: i64,
     pub end_ms: i64,
@@ -1773,7 +1790,7 @@ pub struct BundleRally {
 
 /// A verdict annotation in a bundle. Row ids are dropped — the receiver mints
 /// its own; only the portable fields travel.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BundleAnnotation {
     pub time_ms: i64,
     pub verdict: String,
@@ -1783,7 +1800,7 @@ pub struct BundleAnnotation {
 
 /// One recording's review state in a bundle — everything portable, nothing
 /// per-device.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BundleRecording {
     /// Library-relative path (ADR 0011); resolves against the recipient's own
     /// mount of the same shared library.
@@ -1799,7 +1816,7 @@ pub struct BundleRecording {
 
 /// A whole session's review state as handed off (ADR 0012). `format`/`version`
 /// tag the wire format for backward-readable evolution.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SessionBundle {
     pub format: String,
     pub version: u32,
@@ -1933,6 +1950,330 @@ pub fn bundle_file_name(capture_day: &str, sharer_label: &str) -> String {
     let safe = safe.trim_matches('-');
     let safe = if safe.is_empty() { "unnamed" } else { safe };
     format!("{capture_day}__{safe}.vbundle")
+}
+
+// --- Receiving session bundles (ADR 0012, issue #66) ---------------------
+//
+// Receive applies a bundle's review state against this device's shared library.
+// It is self-sufficient (ADR 0012): a recording the recipient never scanned is
+// registered straight from the bundle after the file at its relative path is
+// verified by quick hash + size — no probe, no segmentation. A mismatch refuses
+// that one recording (naming the file) while the rest of the bundle still
+// applies. Where the recipient already has state: machine-only state is replaced
+// silently; hand-touched state is left alone and surfaced as a keep-mine-or-take-
+// theirs choice (nothing merges). Receiving the same bundle twice is a no-op.
+
+/// One recording a receive could not apply, named so the user knows which file.
+#[derive(Debug, Serialize)]
+pub struct BundleRefusal {
+    /// Absolute path (on this device) of the file that failed verification.
+    pub path: String,
+    pub reason: String,
+}
+
+/// The outcome of receiving a bundle. `applied` counts recordings taken silently
+/// (registered fresh or replacing machine-only state); `refused` names files that
+/// failed verification; `conflicts` are the library-relative paths of recordings
+/// the recipient has hand-touched — each awaits a keep-mine-or-take-theirs choice
+/// via [`resolve_bundle_conflict`], nothing having been changed for them.
+#[derive(Debug, Serialize)]
+pub struct ReceiveResult {
+    pub applied: usize,
+    pub refused: Vec<BundleRefusal>,
+    /// Library-relative paths of hand-touched recordings awaiting the user's
+    /// per-recording choice.
+    pub conflicts: Vec<String>,
+}
+
+/// The waveform peaks serialized exactly as [`save_rallies`] writes them — a
+/// compact JSON array of two-decimal floats.
+fn waveform_to_json(waveform: &[f32]) -> String {
+    format!(
+        "[{}]",
+        waveform
+            .iter()
+            .map(|p| format!("{p:.2}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// Verify that the file at `abs` is the recording the bundle describes: it exists,
+/// its size matches, and its quick hash matches. There is no innocent mismatch
+/// (ADR 0012) — a mismatch means the file at that path is not this recording.
+fn verify_bundle_file(abs: &Path, expect_hash: &str, file_size: i64) -> bool {
+    let Ok(meta) = std::fs::metadata(abs) else {
+        return false;
+    };
+    if meta.len() as i64 != file_size {
+        return false;
+    }
+    quick_hash(abs, meta.len()).map(|h| h == expect_hash).unwrap_or(false)
+}
+
+/// Write a bundle recording's carried state onto recording row `id`, replacing any
+/// prior timeline and annotations (whole-recording, never merged; ADR 0012) and
+/// marking it segmented so it plays immediately. Runs inside the caller's
+/// transaction.
+fn apply_bundle_state(
+    tx: &rusqlite::Transaction,
+    id: i64,
+    rec: &BundleRecording,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
+    tx.execute("DELETE FROM annotations WHERE recording_id = ?1", [id])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for r in &rec.rallies {
+            stmt.execute(rusqlite::params![
+                id,
+                r.start_ms,
+                r.end_ms,
+                r.confidence,
+                r.flagged as i64
+            ])?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO annotations (recording_id, time_ms, verdict, aspect, note)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for a in &rec.annotations {
+            stmt.execute(rusqlite::params![
+                id,
+                a.time_ms,
+                a.verdict,
+                a.aspect,
+                a.note
+            ])?;
+        }
+    }
+    // Registered-from-bundle recordings are playable straight away (ADR 0012): the
+    // file is verified and the carried timeline is its draft. Probe is 'ready'
+    // (libmpv plays the original directly, ADR 0008) and segmentation 'ready' (the
+    // draft came in the bundle — no local segmentation of network video).
+    tx.execute(
+        "UPDATE recordings
+         SET probe_state = 'ready', segment_state = 'ready', duration_ms = ?1, waveform = ?2
+         WHERE id = ?3",
+        rusqlite::params![rec.duration_ms, waveform_to_json(&rec.waveform), id],
+    )?;
+    Ok(())
+}
+
+/// Whether recording `id`'s current timeline and annotations already equal the
+/// bundle's — the test for the idempotent no-op (ADR 0012). Compares the ordered
+/// rally intervals (with confidence + flag) and ordered annotations; row ids are
+/// ignored (the recipient minted its own). Confidence compares with a small
+/// epsilon so a float round-trip through JSON does not read as a difference.
+fn state_matches_bundle(
+    conn: &Connection,
+    id: i64,
+    rec: &BundleRecording,
+) -> rusqlite::Result<bool> {
+    let mut rstmt = conn.prepare(
+        "SELECT start_ms, end_ms, confidence, flagged FROM rallies
+         WHERE recording_id = ?1 ORDER BY start_ms",
+    )?;
+    let rallies: Vec<(i64, i64, f64, bool)> = rstmt
+        .query_map([id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if rallies.len() != rec.rallies.len() {
+        return Ok(false);
+    }
+    for (cur, b) in rallies.iter().zip(&rec.rallies) {
+        if cur.0 != b.start_ms
+            || cur.1 != b.end_ms
+            || (cur.2 - b.confidence).abs() > 1e-6
+            || cur.3 != b.flagged
+        {
+            return Ok(false);
+        }
+    }
+
+    let mut astmt = conn.prepare(
+        "SELECT time_ms, verdict, aspect, note FROM annotations
+         WHERE recording_id = ?1 ORDER BY time_ms, id",
+    )?;
+    let anns: Vec<(i64, String, Option<String>, Option<String>)> = astmt
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if anns.len() != rec.annotations.len() {
+        return Ok(false);
+    }
+    for (cur, b) in anns.iter().zip(&rec.annotations) {
+        if cur.0 != b.time_ms
+            || cur.1 != b.verdict
+            || cur.2 != b.aspect
+            || cur.3 != b.note
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Receive a session bundle into this device's **shared** library (ADR 0012).
+/// `bundle_json` is the `.vbundle` file's contents. Registers unknown recordings
+/// after verifying their file, replaces machine-only state silently, and reports
+/// hand-touched recordings as conflicts for a keep-mine-or-take-theirs choice —
+/// leaving those untouched. Idempotent: a second receive of the same bundle finds
+/// every recording already matching and reports nothing to resolve.
+pub fn receive_session_bundle(
+    conn: &mut Connection,
+    bundle_json: &str,
+) -> Result<ReceiveResult, String> {
+    let bundle: SessionBundle =
+        serde_json::from_str(bundle_json).map_err(|e| format!("not a valid bundle: {e}"))?;
+    if bundle.format != BUNDLE_FORMAT {
+        return Err("this file is not a Voloph session bundle".into());
+    }
+    if bundle.version > BUNDLE_VERSION {
+        return Err(format!(
+            "this bundle is from a newer version of Voloph (format v{})",
+            bundle.version
+        ));
+    }
+    let library = library_path_of(conn, "shared")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "designate the shared library before receiving a bundle".to_string())?;
+
+    let mut applied = 0usize;
+    let mut refused = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for rec in &bundle.recordings {
+        let abs = absolute(&library, &rec.path);
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM recordings WHERE library = 'shared' AND path = ?1",
+                [&rec.path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        // Already exactly this state (a second receive of the same bundle, or the
+        // recipient's own copy of a review they shared) → nothing to do, no
+        // conflict (ADR 0012: receiving twice is a no-op). Checked before the
+        // hand-touched branch because the bundle's own flags/annotations make the
+        // recording read as hand-touched once applied.
+        if let Some(id) = existing {
+            if state_matches_bundle(conn, id, rec).map_err(|e| e.to_string())? {
+                continue;
+            }
+            // Hand-touched local state differing from the bundle is never
+            // overwritten silently — surface it as a choice and move on, having
+            // changed nothing (ADR 0012).
+            if is_hand_touched(conn, id).map_err(|e| e.to_string())? {
+                conflicts.push(rec.path.clone());
+                continue;
+            }
+        }
+
+        // Every applied recording is verified against the file on disk — for a
+        // fresh registration this is self-sufficiency; for a machine-only replace
+        // it is the same strict check (there is no innocent mismatch, ADR 0012).
+        if !verify_bundle_file(Path::new(&abs), &rec.quick_hash, rec.file_size) {
+            refused.push(BundleRefusal {
+                path: abs,
+                reason: "file does not match the bundle (missing, or different content)".into(),
+            });
+            continue;
+        }
+
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO sessions (capture_day, library) VALUES (?1, 'shared')",
+                    [&rec.capture_day],
+                )
+                .map_err(|e| e.to_string())?;
+                let session_id: i64 = tx
+                    .query_row(
+                        "SELECT id FROM sessions WHERE capture_day = ?1 AND library = 'shared'",
+                        [&rec.capture_day],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO recordings
+                        (session_id, path, library, file_size, quick_hash, capture_day)
+                     VALUES (?1, ?2, 'shared', ?3, ?4, ?5)",
+                    rusqlite::params![
+                        session_id,
+                        &rec.path,
+                        rec.file_size,
+                        &rec.quick_hash,
+                        &rec.capture_day
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.last_insert_rowid()
+            }
+        };
+        apply_bundle_state(&tx, id, rec).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        applied += 1;
+    }
+
+    Ok(ReceiveResult {
+        applied,
+        refused,
+        conflicts,
+    })
+}
+
+/// Resolve one keep-mine-or-take-theirs conflict from a received bundle (ADR
+/// 0012). `path` is the recording's library-relative path (as reported in
+/// [`ReceiveResult::conflicts`]). `take_theirs` replaces the recipient's whole
+/// timeline and annotations with the bundle's after re-verifying the file; keep-
+/// mine (`false`) is a no-op. Re-reads the bundle so no server-side state is held
+/// between the offer and the choice. Returns whether the recording was replaced.
+pub fn resolve_bundle_conflict(
+    conn: &mut Connection,
+    bundle_json: &str,
+    path: &str,
+    take_theirs: bool,
+) -> Result<bool, String> {
+    if !take_theirs {
+        return Ok(false);
+    }
+    let bundle: SessionBundle =
+        serde_json::from_str(bundle_json).map_err(|e| format!("not a valid bundle: {e}"))?;
+    let rec = bundle
+        .recordings
+        .iter()
+        .find(|r| r.path == path)
+        .ok_or_else(|| "recording not in bundle".to_string())?;
+    let library = library_path_of(conn, "shared")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the shared library is not designated".to_string())?;
+    let abs = absolute(&library, &rec.path);
+    if !verify_bundle_file(Path::new(&abs), &rec.quick_hash, rec.file_size) {
+        return Err(format!(
+            "file does not match the bundle: {abs}"
+        ));
+    }
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM recordings WHERE library = 'shared' AND path = ?1",
+            [&rec.path],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    apply_bundle_state(&tx, id, rec).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2996,5 +3337,195 @@ mod tests {
             bundle_file_name("2026-01-01", "///"),
             "2026-01-01__unnamed.vbundle"
         );
+    }
+
+    // --- Receiving bundles (issue #66) ------------------------------------
+
+    /// A sharer's DB over the shared library `lib`, with two recordings under it
+    /// (both real files so quick hashes verify), the first flagged + annotated
+    /// so it carries hand-touched state and a custom aspect. Returns the DB and
+    /// the built bundle's JSON, ready to receive on another device pointed at the
+    /// same shared folder.
+    fn shared_bundle_json(lib: &TempLib) -> String {
+        lib.write("a.mp4", b"aaaa");
+        lib.write("b.mp4", b"bbbb");
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 2);
+        let a_abs = absolute(&lib.0.to_string_lossy(), "a.mp4");
+        // Give a.mp4 a machine timeline, then flag a rally + annotate with an
+        // aspect outside the seeded vocabulary — hand-touched, carried in the bundle.
+        let a_id = recording_id(&conn, &a_abs).unwrap().unwrap();
+        conn.execute(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+             VALUES (?1, 1000, 5000, 0.4, 1), (?1, 8000, 9000, 0.3, 0)",
+            [a_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE recordings SET segment_state = 'ready', duration_ms = 60000 WHERE id = ?1",
+            [a_id],
+        )
+        .unwrap();
+        add_annotation(&conn, &a_abs, 2000, "good").unwrap();
+        update_annotation(
+            &conn,
+            &a_abs,
+            recording_annotations(&conn, &a_abs).unwrap()[0].id,
+            "good",
+            Some("serve-toss"),
+            None,
+        )
+        .unwrap();
+        // Group both recordings under one session so the bundle spans them.
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT session_id FROM recordings WHERE id = ?1",
+                [a_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE recordings SET session_id = ?1 WHERE library = 'shared'",
+            [session_id],
+        )
+        .unwrap();
+        let bundle = build_session_bundle(&conn, session_id, "alice")
+            .unwrap()
+            .unwrap();
+        serde_json::to_string(&bundle).unwrap()
+    }
+
+    fn recipient_db(lib: &TempLib) -> Connection {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+        conn
+    }
+
+    /// Receiving on a device that never scanned the session registers every
+    /// recording (self-sufficient), applies the carried timeline/annotations, and
+    /// the recordings play immediately (segment_state ready with a duration). An
+    /// imported aspect enters the recipient's vocabulary. A second receive is a no-op.
+    #[test]
+    fn receive_registers_and_applies_on_a_fresh_device() {
+        let lib = TempLib::new();
+        let json = shared_bundle_json(&lib);
+        let mut conn = recipient_db(&lib);
+
+        let result = receive_session_bundle(&mut conn, &json).unwrap();
+        assert_eq!(result.applied, 2);
+        assert!(result.refused.is_empty());
+        assert!(result.conflicts.is_empty());
+
+        // a.mp4 registered with the sharer's timeline, flag, annotation, aspect.
+        let a_abs = absolute(&lib.0.to_string_lossy(), "a.mp4");
+        let tl = recording_timeline(&conn, &a_abs).unwrap().unwrap();
+        assert_eq!(tl.rallies.len(), 2);
+        assert!(tl.rallies[0].flagged);
+        let anns = recording_annotations(&conn, &a_abs).unwrap();
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].aspect.as_deref(), Some("serve-toss"));
+        // Plays immediately: probed + segmented ready with a learned duration.
+        let (probe, seg, dur): (String, String, Option<i64>) = conn
+            .query_row(
+                "SELECT probe_state, segment_state, duration_ms FROM recordings
+                 WHERE library = 'shared' AND path = 'a.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(probe, "ready");
+        assert_eq!(seg, "ready");
+        assert_eq!(dur, Some(60000));
+        // The imported aspect appears in the recipient's vocabulary (AC4).
+        assert!(aspect_vocabulary(&conn).unwrap().contains(&"serve-toss".to_string()));
+
+        // Receiving the identical bundle again changes nothing, resolves nothing.
+        let again = receive_session_bundle(&mut conn, &json).unwrap();
+        assert_eq!(again.applied, 0);
+        assert!(again.refused.is_empty());
+        assert!(again.conflicts.is_empty());
+    }
+
+    /// A recording whose file fails hash + size verification is refused by name;
+    /// the rest of the bundle still applies.
+    #[test]
+    fn receive_refuses_a_mismatched_file_and_applies_the_rest() {
+        let lib = TempLib::new();
+        let json = shared_bundle_json(&lib);
+        // Corrupt a.mp4's bytes so its quick hash no longer matches the bundle.
+        std::fs::write(lib.0.join("a.mp4"), b"tampered-different-length").unwrap();
+        let mut conn = recipient_db(&lib);
+
+        let result = receive_session_bundle(&mut conn, &json).unwrap();
+        assert_eq!(result.applied, 1); // b.mp4 still applies
+        assert_eq!(result.refused.len(), 1);
+        assert!(result.refused[0].path.ends_with("a.mp4")); // names the file
+        // The refused recording was not registered.
+        assert!(recording_id(&conn, &absolute(&lib.0.to_string_lossy(), "a.mp4"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// Machine-only local state is replaced silently; hand-touched local state is
+    /// surfaced as a keep-mine-or-take-theirs conflict (nothing changed), which the
+    /// user resolves per recording at whole-recording granularity.
+    #[test]
+    fn receive_replaces_machine_state_and_offers_conflict_on_hand_touched() {
+        let lib = TempLib::new();
+        let json = shared_bundle_json(&lib);
+        let mut conn = recipient_db(&lib);
+        // The recipient scanned first, so both recordings exist locally.
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 2);
+        let a_abs = absolute(&lib.0.to_string_lossy(), "a.mp4");
+        let b_abs = absolute(&lib.0.to_string_lossy(), "b.mp4");
+        // b.mp4: a machine-only draft (uncertain rally, no flag/annotation).
+        let b_id = recording_id(&conn, &b_abs).unwrap().unwrap();
+        conn.execute(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+             VALUES (?1, 0, 1000, 0.2, 0)",
+            [b_id],
+        )
+        .unwrap();
+        // a.mp4: hand-touched (an annotation of the recipient's own).
+        add_annotation(&conn, &a_abs, 500, "bad").unwrap();
+
+        let result = receive_session_bundle(&mut conn, &json).unwrap();
+        // b.mp4 machine-only → replaced silently; a.mp4 hand-touched → conflict.
+        assert_eq!(result.applied, 1);
+        assert_eq!(result.conflicts, vec!["a.mp4".to_string()]);
+        // a.mp4 untouched so far: still the recipient's single annotation, no bundle rallies.
+        assert!(recording_timeline(&conn, &a_abs).unwrap().unwrap().rallies.is_empty());
+        assert_eq!(recording_annotations(&conn, &a_abs).unwrap().len(), 1);
+        // b.mp4 took the bundle: it had no rallies in the bundle → its draft is gone.
+        assert!(recording_timeline(&conn, &b_abs).unwrap().unwrap().rallies.is_empty());
+
+        // Keep-mine: a.mp4 is left exactly as the recipient had it.
+        assert!(!resolve_bundle_conflict(&mut conn, &json, "a.mp4", false).unwrap());
+        assert_eq!(recording_annotations(&conn, &a_abs).unwrap().len(), 1);
+
+        // Take-theirs: a.mp4 wholly replaced by the bundle (2 rallies, sharer's annotation).
+        assert!(resolve_bundle_conflict(&mut conn, &json, "a.mp4", true).unwrap());
+        let tl = recording_timeline(&conn, &a_abs).unwrap().unwrap();
+        assert_eq!(tl.rallies.len(), 2);
+        assert!(tl.rallies[0].flagged);
+        let anns = recording_annotations(&conn, &a_abs).unwrap();
+        assert_eq!(anns.len(), 1);
+        assert_eq!(anns[0].aspect.as_deref(), Some("serve-toss"));
+    }
+
+    /// A file/format that is not a Voloph bundle is rejected before any state
+    /// changes; a bundle from a newer format version is refused too.
+    #[test]
+    fn receive_rejects_a_non_bundle_and_newer_version() {
+        let lib = TempLib::new();
+        let mut conn = recipient_db(&lib);
+        assert!(receive_session_bundle(&mut conn, "{not json").is_err());
+        assert!(receive_session_bundle(&mut conn, r#"{"format":"nope","version":1,"capture_day":"","sharer_label":"","recordings":[]}"#).is_err());
+        let newer = format!(
+            r#"{{"format":"{BUNDLE_FORMAT}","version":{},"capture_day":"","sharer_label":"","recordings":[]}}"#,
+            BUNDLE_VERSION + 1
+        );
+        assert!(receive_session_bundle(&mut conn, &newer).is_err());
     }
 }

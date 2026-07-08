@@ -241,6 +241,58 @@ async fn save_session_bundle_as(
     Ok(())
 }
 
+/// Receive a session bundle (ADR 0012, issue #66): read the `.vbundle` file at
+/// `bundle_path` and apply its review state against this device's shared library.
+/// Unknown recordings are registered straight from the bundle after verifying
+/// their file (quick hash + size); machine-only local state is replaced silently;
+/// hand-touched recordings are returned as `conflicts` for a keep-mine-or-take-
+/// theirs choice (nothing changed for them). Files that fail verification are
+/// `refused`, named, while the rest of the bundle still applies. Receiving the
+/// same bundle twice is a no-op. Refused while the local library is active
+/// (bundles live in and resolve against the shared library).
+#[tauri::command]
+async fn receive_session_bundle(
+    db: State<'_, Db>,
+    bundle_path: String,
+) -> Result<db::ReceiveResult, String> {
+    let json = std::fs::read_to_string(&bundle_path)
+        .map_err(|e| format!("could not read bundle: {e}"))?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    if db::active_kind(&conn).map_err(|e| e.to_string())? != "shared" {
+        return Err("switch to the shared library to receive a bundle".into());
+    }
+    db::receive_session_bundle(&mut conn, &json)
+}
+
+/// Resolve one keep-mine-or-take-theirs conflict from a received bundle (ADR
+/// 0012, issue #66). `path` is the recording's library-relative path (as returned
+/// in [`db::ReceiveResult::conflicts`]); `take_theirs` replaces the recipient's
+/// whole timeline + annotations with the bundle's, keep-mine leaves it untouched.
+/// The bundle is re-read from `bundle_path` so no server-side state is held
+/// between the offer and the choice.
+#[tauri::command]
+async fn resolve_bundle_conflict(
+    db: State<'_, Db>,
+    bundle_path: String,
+    path: String,
+    take_theirs: bool,
+) -> Result<bool, String> {
+    let json = std::fs::read_to_string(&bundle_path)
+        .map_err(|e| format!("could not read bundle: {e}"))?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::resolve_bundle_conflict(&mut conn, &json, &path, take_theirs)
+}
+
+/// The aspect vocabulary present in the active library's annotations (issue #66),
+/// so the moment browser's aspect filter can offer aspects a received bundle
+/// imported alongside its seeded list. A user-editable vocabulary, not a fixed
+/// enum (CONTEXT.md).
+#[tauri::command]
+async fn aspect_vocabulary(db: State<'_, Db>) -> Result<Vec<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::aspect_vocabulary(&conn).map_err(|e| e.to_string())
+}
+
 /// Resolve the draft timeline (rallies + per-region confidence) for the
 /// recording at `path` (ADR 0002). While segmentation is still running the
 /// `segment_state` is `unknown` and `rallies` is empty; the player polls until
@@ -829,6 +881,9 @@ pub fn run() {
             sharer_label,
             share_session_bundle,
             save_session_bundle_as,
+            receive_session_bundle,
+            resolve_bundle_conflict,
+            aspect_vocabulary,
             recording_timeline,
             reanalyze_recording,
             rescan_library,
