@@ -193,7 +193,60 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     if !has_library_column {
         migrate_to_typed_libraries(&conn)?;
     }
+    // Heal DBs bitten by the first version of that migration: its
+    // `ALTER TABLE recordings RENAME TO recordings_old` made SQLite rewrite the
+    // child tables' FK clauses (rallies, annotations) to point at
+    // `recordings_old`, which the migration then dropped — leaving every
+    // timeline/annotation write failing with "no such table: main.recordings_old".
+    repair_dangling_recording_refs(&conn)?;
     Ok(conn)
+}
+
+/// Rebuild `rallies` and `annotations` when their FK clauses dangle on the
+/// dropped `recordings_old` (see `open`). Rebuilding in the safe order —
+/// create new, copy, drop old, rename into place — re-points them at
+/// `recordings` while keeping every row. No-op on a healthy DB.
+fn repair_dangling_recording_refs(conn: &Connection) -> rusqlite::Result<()> {
+    let broken: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND sql LIKE '%recordings_old%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if broken == 0 {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", false)?;
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE rallies_new (
+            id           INTEGER PRIMARY KEY,
+            recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+            start_ms     INTEGER NOT NULL,
+            end_ms       INTEGER NOT NULL,
+            confidence   REAL NOT NULL,
+            flagged      INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO rallies_new SELECT id, recording_id, start_ms, end_ms, confidence, flagged FROM rallies;
+         DROP TABLE rallies;
+         ALTER TABLE rallies_new RENAME TO rallies;
+         CREATE INDEX IF NOT EXISTS idx_rallies_recording ON rallies(recording_id);
+         CREATE TABLE annotations_new (
+            id           INTEGER PRIMARY KEY,
+            recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+            time_ms      INTEGER NOT NULL,
+            verdict      TEXT NOT NULL,
+            aspect       TEXT,
+            note         TEXT
+         );
+         INSERT INTO annotations_new SELECT id, recording_id, time_ms, verdict, aspect, note FROM annotations;
+         DROP TABLE annotations;
+         ALTER TABLE annotations_new RENAME TO annotations;
+         CREATE INDEX IF NOT EXISTS idx_annotations_recording ON annotations(recording_id);
+         COMMIT;",
+    )?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
 }
 
 /// One-time rebuild of `sessions` and `recordings` for the two-library model
@@ -202,17 +255,21 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
 /// old table-level UNIQUE(path)/UNIQUE(capture_day) cannot be dropped in place).
 fn migrate_to_typed_libraries(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "foreign_keys", false)?;
+    // Safe rebuild order per the SQLite docs ("Making Other Kinds Of Table
+    // Schema Changes"): create the new table under a temporary name, copy, drop
+    // the old, then rename the new into place. Renaming the *old* table out of
+    // the way instead would make SQLite rewrite the FK clauses of the child
+    // tables (rallies, annotations) to follow the rename, leaving them pointing
+    // at a dropped table.
     conn.execute_batch(
         "BEGIN;
-         ALTER TABLE sessions RENAME TO sessions_old;
-         ALTER TABLE recordings RENAME TO recordings_old;
-         CREATE TABLE sessions (
+         CREATE TABLE sessions_new (
             id          INTEGER PRIMARY KEY,
             capture_day TEXT NOT NULL,
             library     TEXT NOT NULL DEFAULT 'local',
             UNIQUE(library, capture_day)
          );
-         CREATE TABLE recordings (
+         CREATE TABLE recordings_new (
             id          INTEGER PRIMARY KEY,
             session_id  INTEGER NOT NULL REFERENCES sessions(id),
             path        TEXT NOT NULL,
@@ -227,16 +284,18 @@ fn migrate_to_typed_libraries(conn: &Connection) -> rusqlite::Result<()> {
             waveform        TEXT,
             UNIQUE(library, path)
          );
-         INSERT INTO sessions (id, capture_day, library)
-            SELECT id, capture_day, 'local' FROM sessions_old;
-         INSERT INTO recordings
+         INSERT INTO sessions_new (id, capture_day, library)
+            SELECT id, capture_day, 'local' FROM sessions;
+         INSERT INTO recordings_new
             (id, session_id, path, library, file_size, quick_hash, capture_day,
              probe_state, segment_state, date_state, duration_ms, waveform)
             SELECT id, session_id, path, 'local', file_size, quick_hash, capture_day,
                    probe_state, segment_state, date_state, duration_ms, waveform
-            FROM recordings_old;
-         DROP TABLE recordings_old;
-         DROP TABLE sessions_old;
+            FROM recordings;
+         DROP TABLE recordings;
+         DROP TABLE sessions;
+         ALTER TABLE sessions_new RENAME TO sessions;
+         ALTER TABLE recordings_new RENAME TO recordings;
          COMMIT;",
     )?;
     conn.pragma_update(None, "foreign_keys", true)?;
@@ -2839,10 +2898,19 @@ mod tests {
                     segment_state TEXT NOT NULL DEFAULT 'unknown',
                     date_state TEXT NOT NULL DEFAULT 'unknown',
                     duration_ms INTEGER, waveform TEXT);
+                 -- The real shipped child tables carry FK clauses on recordings;
+                 -- a RENAME of recordings rewrites these, so the fixture must
+                 -- have them for the migration test to be honest.
                  CREATE TABLE rallies (
-                    id INTEGER PRIMARY KEY, recording_id INTEGER NOT NULL,
+                    id INTEGER PRIMARY KEY,
+                    recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
                     start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
                     confidence REAL NOT NULL, flagged INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE annotations (
+                    id INTEGER PRIMARY KEY,
+                    recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+                    time_ms INTEGER NOT NULL, verdict TEXT NOT NULL,
+                    aspect TEXT, note TEXT);
                  INSERT INTO sessions (id, capture_day) VALUES (1, '2026-01-01');
                  INSERT INTO recordings (id, session_id, path, file_size, quick_hash, capture_day)
                     VALUES (7, 1, 'day1/game.mp4', 0, '', '2026-01-01');
@@ -2873,6 +2941,104 @@ mod tests {
             })
             .unwrap();
         assert_eq!(flagged, 1);
+        // Writes into the child tables still work after the rebuild — the rename
+        // must not leave rallies/annotations pointing at a dropped table
+        // ("no such table: main.recordings_old" from the media worker otherwise).
+        conn.execute(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence) VALUES (7, 6000, 9000, 0.8)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO annotations (recording_id, time_ms, verdict) VALUES (7, 6500, 'good')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A DB already bitten by the pre-fix #62 migration (its RENAME rewrote the
+    /// child tables' FK clauses to `recordings_old`, then dropped that table)
+    /// heals on open: the child tables are rebuilt against `recordings` with
+    /// every row kept, and timeline writes work again.
+    #[test]
+    fn open_repairs_child_tables_broken_by_earlier_rename() {
+        let path = std::env::temp_dir().join(format!(
+            "voloph-repair-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Reproduce the corrupted state the bad migration left behind: new-shape
+        // sessions/recordings, but child FKs pointing at the dropped table.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY, capture_day TEXT NOT NULL,
+                    library TEXT NOT NULL DEFAULT 'local', UNIQUE(library, capture_day));
+                 CREATE TABLE recordings (
+                    id INTEGER PRIMARY KEY,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    path TEXT NOT NULL, library TEXT NOT NULL DEFAULT 'local',
+                    file_size INTEGER NOT NULL, quick_hash TEXT NOT NULL,
+                    capture_day TEXT NOT NULL,
+                    probe_state TEXT NOT NULL DEFAULT 'unknown',
+                    segment_state TEXT NOT NULL DEFAULT 'unknown',
+                    date_state TEXT NOT NULL DEFAULT 'unknown',
+                    duration_ms INTEGER, waveform TEXT, UNIQUE(library, path));
+                 CREATE TABLE rallies (
+                    id INTEGER PRIMARY KEY,
+                    recording_id INTEGER NOT NULL REFERENCES \"recordings_old\"(id) ON DELETE CASCADE,
+                    start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+                    confidence REAL NOT NULL, flagged INTEGER NOT NULL DEFAULT 0);
+                 CREATE INDEX idx_rallies_recording ON rallies(recording_id);
+                 CREATE TABLE annotations (
+                    id INTEGER PRIMARY KEY,
+                    recording_id INTEGER NOT NULL REFERENCES \"recordings_old\"(id) ON DELETE CASCADE,
+                    time_ms INTEGER NOT NULL, verdict TEXT NOT NULL,
+                    aspect TEXT, note TEXT);
+                 CREATE INDEX idx_annotations_recording ON annotations(recording_id);
+                 INSERT INTO sessions (id, capture_day) VALUES (1, '2026-01-01');
+                 INSERT INTO recordings (id, session_id, path, library, file_size, quick_hash, capture_day)
+                    VALUES (7, 1, 'day1/game.mp4', 'local', 0, '', '2026-01-01');
+                 INSERT INTO rallies (recording_id, start_ms, end_ms, confidence, flagged)
+                    VALUES (7, 0, 5000, 1.0, 1);
+                 INSERT INTO annotations (recording_id, time_ms, verdict) VALUES (7, 100, 'good');",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        // Existing review state survived the repair…
+        let flagged: i64 = conn
+            .query_row("SELECT flagged FROM rallies WHERE recording_id = 7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(flagged, 1);
+        let verdict: String = conn
+            .query_row(
+                "SELECT verdict FROM annotations WHERE recording_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict, "good");
+        // …and the media worker's write path works again.
+        conn.execute(
+            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence) VALUES (7, 6000, 9000, 0.8)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO annotations (recording_id, time_ms, verdict) VALUES (7, 6500, 'bad')",
+            [],
+        )
+        .unwrap();
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
