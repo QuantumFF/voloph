@@ -190,6 +190,12 @@ interface SessionListProps {
   ) => void
   /** Open the cross-session moment browser (issue #11). */
   onBrowse: () => void
+  /**
+   * Re-scan the active library folder on mount (as the Refresh button does),
+   * not just re-read the DB. Set when returning from the player so recordings
+   * added while reviewing appear without a manual Refresh.
+   */
+  rescanOnMount?: boolean
 }
 
 /**
@@ -199,7 +205,11 @@ interface SessionListProps {
  * stats, a Review button that opens the whole session in the workstation, and
  * the recordings it holds as dense rows.
  */
-export function SessionList({ onPlay, onBrowse }: SessionListProps) {
+export function SessionList({
+  onPlay,
+  onBrowse,
+  rescanOnMount = false,
+}: SessionListProps) {
   const [sessions, setSessions] = useState<Session[]>([])
   // The designated libraries (ADR 0011) and which kind the switcher has active.
   // At most one of each kind; the session list, filters, and review scope to the
@@ -330,10 +340,15 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   const library = activeLibrary?.path ?? null
 
   useEffect(() => {
-    // Load persisted sessions once on mount. The setState lands after an
-    // awaited round-trip to Rust, not synchronously within the effect body.
+    // On mount, load persisted sessions. Returning from the player rescans the
+    // active library folder first so recordings added while reviewing appear;
+    // otherwise just re-read the DB. `rescanOnMount` is fixed for this mount
+    // (the parent clears it only after navigating away, which unmounts us), so
+    // reading it once here is correct. The setState lands after an awaited
+    // round-trip to Rust, not synchronously within the effect body.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    void refresh()
+    void (rescanOnMount ? handleRefresh() : refresh())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refresh])
 
   // While any recording is still being prepared or segmented in the
@@ -750,7 +765,16 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
             <RefreshCwIcon
               className={`size-4 ${refreshing ? "animate-spin" : ""}`}
             />
-            {refreshing ? "Refreshing…" : "Refresh"}
+            {/* Reserve the wider label's width so swapping the text on click
+                doesn't resize the button and reflow the row. */}
+            <span className="grid text-center">
+              <span className="invisible col-start-1 row-start-1">
+                Refreshing…
+              </span>
+              <span className="col-start-1 row-start-1">
+                {refreshing ? "Refreshing…" : "Refresh"}
+              </span>
+            </span>
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
