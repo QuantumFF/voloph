@@ -222,6 +222,11 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
         Ok(mut c) => {
             if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform) {
                 log::error!("media worker: could not save timeline for {path}: {e}");
+            } else {
+                // Publish the pristine machine Analysis for adoption by other users
+                // of a shared library (ADR 0013). A no-op for a local recording, and
+                // silent on failure — the timeline is already saved above.
+                db::publish_analysis(&c, id);
             }
         }
         Err(e) => log::error!("media worker: db lock poisoned saving {path}: {e}"),

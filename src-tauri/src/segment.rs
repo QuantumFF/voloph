@@ -27,6 +27,11 @@
 //! The segmenter is a replaceable component behind the timeline (ADR 0002):
 //! nothing downstream depends on how these intervals were produced.
 
+/// The segmenter's identity, stamped into a published Analysis (ADR 0013) so a
+/// future, meaningfully better segmenter can spot stale Analyses. Ignored today;
+/// bump on a change that materially alters the draft timeline it produces.
+pub const SEGMENTER_VERSION: u32 = 1;
+
 /// A detected rally interval over a recording, in milliseconds from its start,
 /// carrying a per-region confidence in `[0, 1]`. Low-confidence rallies surface
 /// as "uncertain regions" on the timeline during review (ADR 0002).

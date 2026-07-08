@@ -1681,3 +1681,134 @@ fn pending_offer_holds_recordings_out_of_analysis() {
     assert!(next_media_work(&conn).unwrap().is_some());
     assert_eq!(pending_analysis(&conn).unwrap().len(), 2);
 }
+
+// --- Publishing the Analysis at completion (ADR 0013, issue #69) ---------
+
+/// Read the `.vanalysis` published for `abs` under the shared library `root`, if
+/// any. Content-keyed by quick hash + size (ADR 0013).
+fn read_published_analysis(root: &Path, abs: &Path) -> Option<Analysis> {
+    let meta = std::fs::metadata(abs).unwrap();
+    let hash = quick_hash(abs, meta.len()).unwrap();
+    let name = format!("{hash}_{}.vanalysis", meta.len());
+    let path = root.join(".voloph").join("analysis").join(name);
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+}
+
+#[test]
+fn segmenting_a_shared_recording_publishes_a_content_keyed_analysis() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    assert_eq!(scan_library(&mut conn).unwrap().registered, 1);
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+
+    let rallies = vec![crate::segment::Rally {
+        start_ms: 1000,
+        end_ms: 5000,
+        confidence: 0.4,
+    }];
+    save_rallies(&mut conn, id, 60000, &rallies, &[0.1, 0.2]).unwrap();
+    publish_analysis(&conn, id);
+
+    let a = read_published_analysis(&lib.0, &abs).expect("analysis published");
+    assert_eq!(a.format, ANALYSIS_FORMAT);
+    assert_eq!(a.version, ANALYSIS_VERSION);
+    assert_eq!(a.segmenter_version, crate::segment::SEGMENTER_VERSION);
+    let expected_day: String = conn
+        .query_row("SELECT capture_day FROM recordings WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(a.capture_day, expected_day);
+    assert_eq!(a.duration_ms, Some(60000));
+    assert_eq!(a.waveform, vec![0.1, 0.2]);
+    assert_eq!(
+        a.rallies,
+        vec![AnalysisRally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4
+        }]
+    );
+}
+
+#[test]
+fn re_analyze_overwrites_the_published_analysis() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 1000,
+            end_ms: 2000,
+            confidence: 0.3,
+        }],
+        &[],
+    )
+    .unwrap();
+    publish_analysis(&conn, id);
+
+    // A fresh analysis with a different timeline republishes over the same file.
+    save_rallies(
+        &mut conn,
+        id,
+        70000,
+        &[crate::segment::Rally {
+            start_ms: 500,
+            end_ms: 9000,
+            confidence: 0.9,
+        }],
+        &[],
+    )
+    .unwrap();
+    publish_analysis(&conn, id);
+
+    let a = read_published_analysis(&lib.0, &abs).unwrap();
+    assert_eq!(a.duration_ms, Some(70000));
+    assert_eq!(
+        a.rallies,
+        vec![AnalysisRally {
+            start_ms: 500,
+            end_ms: 9000,
+            confidence: 0.9
+        }]
+    );
+}
+
+#[test]
+fn segmenting_a_local_recording_publishes_nothing() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4,
+        }],
+        &[],
+    )
+    .unwrap();
+    publish_analysis(&conn, id);
+
+    // No `.voloph/analysis/` folder for a local library — no one can reach it.
+    assert!(!lib.0.join(".voloph").join("analysis").exists());
+    assert!(read_published_analysis(&lib.0, &abs).is_none());
+}

@@ -2,6 +2,7 @@
 //! query the app runs against it. Split by domain concern (CONTEXT.md); the
 //! submodules re-export flat, so callers keep referring to `db::x`.
 
+mod analysis;
 mod annotations;
 mod bundle;
 mod capture_day;
@@ -12,6 +13,7 @@ mod schema;
 mod timeline;
 mod work;
 
+pub use analysis::*;
 pub use annotations::*;
 pub use bundle::*;
 pub use capture_day::*;
