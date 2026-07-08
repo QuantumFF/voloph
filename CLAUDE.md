@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Always use Opus for general-purpose agents
+use Opus for general-purpose agents
 
 ## Agent skills
 
