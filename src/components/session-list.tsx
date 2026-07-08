@@ -8,6 +8,7 @@ import {
   DownloadIcon,
   FilterIcon,
   FolderOpenIcon,
+  ImportIcon,
   Loader2Icon,
   MoreVerticalIcon,
   PlayIcon,
@@ -16,6 +17,7 @@ import {
   Share2Icon,
   Trash2Icon,
   VideoIcon,
+  XIcon,
 } from "lucide-react"
 
 import {
@@ -282,8 +284,9 @@ export function SessionList({
     }
   }, [])
 
-  // Accept an offer: carry the review to the other copy, then refresh (the offer
-  // disappears once both sides match). Declining is just dismissing the row.
+  // Accept an offer: carry the review — timeline, flags, annotations, and the
+  // analyzed segments — to the other copy, then refresh (the offer disappears once
+  // both sides match). The carried copy is not re-analyzed.
   async function handleCarry(offer: CarryOffer) {
     setError(null)
     try {
@@ -297,8 +300,17 @@ export function SessionList({
     }
   }
 
-  function handleDecline(offer: CarryOffer) {
-    setCarryOffers((prev) => prev.filter((o) => o !== offer))
+  // Dismiss an offer's inline button: persist it (ADR 0011) so the carry stops
+  // being offered for this copy, then refresh so the button disappears. Unlike a
+  // transient "not now" this holds across restarts.
+  async function handleDismiss(offer: CarryOffer) {
+    setError(null)
+    try {
+      await trackedInvoke("dismiss_carry", { toPath: offer.to_path })
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
   }
 
   // Accept a discovered bundle offer (ADR 0012, issue #67): run the receive flow
@@ -590,6 +602,14 @@ export function SessionList({
     },
   } as const
   const copy = confirmAction ? confirmCopy[confirmAction] : null
+
+  // Carry-over offers whose receiving copy lives in the active library (ADR 0011),
+  // keyed by that copy's absolute path — the same shape `list_sessions` returns for
+  // a recording, so a row can look up its own offer. Offers pointing at the other
+  // library's copy surface when that library is active instead.
+  const carryByPath = new Map(
+    carryOffers.filter((o) => o.to_kind === active).map((o) => [o.to_path, o])
+  )
 
   return (
     <div className="flex h-full flex-col">
@@ -939,34 +959,9 @@ export function SessionList({
               </ul>
             </div>
           ) : null}
-          {carryOffers.map((offer) => (
-            <div
-              key={`${offer.from_path}→${offer.to_path}`}
-              className="rounded-lg border border-sky-500/50 bg-sky-500/5 px-4 py-3 text-sm"
-            >
-              <div className="font-medium text-sky-700 dark:text-sky-400">
-                Carry your review to the {kindLabel(offer.to_kind).toLowerCase()}{" "}
-                library?
-              </div>
-              <p className="mt-1 text-muted-foreground">
-                <span className="font-medium">{fileName(offer.to_path)}</span> is
-                the same recording as one you have already reviewed. Bring that
-                review — timeline, annotations, and flags — over to this copy?
-              </p>
-              <div className="mt-2 flex gap-2">
-                <Button size="sm" onClick={() => void handleCarry(offer)}>
-                  Carry review over
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => handleDecline(offer)}
-                >
-                  Not now
-                </Button>
-              </div>
-            </div>
-          ))}
+          {/* Carry-over offers (ADR 0011) are no longer a top banner — they surface
+              as an inline button on the receiving recording's row below, so the
+              offer stays available (with a dismiss) instead of expiring. */}
           {/* Discovered shared reviews (ADR 0012, issue #67): bundles other people
               dropped into the shared library, offered before analysis runs on the
               recordings they cover. Accept receives; decline stops the nagging. */}
@@ -1141,6 +1136,40 @@ export function SessionList({
                           </span>
                         )}
                       </button>
+                      {/* Carry-over (ADR 0011): this copy is byte-identical to one
+                          already reviewed in the other library, and it is un-touched
+                          here — offer to bring that review (timeline, flags,
+                          annotations, segments) over. Dismiss hides it for good. */}
+                      {(() => {
+                        const offer = carryByPath.get(recording.path)
+                        if (!offer) return null
+                        return (
+                          <div className="flex shrink-0 items-center gap-1">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 border-sky-500/50 text-sky-700 hover:bg-sky-500/10 hover:text-sky-700 dark:text-sky-400 dark:hover:text-sky-400"
+                              onClick={() => void handleCarry(offer)}
+                              title="Bring the review from your other-library copy — timeline, flags, annotations, and segments — onto this copy."
+                            >
+                              <ImportIcon className="size-3.5" />
+                              Carry review
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              className="size-7 shrink-0 text-muted-foreground"
+                              onClick={() => void handleDismiss(offer)}
+                              title="Dismiss this carry-over offer"
+                            >
+                              <XIcon className="size-3.5" />
+                              <span className="sr-only">
+                                Dismiss carry-over offer
+                              </span>
+                            </Button>
+                          </div>
+                        )
+                      })()}
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button

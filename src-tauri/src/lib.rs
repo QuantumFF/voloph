@@ -170,6 +170,16 @@ async fn carry_review(
     db::carry_review(&mut conn, &from_path, &to_path).map_err(|e| e.to_string())
 }
 
+/// Dismiss a cross-library carry-over offer (ADR 0011): the user does not want the
+/// review carried onto the copy at `to_path`, so it stops being offered. Persisted
+/// (unlike a transient "not now") and content-keyed, so it holds across restarts
+/// and re-mounts.
+#[tauri::command]
+async fn dismiss_carry(db: State<'_, Db>, to_path: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::dismiss_carry(&conn, &to_path)
+}
+
 /// The sharer label this device signs its bundles with (ADR 0012) — the name the
 /// user gives themselves once. `None` until they name themselves. Persisted per
 /// device in `meta`.
@@ -916,6 +926,7 @@ pub fn run() {
             list_sessions,
             carry_offers,
             carry_review,
+            dismiss_carry,
             sharer_label,
             share_session_bundle,
             save_session_bundle_as,
