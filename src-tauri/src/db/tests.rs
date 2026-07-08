@@ -1682,6 +1682,127 @@ fn pending_offer_holds_recordings_out_of_analysis() {
     assert_eq!(pending_analysis(&conn).unwrap().len(), 2);
 }
 
+/// A recording covered by a pending bundle offer that *also* has a matching
+/// Analysis adopts it immediately and keeps the offer pending (ADR 0013, issue
+/// #72): playable at once from the machine draft, accepting the bundle later
+/// applies its review over machine-only state silently, and declining leaves the
+/// adopted draft intact and triggers no analysis. A covered recording with no
+/// Analysis keeps today's held-out behavior.
+#[test]
+fn pending_offer_coexists_with_analysis_adoption() {
+    let lib = TempLib::new();
+    let a_abs = lib.write("a.mp4", b"aaaa");
+    lib.write("b.mp4", b"bbbb");
+    let bundle_file = drop_bundle(&lib, "alice", "2026-01-01"); // covers a.mp4 + b.mp4
+    // Only a.mp4 has a published Analysis (a machine draft distinct from the
+    // bundle's); b.mp4 is covered but unanalyzed.
+    publish_test_analysis(
+        &lib,
+        &a_abs,
+        vec![AnalysisRally {
+            start_ms: 1000,
+            end_ms: 2000,
+            confidence: 0.4,
+        }],
+    );
+
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    assert_eq!(scan_library(&mut conn).unwrap().registered, 2);
+    conn.execute(
+        "UPDATE recordings SET date_state = 'refined' WHERE library = 'shared'",
+        [],
+    )
+    .unwrap();
+
+    // AC1: a.mp4 registered + playable from the Analysis before the offer is
+    // answered. AC4: b.mp4 (no Analysis) stays held out, unanalyzed.
+    let a_tl = recording_timeline(&conn, &a_abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a_tl.segment_state, "ready");
+    assert_eq!(a_tl.duration_ms, Some(42_000));
+    assert_eq!(
+        a_tl.rallies.iter().map(|r| r.start_ms).collect::<Vec<_>>(),
+        vec![1000]
+    );
+    let b_abs = lib.0.join("b.mp4");
+    assert_eq!(
+        recording_timeline(&conn, &b_abs.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .segment_state,
+        "unknown"
+    );
+
+    // The offer is still pending after adoption (nothing consumed it).
+    let offers = discover_bundles(&conn);
+    assert_eq!(offers.len(), 1);
+    let bundle_path = lib.0.join(&bundle_file);
+    let bundle_json = std::fs::read_to_string(&bundle_path).unwrap();
+
+    // AC2: accepting the bundle applies its review silently — adopted state is
+    // machine-only, so a.mp4's rally is replaced (flagged, from the bundle) with
+    // no keep-mine conflict. b.mp4 is a no-op (the bundle carries no state for it,
+    // matching its empty machine-only state), so exactly one recording changes.
+    let result = receive_session_bundle(&mut conn, &bundle_json).unwrap();
+    assert_eq!(result.applied, 1);
+    assert!(result.conflicts.is_empty());
+    assert!(result.refused.is_empty());
+    let a_tl = recording_timeline(&conn, &a_abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        a_tl.rallies.iter().map(|r| r.start_ms).collect::<Vec<_>>(),
+        vec![0] // the bundle's rally, not the adopted 1000ms one
+    );
+    assert!(a_tl.rallies[0].flagged);
+}
+
+/// AC3: declining the offer leaves the adopted Analysis intact and starts no
+/// analysis — the adopted a.mp4 stays `ready` and out of the media queue.
+#[test]
+fn declining_after_adoption_keeps_the_draft_and_runs_no_analysis() {
+    let lib = TempLib::new();
+    let a_abs = lib.write("a.mp4", b"aaaa");
+    lib.write("b.mp4", b"bbbb");
+    drop_bundle(&lib, "alice", "2026-01-01");
+    publish_test_analysis(
+        &lib,
+        &a_abs,
+        vec![AnalysisRally {
+            start_ms: 1000,
+            end_ms: 2000,
+            confidence: 0.4,
+        }],
+    );
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    conn.execute(
+        "UPDATE recordings SET date_state = 'refined' WHERE library = 'shared'",
+        [],
+    )
+    .unwrap();
+
+    let offers = discover_bundles(&conn);
+    decline_bundle(&conn, &offers[0].bundle_path).unwrap();
+
+    // a.mp4's adopted draft is untouched by the decline.
+    let a_tl = recording_timeline(&conn, &a_abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(a_tl.segment_state, "ready");
+    assert_eq!(
+        a_tl.rallies.iter().map(|r| r.start_ms).collect::<Vec<_>>(),
+        vec![1000]
+    );
+    // Only b.mp4 (never analyzed) returns to the queue; a.mp4 needs no analysis.
+    let pending = pending_analysis(&conn).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].path.ends_with("b.mp4"));
+}
+
 // --- Publishing the Analysis at completion (ADR 0013, issue #69) ---------
 
 /// Read the `.vanalysis` published for `abs` under the shared library `root`, if
