@@ -116,6 +116,21 @@ interface CarryOffer {
 }
 
 /**
+ * A shared review discovered in the shared library (ADR 0012, issue #67): a
+ * bundle another person dropped in, offered by session + sharer label before
+ * analysis runs on the recordings it covers. Accepting runs the receive flow;
+ * declining stops it nagging until the sharer re-shares it (`is_update`).
+ */
+interface BundleOffer {
+  /** Absolute path of the `.vbundle` on this device. */
+  bundle_path: string
+  capture_day: string
+  sharer_label: string
+  /** A changed re-share of a bundle the user previously declined. */
+  is_update: boolean
+}
+
+/**
  * The outcome of receiving a session bundle (ADR 0012, issue #66). `applied` is
  * the count taken silently (registered fresh or replacing machine-only state);
  * `refused` names files that failed verification; `conflicts` are the library-
@@ -206,6 +221,11 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
   // silently — to carry that review to the other copy; the user accepts or declines
   // per offer, and declining leaves both sides untouched.
   const [carryOffers, setCarryOffers] = useState<CarryOffer[]>([])
+  // Shared reviews discovered in the shared library (ADR 0012, issue #67): bundles
+  // other people dropped in, offered by session + sharer before analysis runs on
+  // the recordings they cover. Accepting receives; declining stops the nagging
+  // until the bundle changes.
+  const [bundleOffers, setBundleOffers] = useState<BundleOffer[]>([])
   // The name this device signs its shared bundles with (ADR 0012), persisted in
   // the DB so the user names themselves only once. Empty until they do.
   const [sharerLabel, setSharerLabel] = useState<string>("")
@@ -229,17 +249,19 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
 
   const refresh = useCallback(async () => {
     try {
-      const [next, state, offers, label] = await Promise.all([
+      const [next, state, offers, label, bundles] = await Promise.all([
         trackedInvoke<Session[]>("list_sessions"),
         trackedInvoke<[Library[], string]>("library_state"),
         trackedInvoke<CarryOffer[]>("carry_offers"),
         trackedInvoke<string | null>("sharer_label"),
+        trackedInvoke<BundleOffer[]>("discover_bundles"),
       ])
       setSessions(next)
       setLibraries(state[0])
       setActive(state[1])
       setCarryOffers(offers)
       setSharerLabel(label ?? "")
+      setBundleOffers(bundles)
     } catch (e) {
       setError(String(e))
     }
@@ -262,6 +284,44 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
 
   function handleDecline(offer: CarryOffer) {
     setCarryOffers((prev) => prev.filter((o) => o !== offer))
+  }
+
+  // Accept a discovered bundle offer (ADR 0012, issue #67): run the receive flow
+  // on it, which registers the covered recordings straight from the bundle (no
+  // probe/segmentation/staging). Surfaces the same conflict/refusal resolution
+  // dialog as a manually-opened bundle when anything needs the user's choice.
+  async function handleReceiveOffer(offer: BundleOffer) {
+    setError(null)
+    setShareNote(null)
+    try {
+      const result = await trackedInvoke<ReceiveResult>(
+        "receive_session_bundle",
+        { bundlePath: offer.bundle_path }
+      )
+      await refresh()
+      if (result.conflicts.length > 0 || result.refused.length > 0) {
+        setReceiving({ bundlePath: offer.bundle_path, result })
+      } else {
+        setShareNote(
+          `Received ${result.applied} recording${result.applied === 1 ? "" : "s"}.`
+        )
+      }
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // Decline a discovered bundle offer (ADR 0012, issue #67): record it so it
+  // stops being offered until the sharer re-shares it, and release the recordings
+  // it held back to the analysis queue. Refresh so the offer disappears.
+  async function handleDeclineOffer(offer: BundleOffer) {
+    setError(null)
+    try {
+      await trackedInvoke("decline_bundle", { bundlePath: offer.bundle_path })
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
   }
 
   // The active library's own record (mount path + locality), or undefined until
@@ -813,6 +873,41 @@ export function SessionList({ onPlay, onBrowse }: SessionListProps) {
                   size="sm"
                   variant="outline"
                   onClick={() => handleDecline(offer)}
+                >
+                  Not now
+                </Button>
+              </div>
+            </div>
+          ))}
+          {/* Discovered shared reviews (ADR 0012, issue #67): bundles other people
+              dropped into the shared library, offered before analysis runs on the
+              recordings they cover. Accept receives; decline stops the nagging. */}
+          {bundleOffers.map((offer) => (
+            <div
+              key={offer.bundle_path}
+              className="rounded-lg border border-emerald-500/50 bg-emerald-500/5 px-4 py-3 text-sm"
+            >
+              <div className="font-medium text-emerald-700 dark:text-emerald-400">
+                {offer.is_update ? "An updated shared" : "A shared"} review of{" "}
+                {formatCaptureDay(offer.capture_day)} from{" "}
+                <span className="font-medium">{offer.sharer_label}</span> is
+                available — receive it?
+              </div>
+              <p className="mt-1 text-muted-foreground">
+                Applies their timeline, annotations, and flags. No video is
+                copied, and the covered recordings are not re-analyzed.
+              </p>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="sm"
+                  onClick={() => void handleReceiveOffer(offer)}
+                >
+                  Receive review
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void handleDeclineOffer(offer)}
                 >
                   Not now
                 </Button>

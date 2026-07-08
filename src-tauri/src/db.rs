@@ -1104,28 +1104,37 @@ pub fn next_media_work(conn: &Connection) -> rusqlite::Result<Option<MediaWork>>
     if let Some((id, rel)) = date {
         return Ok(Some(MediaWork::CaptureDate(id, absolute(&library, &rel))));
     }
-    // Phase 1: anything not yet probed.
-    let probe = conn
-        .query_row(
-            "SELECT id, path FROM recordings
-             WHERE library = ?1 AND probe_state = 'unknown' ORDER BY id LIMIT 1",
-            [&kind],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
+    // Recordings a pending bundle offer covers are held out of the probe/segment
+    // pipeline (ADR 0012, issue #67): accepting the offer registers them ready
+    // from the bundle, so analysis (and its network staging) never runs on them.
+    // The capture-date phase above is not held back — it reads only headers.
+    let covered = pending_bundle_paths(conn);
+    // Phase 1: anything not yet probed (skipping covered recordings).
+    let mut pstmt = conn.prepare(
+        "SELECT id, path FROM recordings
+         WHERE library = ?1 AND probe_state = 'unknown' ORDER BY id",
+    )?;
+    let probe = pstmt
+        .query_map([&kind], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(Result::ok)
+        .find(|(_, rel)| !covered.contains(rel));
     if let Some((id, rel)) = probe {
         return Ok(Some(MediaWork::Probe(id, absolute(&library, &rel))));
     }
-    // Phase 2: anything probed but not yet segmented.
-    let segment = conn
-        .query_row(
-            "SELECT id, path FROM recordings
-             WHERE library = ?1 AND probe_state = 'ready' AND segment_state = 'unknown'
-             ORDER BY id LIMIT 1",
-            [&kind],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
+    // Phase 2: anything probed but not yet segmented (skipping covered recordings).
+    let mut sstmt = conn.prepare(
+        "SELECT id, path FROM recordings
+         WHERE library = ?1 AND probe_state = 'ready' AND segment_state = 'unknown'
+         ORDER BY id",
+    )?;
+    let segment = sstmt
+        .query_map([&kind], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(Result::ok)
+        .find(|(_, rel)| !covered.contains(rel));
     Ok(segment.map(|(id, rel)| MediaWork::Segment(id, absolute(&library, &rel))))
 }
 
@@ -1165,6 +1174,9 @@ pub fn pending_analysis(conn: &Connection) -> rusqlite::Result<Vec<PendingAnalys
     let Some(library) = library_path_of(conn, &kind)? else {
         return Ok(Vec::new());
     };
+    // Recordings a pending bundle offer covers are held out of staging + analysis
+    // (ADR 0012, issue #67) so accepting the offer skips that network copy entirely.
+    let covered = pending_bundle_paths(conn);
     let mut stmt = conn.prepare(
         "SELECT id, path, probe_state, segment_state FROM recordings
          WHERE library = ?1
@@ -1178,7 +1190,7 @@ pub fn pending_analysis(conn: &Connection) -> rusqlite::Result<Vec<PendingAnalys
             let rel: String = row.get(1)?;
             let probe_state: String = row.get(2)?;
             let segment_state: String = row.get(3)?;
-            Ok(PendingAnalysis {
+            Ok((rel.clone(), PendingAnalysis {
                 id,
                 path: absolute(&library, &rel),
                 needs_probe: probe_state == "unknown",
@@ -1186,9 +1198,13 @@ pub fn pending_analysis(conn: &Connection) -> rusqlite::Result<Vec<PendingAnalys
                 // marks the file playable. `unknown` here means either already
                 // probed-ready (probe skipped) or about to be probed this pass.
                 needs_segment: segment_state == "unknown",
-            })
+            }))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(rel, _)| !covered.contains(rel))
+        .map(|(_, item)| item)
+        .collect();
     Ok(rows)
 }
 
@@ -2274,6 +2290,192 @@ pub fn resolve_bundle_conflict(
     apply_bundle_state(&tx, id, rec).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+// --- Bundle discovery (ADR 0012, issue #67) ------------------------------
+//
+// Scanning the shared library surfaces `.vbundle` files another person dropped
+// in, offering each by session + sharer label. Discovery is ordered before
+// analysis: a recording that a pending offer covers is held out of the media
+// worker's probe/segment/stage queue (`next_media_work`/`pending_analysis`), so
+// accepting the offer registers it ready from the bundle and that work never
+// runs (ADR 0011, ADR 0012). Your own bundle is never offered back — it is
+// keyed by your sharer label. Declining records the bundle's on-disk signature
+// (size + mtime) so it stops nagging until the sharer re-shares (the file
+// changes); a changed bundle is re-offered as an update.
+
+/// A discovered shared bundle awaiting a receive-it? offer (ADR 0012). Named by
+/// session day + sharer label so the same session from two sharers reads as two
+/// independent offers.
+#[derive(Debug, Serialize)]
+pub struct BundleOffer {
+    /// Absolute path of the `.vbundle` on this device — handed straight back to
+    /// [`receive_session_bundle`] on accept, or [`decline_bundle`] on decline.
+    pub bundle_path: String,
+    pub capture_day: String,
+    pub sharer_label: String,
+    /// A re-share of a bundle the user previously declined (its file changed) —
+    /// offered again, marked as an update rather than a first-time offer.
+    pub is_update: bool,
+}
+
+/// A bundle file's change signature: its size and mtime, cheap to read and
+/// enough to notice a re-share without hashing the file. `None` when the file
+/// cannot be stat'd (vanished between listing and here).
+fn bundle_signature(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(format!("{}:{}", meta.len(), mtime))
+}
+
+/// The map of declined bundles (file name → signature at decline time), read
+/// from `meta`. A bundle whose current signature still matches its recorded one
+/// stays declined; any change re-offers it (ADR 0012).
+fn declined_bundles(conn: &Connection) -> std::collections::HashMap<String, String> {
+    meta_get(conn, "declined_bundles")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// One parsed shared bundle: its file, the parsed contents, and its current
+/// on-disk signature — the shared shape behind both the offer list and the
+/// worker's coverage set.
+struct DiscoveredBundle {
+    path: std::path::PathBuf,
+    bundle: SessionBundle,
+    signature: String,
+}
+
+/// List every readable `.vbundle` in the shared library root that is not this
+/// device's own (by sharer label). Malformed, foreign-format, or newer-version
+/// files are skipped silently — discovery never errors on a bad drop-in. Returns
+/// nothing when the shared library is not designated.
+fn list_shared_bundles(conn: &Connection) -> Vec<DiscoveredBundle> {
+    let Ok(Some(root)) = library_path_of(conn, "shared") else {
+        return Vec::new();
+    };
+    let own = meta_get(conn, "sharer_label").ok().flatten();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("vbundle") {
+            continue;
+        }
+        let Ok(json) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(bundle) = serde_json::from_str::<SessionBundle>(&json) else {
+            continue;
+        };
+        if bundle.format != BUNDLE_FORMAT || bundle.version > BUNDLE_VERSION {
+            continue;
+        }
+        // Never offer a bundle back to the person who shared it (ADR 0012).
+        if own.as_deref() == Some(bundle.sharer_label.as_str()) {
+            continue;
+        }
+        let Some(signature) = bundle_signature(&path) else {
+            continue;
+        };
+        out.push(DiscoveredBundle {
+            path,
+            bundle,
+            signature,
+        });
+    }
+    out
+}
+
+/// The offers surfaced on a scan/refresh of the shared library (ADR 0012):
+/// every foreign `.vbundle` in the shared root, minus those the user declined
+/// and that have not changed since. A declined bundle whose file changed is
+/// re-offered with `is_update` set. Ordered by session day then sharer label
+/// for a stable list.
+pub fn discover_bundles(conn: &Connection) -> Vec<BundleOffer> {
+    let declined = declined_bundles(conn);
+    let mut offers = Vec::new();
+    for d in list_shared_bundles(conn) {
+        let name = d
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // Declined and unchanged → stay quiet. Declined but changed → re-offer as
+        // an update. Never declined → a first-time offer.
+        let prior = declined.get(&name);
+        if prior == Some(&d.signature) {
+            continue;
+        }
+        offers.push(BundleOffer {
+            bundle_path: d.path.to_string_lossy().into_owned(),
+            capture_day: d.bundle.capture_day,
+            sharer_label: d.bundle.sharer_label,
+            is_update: prior.is_some(),
+        });
+    }
+    offers.sort_by(|a, b| {
+        a.capture_day
+            .cmp(&b.capture_day)
+            .then_with(|| a.sharer_label.cmp(&b.sharer_label))
+    });
+    offers
+}
+
+/// The library-relative paths of every recording covered by a bundle currently
+/// on offer (ADR 0012) — the set the media worker holds out of analysis so an
+/// accepted offer's recordings are never probed, segmented, or staged before the
+/// user decides. Empty unless the shared library is active (bundles only live
+/// and resolve there).
+fn pending_bundle_paths(conn: &Connection) -> std::collections::HashSet<String> {
+    if active_kind(conn).unwrap_or_default() != "shared" {
+        return std::collections::HashSet::new();
+    }
+    let declined = declined_bundles(conn);
+    let mut covered = std::collections::HashSet::new();
+    for d in list_shared_bundles(conn) {
+        let name = d
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        // A declined, unchanged bundle no longer holds its recordings back — the
+        // user chose to let analysis proceed on them.
+        if declined.get(name) == Some(&d.signature) {
+            continue;
+        }
+        for rec in d.bundle.recordings {
+            covered.insert(rec.path);
+        }
+    }
+    covered
+}
+
+/// Record that the user declined the bundle at `bundle_path`: store its current
+/// signature so it stops nagging until it changes (ADR 0012). Re-declining a
+/// changed bundle simply overwrites the stored signature.
+pub fn decline_bundle(conn: &Connection, bundle_path: &str) -> Result<(), String> {
+    let signature = bundle_signature(Path::new(bundle_path))
+        .ok_or_else(|| "bundle file could not be read".to_string())?;
+    let name = Path::new(bundle_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "bad bundle path".to_string())?
+        .to_string();
+    let mut declined = declined_bundles(conn);
+    declined.insert(name, signature);
+    let json = serde_json::to_string(&declined).map_err(|e| e.to_string())?;
+    meta_set(conn, "declined_bundles", &json).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -3527,5 +3729,138 @@ mod tests {
             BUNDLE_VERSION + 1
         );
         assert!(receive_session_bundle(&mut conn, &newer).is_err());
+    }
+
+    // --- Bundle discovery (issue #67) -------------------------------------
+
+    /// Write `sharer`'s bundle for `a.mp4`+`b.mp4` (both real files present) into
+    /// the shared root, returning its file name. Mirrors what `share_session_bundle`
+    /// drops in — the sharer's own device wrote it, we discover it.
+    fn drop_bundle(lib: &TempLib, sharer: &str, day: &str) -> String {
+        let bundle = SessionBundle {
+            format: BUNDLE_FORMAT.to_string(),
+            version: BUNDLE_VERSION,
+            capture_day: day.to_string(),
+            sharer_label: sharer.to_string(),
+            recordings: vec![
+                BundleRecording {
+                    path: "a.mp4".into(),
+                    quick_hash: quick_hash(&lib.0.join("a.mp4"), 4).unwrap(),
+                    file_size: 4,
+                    capture_day: day.to_string(),
+                    duration_ms: Some(60000),
+                    waveform: vec![],
+                    rallies: vec![BundleRally {
+                        start_ms: 0,
+                        end_ms: 5000,
+                        confidence: 0.5,
+                        flagged: true,
+                    }],
+                    annotations: vec![],
+                },
+                BundleRecording {
+                    path: "b.mp4".into(),
+                    quick_hash: quick_hash(&lib.0.join("b.mp4"), 4).unwrap(),
+                    file_size: 4,
+                    capture_day: day.to_string(),
+                    duration_ms: Some(60000),
+                    waveform: vec![],
+                    rallies: vec![],
+                    annotations: vec![],
+                },
+            ],
+        };
+        let file = bundle_file_name(day, sharer);
+        std::fs::write(
+            lib.0.join(&file),
+            serde_json::to_vec_pretty(&bundle).unwrap(),
+        )
+        .unwrap();
+        file
+    }
+
+    /// A dropped-in bundle is discovered and offered by session + sharer; two
+    /// sharers' bundles for the same day are two independent offers; the user's
+    /// own bundle is never offered back (AC1, AC4, AC5).
+    #[test]
+    fn discovers_foreign_bundles_and_never_own() {
+        let lib = TempLib::new();
+        lib.write("a.mp4", b"aaaa");
+        lib.write("b.mp4", b"bbbb");
+        drop_bundle(&lib, "alice", "2026-01-01");
+        drop_bundle(&lib, "bob", "2026-01-01");
+        // This device shares under "carol", so carol's bundle is not offered back.
+        drop_bundle(&lib, "carol", "2026-01-01");
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+        meta_set(&conn, "sharer_label", "carol").unwrap();
+
+        let offers = discover_bundles(&conn);
+        assert_eq!(offers.len(), 2); // alice + bob, not carol
+        assert_eq!(offers[0].sharer_label, "alice");
+        assert_eq!(offers[1].sharer_label, "bob");
+        assert!(offers.iter().all(|o| o.capture_day == "2026-01-01"));
+        assert!(offers.iter().all(|o| !o.is_update));
+        assert!(offers.iter().all(|o| o.bundle_path.ends_with(".vbundle")));
+    }
+
+    /// Declining a bundle stops it being offered until it changes; a re-shared
+    /// (rewritten) bundle is offered again as an update (AC3).
+    #[test]
+    fn declined_bundle_stays_quiet_until_reshared() {
+        let lib = TempLib::new();
+        lib.write("a.mp4", b"aaaa");
+        lib.write("b.mp4", b"bbbb");
+        let file = drop_bundle(&lib, "alice", "2026-01-01");
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+
+        let offers = discover_bundles(&conn);
+        assert_eq!(offers.len(), 1);
+        decline_bundle(&conn, &offers[0].bundle_path).unwrap();
+        // Declined + unchanged → not re-offered.
+        assert!(discover_bundles(&conn).is_empty());
+
+        // Re-share: rewrite the file so its signature changes. Sleep a hair so the
+        // mtime actually advances even on coarse-resolution filesystems, and pad
+        // the bytes so the size differs too.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(lib.0.join(&file), b"{\"changed\": true}").unwrap();
+        drop_bundle(&lib, "alice", "2026-01-01"); // valid contents again, new bytes
+        let reoffered = discover_bundles(&conn);
+        assert_eq!(reoffered.len(), 1);
+        assert!(reoffered[0].is_update); // AC3: offered again as an update
+    }
+
+    /// A pending offer holds its recordings out of the analysis queue so accepting
+    /// it skips their probe/segmentation/staging; declining releases them back
+    /// (AC2). Verified through both the one-at-a-time queue and the staged batch.
+    #[test]
+    fn pending_offer_holds_recordings_out_of_analysis() {
+        let lib = TempLib::new();
+        lib.write("a.mp4", b"aaaa");
+        lib.write("b.mp4", b"bbbb");
+        drop_bundle(&lib, "alice", "2026-01-01"); // covers a.mp4 + b.mp4
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+        assert_eq!(scan_library(&mut conn).unwrap().registered, 2);
+        // Settle the capture-date phase (headers-only, never held back) so this
+        // test isolates the probe/segment queue the offer actually gates.
+        conn.execute(
+            "UPDATE recordings SET date_state = 'refined' WHERE library = 'shared'",
+            [],
+        )
+        .unwrap();
+
+        // Both recordings are covered by the pending offer → no probe/segment work,
+        // no staging.
+        assert!(next_media_work(&conn).unwrap().is_none());
+        assert!(pending_analysis(&conn).unwrap().is_empty());
+
+        // Decline → the recordings return to the queue for the app to analyze.
+        let offers = discover_bundles(&conn);
+        decline_bundle(&conn, &offers[0].bundle_path).unwrap();
+        assert!(next_media_work(&conn).unwrap().is_some());
+        assert_eq!(pending_analysis(&conn).unwrap().len(), 2);
     }
 }

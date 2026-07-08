@@ -293,6 +293,34 @@ async fn aspect_vocabulary(db: State<'_, Db>) -> Result<Vec<String>, String> {
     db::aspect_vocabulary(&conn).map_err(|e| e.to_string())
 }
 
+/// Discover shared bundles dropped into the shared library by other people (ADR
+/// 0012, issue #67), each offered by session + sharer label. Your own bundle is
+/// never offered back; a declined bundle stops appearing until its sharer
+/// re-shares (then it is offered again as an update). The media worker holds the
+/// recordings a pending offer covers out of analysis, so accepting the offer's
+/// receive skips their probe/segmentation/staging entirely. Called on every
+/// scan/refresh.
+#[tauri::command]
+async fn discover_bundles(db: State<'_, Db>) -> Result<Vec<db::BundleOffer>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    Ok(db::discover_bundles(&conn))
+}
+
+/// Decline a discovered bundle offer (ADR 0012, issue #67): record its current
+/// on-disk signature so it stops being offered until the sharer re-shares it.
+/// The recordings it covered are released back to the analysis queue — the user
+/// chose not to take the shared review, so the app segments them itself.
+#[tauri::command]
+async fn decline_bundle(app: AppHandle, db: State<'_, Db>, bundle_path: String) -> Result<(), String> {
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        db::decline_bundle(&conn, &bundle_path)?;
+    }
+    // Recordings this offer had held back may now need analysis; wake the worker.
+    spawn_media_worker(&app);
+    Ok(())
+}
+
 /// Resolve the draft timeline (rallies + per-region confidence) for the
 /// recording at `path` (ADR 0002). While segmentation is still running the
 /// `segment_state` is `unknown` and `rallies` is empty; the player polls until
@@ -883,6 +911,8 @@ pub fn run() {
             save_session_bundle_as,
             receive_session_bundle,
             resolve_bundle_conflict,
+            discover_bundles,
+            decline_bundle,
             aspect_vocabulary,
             recording_timeline,
             reanalyze_recording,
