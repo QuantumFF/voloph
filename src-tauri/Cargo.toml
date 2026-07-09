@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Frictionless review of badminton games you recorded yourself."
 authors = ["QuantumFF"]
 edition = "2021"
+# The crate ships two binaries — the Tauri app and the `eval-harness` dev CLI
+# (ADR 0015). `tauri dev`/`cargo run` would be ambiguous without naming the app
+# as the default; `cargo run --bin eval-harness` still reaches the harness.
+default-run = "tauri-native"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
