@@ -73,6 +73,7 @@ export function SessionList({
     setBrowsing,
     library,
     carryByPath,
+    remainingByRecording,
     handleCarry,
     handleDismiss,
     handleReceiveOffer,
@@ -186,6 +187,7 @@ export function SessionList({
                 session={session}
                 active={active}
                 carryByPath={carryByPath}
+                remainingByRecording={remainingByRecording}
                 onPlay={onPlay}
                 onBrowseBundles={(day) => void openBundleBrowser(day)}
                 onShare={openShare}
