@@ -10,9 +10,11 @@ import {
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
+  resumeEntersFreePlay,
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
+  seekTickSettled,
   type PlaylistRecording,
   type Resume,
   type SessionModel,
@@ -27,6 +29,14 @@ import {
  * before the seek takes hold.
  */
 const RESUME_TICK_TOL_MS = 250
+
+/**
+ * How close (ms) a tick must sit to an in-flight seek's target to count as the
+ * seek having settled (the belt beside the `mpv:playback-restart` signal — see
+ * `seekTickSettled`). Same order as the resume slack: comfortably wider than
+ * one tick interval, far narrower than any gap worth skipping.
+ */
+const SEEK_SETTLE_TOL_MS = 250
 
 /**
  * The session playback machinery: which recording is loaded, the playhead from
@@ -89,6 +99,17 @@ export function useSessionPlayback({
   // (often far-past) ticks, a plain "have we reached the target?" check is enough
   // here. Null once landed, or when a crossing has no specific target yet.
   const resumeTargetRef = useRef<number | null>(null)
+  // The third gate, for *within-recording* seeks (the two above only cover
+  // crossings): the target of an `mpv_seek` that hasn't confirmed applied yet.
+  // The invoke and the `time-pos` stream are both async, so ticks carrying the
+  // *pre-seek* position are routinely delivered after a scrub — acting on one
+  // runs gap-skip against the position the user just left (a stale tick in a
+  // gap yanks the playhead to the rally after the *old* spot; one past the
+  // session's last rally pauses mid-scrub). While set, every tick is dropped;
+  // cleared by `mpv:playback-restart` (mpv's "seek finished"), or by a tick
+  // settling at the target (`seekTickSettled` — the belt so a missed restart
+  // can't freeze the playhead), or by a load/error superseding the seek.
+  const seekInFlightRef = useRef<number | null>(null)
 
   // The playhead within the current recording (ms), from mpv's `time-pos`.
   // Seeded with a jump target (issue #11) so the optimistic playhead is right
@@ -134,6 +155,10 @@ export function useSessionPlayback({
   // the next `time-pos` tick.
   const seekTo = useCallback((ms: number) => {
     const target = Math.max(0, Math.round(ms))
+    // Arm the in-flight gate before the invoke so no stale pre-seek tick can
+    // slip through; a rapid follow-up seek just overwrites the target (last
+    // write wins, matching mpv coalescing queued seeks).
+    seekInFlightRef.current = target
     setCurrentMs(target)
     void trackedInvoke("mpv_seek", { ms: target }).catch(() => {})
   }, [])
@@ -170,6 +195,9 @@ export function useSessionPlayback({
     // deferred `start`/`end` whose rallies haven't arrived) — play from the top.
     awaitingLoadRef.current = true
     resumeTargetRef.current = startMs
+    // A fresh file supersedes any seek still in flight in the old one — left
+    // armed, its stale target would gate the new file's ticks forever.
+    seekInFlightRef.current = null
     void trackedInvoke("mpv_load", { path, startMs })
       .then(() => {
         // `mpv_load` unpauses; `paused` reconciles from the `mpv:pause` event.
@@ -258,58 +286,99 @@ export function useSessionPlayback({
     if (!atLastRecording) goToRecording(index + 1, "start")
   }, [atLastRecording, goToRecording, index])
 
+  // A user-initiated resume (pause → play) past the session's last rally is a
+  // free-play intent: the end-of-session stop has paused playback there, and
+  // without this every resume is re-paused on its first tick — play only ever
+  // advances one frame. Same manual opt-out as dragging into a gap.
+  const handleResume = useCallback(() => {
+    if (resumeEntersFreePlay(rallies, currentMs, atLastRecording)) {
+      freePlayRef.current = true
+    }
+  }, [rallies, currentMs, atLastRecording])
+
   // The mpv-event handlers, mirrored into a ref so the listeners below subscribe
   // once yet always run the latest closures (which capture the current rallies,
   // loop/free-play state, and crossing index) — without re-subscribing the
   // `time-pos` stream on every playhead tick. Synced in an effect, not during
   // render (the codebase forbids writing a ref while rendering).
-  const handlersRef = useRef({ skipGaps, handleEnded })
+  const handlersRef = useRef({ skipGaps, handleEnded, handleResume })
   useEffect(() => {
-    handlersRef.current = { skipGaps, handleEnded }
-  }, [skipGaps, handleEnded])
+    handlersRef.current = { skipGaps, handleEnded, handleResume }
+  }, [skipGaps, handleEnded, handleResume])
 
   // The playhead, end, and error states all come from mpv's event stream (ADR
   // 0008, issue #35). Each `time-pos` tick drives the playhead and runs gap-skip
   // (issue #36), where the old webview `timeUpdate` handler used to. (The
   // pause/speed/volume/mute reconciliation listeners live in `useMpvTransport`.)
   useEffect(() => {
-    const unlisten: Array<() => void> = []
-    void listen<number>("mpv:time-pos", (event) => {
-      // Identity gate: drop every tick until the new file confirms loaded. A tick
-      // carries no file identity, so before `mpv:file-loaded` it's a stale (often
-      // far-past) position from the recording we're leaving — acting on it runs
-      // gap-skip against the wrong position and crosses on past the resume target.
-      if (awaitingLoadRef.current) return
-      const ms = event.payload
-      // Position gate: the file is open but mpv applies the resume seek a moment
-      // later, so its first ticks are still near 0. Drop them until the playhead
-      // reaches the target, then resume normally — otherwise gap-skip reads the
-      // transient ~0 as "before the first rally" and yanks the playhead there.
-      const target = resumeTargetRef.current
-      if (target != null) {
-        if (!resumeTickLanded(ms, target, RESUME_TICK_TOL_MS)) return
+    const subscriptions = [
+      listen<number>("mpv:time-pos", (event) => {
+        // Identity gate: drop every tick until the new file confirms loaded. A
+        // tick carries no file identity, so before `mpv:file-loaded` it's a
+        // stale (often far-past) position from the recording we're leaving —
+        // acting on it runs gap-skip against the wrong position and crosses on
+        // past the resume target.
+        if (awaitingLoadRef.current) return
+        const ms = event.payload
+        // Position gate: the file is open but mpv applies the resume seek a
+        // moment later, so its first ticks are still near 0. Drop them until
+        // the playhead reaches the target, then resume normally — otherwise
+        // gap-skip reads the transient ~0 as "before the first rally" and
+        // yanks the playhead there.
+        const target = resumeTargetRef.current
+        if (target != null) {
+          if (!resumeTickLanded(ms, target, RESUME_TICK_TOL_MS)) return
+          resumeTargetRef.current = null
+        }
+        // Seek gate: an `mpv_seek` is in flight, so this tick may still carry
+        // the pre-seek position — drop it, or gap-skip runs against the spot
+        // the user just scrubbed away from. A tick settling at the target
+        // clears the gate itself in case it beats (or substitutes for)
+        // `mpv:playback-restart`.
+        const inFlight = seekInFlightRef.current
+        if (inFlight != null) {
+          if (!seekTickSettled(ms, inFlight, SEEK_SETTLE_TOL_MS)) return
+          seekInFlightRef.current = null
+        }
+        setCurrentMs(ms)
+        handlersRef.current.skipGaps(ms)
+      }),
+      // mpv finished applying a seek (its "playback restarted" signal): ticks
+      // from here on carry the post-seek position, so reopen the seek gate.
+      listen("mpv:playback-restart", () => {
+        seekInFlightRef.current = null
+      }),
+      // Only resumes matter here (the transport state itself is reconciled in
+      // `useMpvTransport`): a resume past the session's last rally opts into
+      // free play, or the end-of-session stop would re-pause it instantly.
+      listen<boolean>("mpv:pause", (event) => {
+        if (event.payload === false) handlersRef.current.handleResume()
+      }),
+      // The new file is open and its baked-in resume seek has landed: the next
+      // `time-pos` reflects the resumed position, so reopen the playhead gate.
+      listen("mpv:file-loaded", () => {
+        awaitingLoadRef.current = false
+      }),
+      listen("mpv:ended", () => handlersRef.current.handleEnded()),
+      listen<string>("mpv:error", (event) => {
+        // A load that errors never fires `mpv:file-loaded`; reopen all gates
+        // so a failed crossing (or a seek whose restart never comes) can't
+        // leave the playhead frozen.
+        awaitingLoadRef.current = false
         resumeTargetRef.current = null
-      }
-      setCurrentMs(ms)
-      handlersRef.current.skipGaps(ms)
-    }).then((u) => unlisten.push(u))
-    // The new file is open and its baked-in resume seek has landed: the next
-    // `time-pos` reflects the resumed position, so reopen the playhead gate.
-    void listen("mpv:file-loaded", () => {
-      awaitingLoadRef.current = false
-    }).then((u) => unlisten.push(u))
-    void listen("mpv:ended", () => handlersRef.current.handleEnded()).then(
-      (u) => unlisten.push(u)
-    )
-    void listen<string>("mpv:error", (event) => {
-      // A load that errors never fires `mpv:file-loaded`; reopen both gates so a
-      // failed crossing can't leave the playhead frozen.
-      awaitingLoadRef.current = false
-      resumeTargetRef.current = null
-      setError(event.payload ?? "playback failed")
-    }).then((u) => unlisten.push(u))
+        seekInFlightRef.current = null
+        setError(event.payload ?? "playback failed")
+      }),
+    ]
     return () => {
-      for (const u of unlisten) u()
+      // Chain each teardown off its registration promise (the use-export.ts
+      // idiom) instead of collecting resolved unlistens into an array: under
+      // StrictMode's synchronous setup→cleanup→setup this cleanup runs before
+      // the promises resolve, so an array is still empty here and the first
+      // mount's listeners leak — and a leaked `time-pos` handler keeps running
+      // gap-skip (real `mpv_seek` invokes) against a *closed* session's rally
+      // table for the rest of the app's life.
+      for (const s of subscriptions) void s.then((off) => off())
     }
   }, [])
 

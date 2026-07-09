@@ -88,6 +88,7 @@ const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_EVENT_SHUTDOWN: c_int = 1;
 const MPV_EVENT_FILE_LOADED: c_int = 8;
 const MPV_EVENT_END_FILE: c_int = 7;
+const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
 const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
 
 // `mpv_end_file_reason`: the playthrough reached the end of the file (vs. a
@@ -211,6 +212,14 @@ const EVENT_MUTE: &str = "mpv:mute";
 // identity — without the signal a stale tick from the outgoing recording (or a
 // pre-seek near-0 from the new one) trips gap-skip against the wrong position.
 const EVENT_FILE_LOADED: &str = "mpv:file-loaded";
+// mpv finished applying a seek (or started a file) and playback resumed at the
+// new position — every `time-pos` from here on reflects the post-seek playhead.
+// The frontend drops ticks between issuing `mpv_seek` and this signal, because
+// in-flight ticks still carry the *pre-seek* position: acting on one runs
+// gap-skip against the spot the user just scrubbed away from (a stale tick in a
+// gap yanks the playhead to the rally after the old position; one past the
+// session's last rally pauses mid-scrub).
+const EVENT_PLAYBACK_RESTART: &str = "mpv:playback-restart";
 
 /// Pump mpv's event stream on a dedicated thread for the whole process lifetime,
 /// translating mpv events into Tauri events the player listens to:
@@ -263,6 +272,9 @@ fn event_loop(handle_addr: usize, app: AppHandle) {
                 // the seek and from this single event-loop thread, so it always
                 // reaches the frontend ahead of the new file's first `time-pos`.
                 let _ = app.emit(EVENT_FILE_LOADED, ());
+            }
+            MPV_EVENT_PLAYBACK_RESTART => {
+                let _ = app.emit(EVENT_PLAYBACK_RESTART, ());
             }
             MPV_EVENT_PROPERTY_CHANGE => {
                 if event.data.is_null() {

@@ -50,21 +50,22 @@ export function useMpvTransport(path: string | null) {
   // optimistic write. mpv reports speed/volume as raw numbers; the UI tracks a
   // speed *ladder index* and a rounded volume.
   useEffect(() => {
-    const unlisten: Array<() => void> = []
-    void listen<boolean>("mpv:pause", (event) =>
-      setPaused(event.payload)
-    ).then((u) => unlisten.push(u))
-    void listen<number>("mpv:speed", (event) =>
-      setSpeedIndex(speedIndexForValue(event.payload))
-    ).then((u) => unlisten.push(u))
-    void listen<number>("mpv:volume", (event) =>
-      setVolume(Math.round(event.payload))
-    ).then((u) => unlisten.push(u))
-    void listen<boolean>("mpv:mute", (event) =>
-      setMuted(event.payload)
-    ).then((u) => unlisten.push(u))
+    const subscriptions = [
+      listen<boolean>("mpv:pause", (event) => setPaused(event.payload)),
+      listen<number>("mpv:speed", (event) =>
+        setSpeedIndex(speedIndexForValue(event.payload))
+      ),
+      listen<number>("mpv:volume", (event) =>
+        setVolume(Math.round(event.payload))
+      ),
+      listen<boolean>("mpv:mute", (event) => setMuted(event.payload)),
+    ]
     return () => {
-      for (const u of unlisten) u()
+      // Chain each teardown off its registration promise (the use-export.ts
+      // idiom): under StrictMode's synchronous setup→cleanup→setup an
+      // array-collected unlisten is still empty when cleanup runs, leaking the
+      // first mount's listeners for the rest of the app's life.
+      for (const s of subscriptions) void s.then((off) => off())
     }
   }, [])
 
