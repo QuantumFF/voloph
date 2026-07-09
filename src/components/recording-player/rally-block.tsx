@@ -11,14 +11,16 @@ import {
 /**
  * An in-flight rally-edge drag over the timeline strip: which rally and edge is
  * moving, the fixed opposite edge (`anchorGlobalMs`), the live dragged position
- * (`globalMs`), and the recording bounds the drag is clamped into. Session-global
- * ms throughout. Null when nothing is being dragged.
+ * (`globalMs`), whether that position is currently snapped to the playhead, and
+ * the recording bounds the drag is clamped into. Session-global ms throughout.
+ * Null when nothing is being dragged.
  */
 export interface DragState {
   key: string
   edge: "start" | "end"
   anchorGlobalMs: number
   globalMs: number
+  snappedToPlayhead: boolean
   minGlobalMs: number
   maxGlobalMs: number
 }

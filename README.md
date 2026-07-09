@@ -114,6 +114,8 @@ Review is keyboard-driven; press `?` in the player for the live cheat-sheet
 | `L`                     | Loop the current rally                    |
 | `G`                     | Toggle skipping gaps                      |
 | `F`                     | Jump to playhead                          |
+| `E`                     | Toggle timeline editing                   |
+| `A` `S` `C` `X`         | Edit mode: add / split / combine / delete |
 | `M`                     | Mute                                      |
 | `1` `2` `3`             | Annotate `good` / `bad` / `mistake`       |
 | `X`                     | Flag / unflag the current rally           |

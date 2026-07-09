@@ -14,6 +14,7 @@ import {
   clamp,
   type PlaylistRecording,
   type SessionModel,
+  type SessionRally,
   type Verdict,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
@@ -104,6 +105,7 @@ export function RecordingPlayer({
   const timelineRef = useRef<SessionTimelineHandle>(null)
 
   const [editing, setEditing] = useState(false)
+  const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [showCheatSheet, setShowCheatSheet] = useState(false)
   // Timeline zoom and playhead-follow are owned here rather than by the strip,
   // so the status bar (which lives outside the strip) can drive them; the
@@ -131,6 +133,7 @@ export function RecordingPlayer({
     () => buildSessionModel(recordings, timelines),
     [recordings, timelines]
   )
+  const rallyKey = useCallback((r: SessionRally) => `${r.path}:${r.id}`, [])
 
   // Offset of a recording on the session axis (0 if it isn't placed yet).
   const segmentOffset = useCallback(
@@ -248,6 +251,51 @@ export function RecordingPlayer({
         )
   const currentRally =
     currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
+  const selectedIndex = session.rallies.findIndex(
+    (r) => rallyKey(r) === selectedKey
+  )
+  const selectedRally =
+    selectedIndex >= 0 ? session.rallies[selectedIndex] : null
+  const editTargetIndex = selectedIndex >= 0 ? selectedIndex : currentRallyIndex
+  const editTarget = selectedRally ?? currentRally
+  const mergeTarget =
+    editTarget && editTargetIndex >= 0
+      ? (session.rallies[editTargetIndex + 1] ?? null)
+      : null
+  const canSplitEditTarget =
+    editTarget !== null &&
+    globalPlayheadMs !== null &&
+    globalPlayheadMs > editTarget.globalStart &&
+    globalPlayheadMs < editTarget.globalEnd
+  const canMergeEditTarget =
+    editTarget !== null &&
+    mergeTarget !== null &&
+    mergeTarget.recordingIndex === editTarget.recordingIndex
+
+  const toggleTimelineEditing = useCallback(() => {
+    setEditing((e) => {
+      if (!e && session.rallies.length === 0) return e
+      return !e
+    })
+  }, [session.rallies.length])
+
+  const splitEditTarget = useCallback(() => {
+    if (editTarget && canSplitEditTarget && globalPlayheadMs !== null) {
+      splitRally(editTarget, globalPlayheadMs)
+    }
+  }, [editTarget, canSplitEditTarget, globalPlayheadMs, splitRally])
+
+  const mergeEditTarget = useCallback(() => {
+    if (editTarget && canMergeEditTarget && mergeTarget) {
+      mergeRallies(editTarget, mergeTarget)
+    }
+  }, [editTarget, canMergeEditTarget, mergeTarget, mergeRallies])
+
+  const deleteEditTarget = useCallback(() => {
+    if (!editTarget) return
+    deleteRally(editTarget)
+    if (selectedRally) setSelectedKey(null)
+  }, [editTarget, selectedRally, deleteRally])
 
   // Flag / unflag the rally under the playhead (issue #10); a no-op in a gap.
   const flagCurrentRally = useCallback(() => {
@@ -291,6 +339,12 @@ export function RecordingPlayer({
         resetSpeed,
         annotate,
         flagCurrentRally,
+        editing,
+        toggleEditing: toggleTimelineEditing,
+        addAtPlayhead,
+        splitEditTarget,
+        mergeEditTarget,
+        deleteEditTarget,
         toggleCheatSheet,
       }),
     [
@@ -308,6 +362,12 @@ export function RecordingPlayer({
       resetSpeed,
       annotate,
       flagCurrentRally,
+      editing,
+      toggleTimelineEditing,
+      addAtPlayhead,
+      splitEditTarget,
+      mergeEditTarget,
+      deleteEditTarget,
       toggleCheatSheet,
     ]
   )
@@ -433,11 +493,13 @@ export function RecordingPlayer({
               canPrev={!atFirstRecording}
               canNext={!atLastRecording}
               editing={editing}
+              selectedKey={selectedKey}
+              setSelectedKey={setSelectedKey}
               onSeekGlobal={seekSession}
               onPrevRally={() => goToRally("prev")}
               onNextRally={() => goToRally("next")}
               onNextUncertain={goToUncertain}
-              onToggleEditing={() => setEditing((e) => !e)}
+              onToggleEditing={toggleTimelineEditing}
               onAdjustRally={adjustRally}
               onAddAtPlayhead={addAtPlayhead}
               onDeleteRally={deleteRally}

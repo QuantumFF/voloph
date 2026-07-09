@@ -41,6 +41,12 @@ export interface KeymapActions {
   resetSpeed: () => void
   annotate: (verdict: Verdict) => void
   flagCurrentRally: () => void
+  editing: boolean
+  toggleEditing: () => void
+  addAtPlayhead: () => void
+  splitEditTarget: () => void
+  mergeEditTarget: () => void
+  deleteEditTarget: () => void
   toggleCheatSheet: () => void
 }
 
@@ -64,6 +70,12 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     resetSpeed,
     annotate,
     flagCurrentRally,
+    editing,
+    toggleEditing,
+    addAtPlayhead,
+    splitEditTarget,
+    mergeEditTarget,
+    deleteEditTarget,
     toggleCheatSheet,
   } = actions
   const plain = (e: KeyboardEvent) =>
@@ -107,15 +119,12 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
         !e.altKey &&
         (e.key === "ArrowLeft" || e.key === "ArrowRight"),
       run: (e) =>
-        seekRelative(
-          e.key === "ArrowLeft" ? -SEEK_COARSE_MS : SEEK_COARSE_MS
-        ),
+        seekRelative(e.key === "ArrowLeft" ? -SEEK_COARSE_MS : SEEK_COARSE_MS),
     },
     {
       keys: ["↑", "↓"],
       label: "Volume up / down",
-      match: (e) =>
-        plain(e) && (e.key === "ArrowUp" || e.key === "ArrowDown"),
+      match: (e) => plain(e) && (e.key === "ArrowUp" || e.key === "ArrowDown"),
       run: (e) =>
         changeVolume(e.key === "ArrowUp" ? VOLUME_STEP : -VOLUME_STEP),
     },
@@ -156,6 +165,36 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
       run: jumpToPlayhead,
     },
     {
+      keys: ["E"],
+      label: "Toggle timeline editing",
+      match: (e) => plain(e) && e.key.toLowerCase() === "e",
+      run: toggleEditing,
+    },
+    {
+      keys: ["A"],
+      label: "Add rally at playhead (edit mode)",
+      match: (e) => editing && plain(e) && e.key.toLowerCase() === "a",
+      run: addAtPlayhead,
+    },
+    {
+      keys: ["S"],
+      label: "Split selected/current rally (edit mode)",
+      match: (e) => editing && plain(e) && e.key.toLowerCase() === "s",
+      run: splitEditTarget,
+    },
+    {
+      keys: ["C"],
+      label: "Combine selected/current rally with next (edit mode)",
+      match: (e) => editing && plain(e) && e.key.toLowerCase() === "c",
+      run: mergeEditTarget,
+    },
+    {
+      keys: ["X"],
+      label: "Delete selected/current rally (edit mode)",
+      match: (e) => editing && plain(e) && e.key.toLowerCase() === "x",
+      run: deleteEditTarget,
+    },
+    {
       keys: ["M"],
       label: "Mute",
       match: (e) => plain(e) && e.key.toLowerCase() === "m",
@@ -182,7 +221,7 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     {
       keys: ["X"],
       label: "Flag / unflag the current rally",
-      match: (e) => plain(e) && e.key.toLowerCase() === "x",
+      match: (e) => !editing && plain(e) && e.key.toLowerCase() === "x",
       run: flagCurrentRally,
     },
     {

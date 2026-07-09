@@ -77,10 +77,10 @@ export function TimelineNav({
           size="sm"
           onClick={onToggleEditing}
           disabled={!hasRallies}
-          title="Correct the draft timeline: drag rally edges, split, merge, add, or delete."
+          title="Correct the draft timeline: drag rally edges, split, merge, add, or delete (E)."
         >
           <PencilIcon className="size-4" />
-          {editing ? "Done editing" : "Edit timeline"}
+          {editing ? "Done editing" : "Edit timeline (E)"}
         </Button>
       </div>
     </div>
@@ -125,39 +125,39 @@ export function EditToolbar({
           variant="outline"
           size="sm"
           onClick={onAddAtPlayhead}
-          title="Add a rally over a span the segmenter missed (around the playhead, in the current recording)."
+          title="Add a rally over a span the segmenter missed (around the playhead, in the current recording) (A)."
         >
           <PlusIcon className="size-4" />
-          Add at playhead
+          Add at playhead (A)
         </Button>
         <Button
           variant="outline"
           size="sm"
           onClick={onSplit}
           disabled={!canSplit}
-          title="Split the selected rally in two at the playhead."
+          title="Split the selected rally in two at the playhead (S)."
         >
           <ScissorsIcon className="size-4" />
-          Split at playhead
+          Split at playhead (S)
         </Button>
         <Button
           variant="outline"
           size="sm"
           onClick={onMerge}
           disabled={!canMerge}
-          title="Merge the selected rally with the next one in the same recording."
+          title="Merge the selected rally with the next one in the same recording (C)."
         >
-          Merge with next
+          Merge with next (C)
         </Button>
         <Button
           variant="outline"
           size="sm"
           onClick={onDelete}
           disabled={!selected}
-          title="Delete the selected rally (its span becomes a gap)."
+          title="Delete the selected rally (its span becomes a gap) (X)."
         >
           <Trash2Icon className="size-4" />
-          Delete
+          Delete (X)
         </Button>
       </div>
     </div>

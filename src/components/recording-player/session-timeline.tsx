@@ -30,6 +30,9 @@ import { EditToolbar, TimelineNav } from "./timeline-toolbar"
 /** How much each Alt+scroll notch over the timeline zooms. */
 const ALT_SCROLL_ZOOM_FACTOR = 1.15
 
+/** How close a dragged rally edge must be to magnetically land on the playhead. */
+const PLAYHEAD_SNAP_THRESHOLD_MS = 250
+
 /** Imperative surface of the timeline strip the player drives (jump-to-playhead). */
 export interface SessionTimelineHandle {
   scrollToPlayhead: () => void
@@ -68,6 +71,8 @@ export const SessionTimeline = forwardRef<
     canPrev: boolean
     canNext: boolean
     editing: boolean
+    selectedKey: string | null
+    setSelectedKey: Dispatch<SetStateAction<string | null>>
     onSeekGlobal: (globalMs: number) => void
     onPrevRally: () => void
     onNextRally: () => void
@@ -95,6 +100,8 @@ export const SessionTimeline = forwardRef<
     canPrev,
     canNext,
     editing,
+    selectedKey,
+    setSelectedKey,
     onSeekGlobal,
     onPrevRally,
     onNextRally,
@@ -108,9 +115,6 @@ export const SessionTimeline = forwardRef<
   },
   ref
 ) {
-  // The selected rally, by "path:id" so a row id shared across recordings can
-  // never be ambiguous.
-  const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [drag, setDrag] = useState<DragState | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
@@ -158,18 +162,37 @@ export const SessionTimeline = forwardRef<
     el.scrollLeft = next
   }, [])
 
+  const snapToPlayhead = useCallback(
+    (
+      globalMs: number,
+      minGlobalMs: number,
+      maxGlobalMs: number
+    ): { globalMs: number; snappedToPlayhead: boolean } => {
+      if (
+        globalPlayheadMs === null ||
+        globalPlayheadMs < minGlobalMs ||
+        globalPlayheadMs > maxGlobalMs ||
+        Math.abs(globalMs - globalPlayheadMs) > PLAYHEAD_SNAP_THRESHOLD_MS
+      ) {
+        return { globalMs, snappedToPlayhead: false }
+      }
+      return { globalMs: globalPlayheadMs, snappedToPlayhead: true }
+    },
+    [globalPlayheadMs]
+  )
+
   // While dragging a rally edge, follow the pointer and persist on release.
   useEffect(() => {
     if (!drag) return
     const move = (e: PointerEvent) =>
-      setDrag((d) =>
-        d
-          ? {
-              ...d,
-              globalMs: clamp(xToMs(e.clientX), d.minGlobalMs, d.maxGlobalMs),
-            }
-          : d
-      )
+      setDrag((d) => {
+        if (!d) return d
+        const globalMs = clamp(xToMs(e.clientX), d.minGlobalMs, d.maxGlobalMs)
+        return {
+          ...d,
+          ...snapToPlayhead(globalMs, d.minGlobalMs, d.maxGlobalMs),
+        }
+      })
     const up = () => {
       setDrag((d) => {
         if (d) {
@@ -189,7 +212,7 @@ export const SessionTimeline = forwardRef<
       window.removeEventListener("pointermove", move)
       window.removeEventListener("pointerup", up)
     }
-  }, [drag, session, xToMs, onAdjustRally])
+  }, [drag, session, xToMs, snapToPlayhead, onAdjustRally])
 
   // The wheel over the strip: Alt+scroll zooms centered on the cursor; a plain
   // scroll pans the strip horizontally (so a vertical mouse wheel scrubs the
@@ -294,6 +317,7 @@ export const SessionTimeline = forwardRef<
 
   const playheadPx =
     globalPlayheadMs !== null ? (globalPlayheadMs / 1000) * pxPerSec : null
+  const snappedToPlayhead = drag?.snappedToPlayhead ?? false
 
   return (
     <div className="shrink-0 space-y-2">
@@ -398,6 +422,7 @@ export const SessionTimeline = forwardRef<
                           edge === "start"
                             ? rally.globalStart
                             : rally.globalEnd,
+                        snappedToPlayhead: false,
                         minGlobalMs: minMs,
                         maxGlobalMs: maxMs,
                       })
@@ -418,8 +443,17 @@ export const SessionTimeline = forwardRef<
               })}
               {playheadPx !== null ? (
                 <div
-                  className="pointer-events-none absolute inset-y-0 w-0.5 bg-foreground"
+                  className={`pointer-events-none absolute inset-y-0 w-0.5 transition-colors ${
+                    snappedToPlayhead
+                      ? "bg-primary ring-4 ring-primary/30"
+                      : "bg-foreground"
+                  }`}
                   style={{ left: `${playheadPx}px` }}
+                  title={
+                    snappedToPlayhead
+                      ? "Dragged edge snapped to playhead"
+                      : undefined
+                  }
                 />
               ) : null}
             </div>
