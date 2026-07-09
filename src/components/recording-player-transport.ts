@@ -437,6 +437,45 @@ export function resumeTickLanded(
 }
 
 /**
+ * Whether a `time-pos` tick at recording-local `ms` shows an in-flight
+ * within-recording seek has settled at its `target`. Ticks between issuing
+ * `mpv_seek` and the seek applying still carry the *pre-seek* position (the
+ * event stream and the invoke are both async), and acting on one runs gap-skip
+ * against a position the user just left — a stale tick in a gap yanks the
+ * playhead to the rally after the *old* position, and one past the session's
+ * last rally pauses mid-scrub. Unlike a crossing's resume (one-sided, near-0
+ * lead-in only), a seek's stale ticks can lie on either side of the target, so
+ * this is a two-sided window. The primary "seek done" signal is
+ * `mpv:playback-restart`; this is the belt that also clears the gate if a
+ * settled tick arrives first (or a restart is ever missed), so the gate cannot
+ * stick and freeze the playhead.
+ */
+export function seekTickSettled(
+  ms: number,
+  target: number,
+  tolMs: number
+): boolean {
+  return Math.abs(ms - target) <= tolMs
+}
+
+/**
+ * Whether a user-initiated resume (pause → play) at recording-local `ms` is a
+ * free-play intent. Past the session's final rally, gap-skip's end-of-session
+ * stop pauses playback on *every* tick — so without this, pressing play there
+ * advances one frame and is instantly re-paused, forever. Re-pressing play
+ * after that stop means "let me watch the tail anyway": the same manual
+ * opt-out as dragging into a gap.
+ */
+export function resumeEntersFreePlay(
+  rallies: Rally[],
+  ms: number,
+  atLastRecording: boolean
+): boolean {
+  if (!atLastRecording || rallies.length === 0) return false
+  return ms >= rallies[rallies.length - 1].end_ms
+}
+
+/**
  * The next uncertain region's session-global start after `hereMs`, wrapping to
  * the first when none is left ahead, so repeated presses cycle through every
  * doubt in the session (ADR 0002). `null` when there are no uncertain regions.
