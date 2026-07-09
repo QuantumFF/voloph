@@ -2311,3 +2311,420 @@ fn corrupt_or_wrong_version_analysis_is_ignored() {
         "unknown"
     );
 }
+
+// --- Version-aware staleness (ADR 0013/0015, issue #80) ------------------
+//
+// `SEGMENTER_VERSION` is 1 while this lands, so a real bump cannot be forced from
+// a test. Staleness is instead exercised the same way a bump would present it: a
+// `ready` recording carrying a *lower* stored `segmenter_version` (0) is exactly
+// what an untouched recording looks like once the active segmenter outranks it.
+
+/// Publish an Analysis into the shared library for `abs`, stamped with an explicit
+/// segmenter version and named by that version (v1 → bare content key, later →
+/// `_s{N}`), so several versions can sit alongside one another. Returns the
+/// filename written, so a test can assert older files stay on disk.
+fn publish_versioned_analysis(
+    lib: &TempLib,
+    abs: &Path,
+    segmenter_version: u32,
+    rallies: Vec<AnalysisRally>,
+) -> String {
+    let meta = std::fs::metadata(abs).unwrap();
+    let hash = quick_hash(abs, meta.len()).unwrap();
+    let analysis = Analysis {
+        format: ANALYSIS_FORMAT.to_string(),
+        version: ANALYSIS_VERSION,
+        segmenter_version,
+        capture_day: "2026-01-01".to_string(),
+        duration_ms: Some(1000 * segmenter_version as i64),
+        waveform: vec![],
+        rallies,
+    };
+    let name = analysis_file_name(&hash, meta.len() as i64, segmenter_version);
+    let dir = lib.0.join(".voloph").join("analysis");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&name), serde_json::to_vec(&analysis).unwrap()).unwrap();
+    name
+}
+
+/// A fresh machine analysis stamps the active segmenter version onto the row, so
+/// the row records which segmenter produced its draft.
+#[test]
+fn save_rallies_stamps_the_active_segmenter_version() {
+    let (mut conn, id) = db_with_rallies("/x/game.mp4", &[]);
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 0,
+            end_ms: 100,
+            confidence: 0.5,
+        }],
+        &[],
+    )
+    .unwrap();
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT segmenter_version FROM recordings WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, Some(crate::segment::SEGMENTER_VERSION as i64));
+}
+
+/// An untouched recording whose draft an outranked segmenter produced (a lower
+/// stored version) is silently re-queued on scan: its draft is dropped and it
+/// returns to `unknown` so the background worker re-analyzes it.
+#[test]
+fn scan_resegments_an_untouched_stale_recording() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 0,
+            end_ms: 100,
+            confidence: 0.5,
+        }],
+        &[0.1],
+    )
+    .unwrap();
+    // A ready-segmented recording has been probed; age it so the active segmenter
+    // (v1) now outranks this draft (stamped v0).
+    conn.execute(
+        "UPDATE recordings SET segmenter_version = 0, probe_state = 'ready' WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+
+    scan_library(&mut conn).unwrap();
+
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(tl.segment_state, "unknown");
+    assert!(tl.rallies.is_empty());
+    // Re-queued for the worker: probe stays ready (bytes unchanged), segment pending.
+    conn.execute("UPDATE recordings SET date_state = 'refined'", [])
+        .unwrap();
+    assert!(matches!(
+        next_media_work(&conn).unwrap(),
+        Some(MediaWork::Segment(..))
+    ));
+}
+
+/// A hand-touched recording is never re-analyzed by a version bump — corrections
+/// are the most authoritative data in the system (ADR 0015).
+#[test]
+fn scan_never_resegments_a_hand_touched_stale_recording() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 0,
+            end_ms: 100,
+            confidence: 0.5,
+        }],
+        &[0.1],
+    )
+    .unwrap();
+    // Hand-correct a rally (confidence bumped to CORRECTED) and age it.
+    conn.execute(
+        "UPDATE rallies SET confidence = 1.0 WHERE recording_id = ?1",
+        [id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE recordings SET segmenter_version = 0 WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+
+    scan_library(&mut conn).unwrap();
+
+    // Draft stands, nothing dropped, still `ready` — never re-analyzed, never asked.
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(tl.segment_state, "ready");
+    assert_eq!(
+        tl.rallies.iter().map(|r| r.start_ms).collect::<Vec<_>>(),
+        vec![0]
+    );
+}
+
+/// A draft stamped with the current version (or none) is never stale — the feature
+/// lands inert, doing nothing until a real `SEGMENTER_VERSION` bump.
+#[test]
+fn a_current_version_recording_is_left_alone() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 0,
+            end_ms: 100,
+            confidence: 0.5,
+        }],
+        &[0.1],
+    )
+    .unwrap();
+
+    scan_library(&mut conn).unwrap();
+
+    assert_eq!(
+        recording_timeline(&conn, &abs.to_string_lossy())
+            .unwrap()
+            .unwrap()
+            .segment_state,
+        "ready"
+    );
+}
+
+/// Adoption prefers the highest segmenter version when several Analyses exist for
+/// the same content key, and every older file stays on disk (nothing is deleted
+/// from shared storage).
+#[test]
+fn scan_adopts_the_highest_version_and_keeps_older_files() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    // Two Analyses for the same bytes: an older v1 and a newer v2, side by side.
+    let v1_name = publish_versioned_analysis(
+        &lib,
+        &abs,
+        1,
+        vec![AnalysisRally {
+            start_ms: 0,
+            end_ms: 1000,
+            confidence: 0.2,
+        }],
+    );
+    let v2_name = publish_versioned_analysis(
+        &lib,
+        &abs,
+        2,
+        vec![AnalysisRally {
+            start_ms: 5000,
+            end_ms: 9000,
+            confidence: 0.9,
+        }],
+    );
+    assert_ne!(v1_name, v2_name, "the two versions have distinct filenames");
+
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+
+    // The v2 draft (highest version) was adopted, not v1.
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(tl.duration_ms, Some(2000)); // publish_versioned_analysis marks v2 → 2000
+    assert_eq!(
+        tl.rallies
+            .iter()
+            .map(|r| (r.start_ms, r.end_ms))
+            .collect::<Vec<_>>(),
+        vec![(5000, 9000)]
+    );
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT segmenter_version FROM recordings WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, Some(2));
+
+    // Both files remain on disk — nothing was deleted from shared storage.
+    let dir = lib.0.join(".voloph").join("analysis");
+    assert!(dir.join(&v1_name).exists(), "older Analysis was deleted");
+    assert!(dir.join(&v2_name).exists());
+}
+
+/// A newer-version Analysis is published *alongside* a stale one — a bump backfills
+/// its own versioned file without touching the older sibling. (Simulated by
+/// stamping the row with a higher version than the file already on disk.)
+#[test]
+fn publish_writes_alongside_without_deleting_the_older_version() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 0,
+            end_ms: 100,
+            confidence: 0.5,
+        }],
+        &[],
+    )
+    .unwrap();
+    publish_analysis(&conn, id);
+    let meta = std::fs::metadata(&abs).unwrap();
+    let hash = quick_hash(&abs, meta.len()).unwrap();
+    let v1_name = analysis_file_name(&hash, meta.len() as i64, 1);
+    let dir = lib.0.join(".voloph").join("analysis");
+    assert!(dir.join(&v1_name).exists());
+
+    // The row's draft is now a v2 draft; publishing writes a `_s2` file alongside.
+    conn.execute(
+        "UPDATE recordings SET segmenter_version = 2 WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+    publish_analysis(&conn, id);
+
+    let v2_name = analysis_file_name(&hash, meta.len() as i64, 2);
+    assert!(dir.join(&v2_name).exists(), "v2 published alongside");
+    assert!(dir.join(&v1_name).exists(), "v1 left in place");
+}
+
+/// On an upgraded DB, the migration stamps every already-segmented row with the
+/// current version while leaving unsegmented rows unstamped, so pre-feature drafts
+/// are treated as current (not spuriously stale) and the feature stays inert.
+#[test]
+fn migration_backfills_ready_recordings_to_the_current_version() {
+    // Build a pre-#80 `recordings` table (no `segmenter_version` column) with a
+    // `ready` and an `unknown` row directly in a file DB, then run `open` to drive
+    // the real ADD COLUMN + backfill migration against it.
+    let db = std::env::temp_dir().join(format!(
+        "voloph-mig-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sessions (id INTEGER PRIMARY KEY, capture_day TEXT NOT NULL,
+             library TEXT NOT NULL DEFAULT 'local', UNIQUE(library, capture_day));
+         CREATE TABLE recordings (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL REFERENCES sessions(id),
+            path TEXT NOT NULL,
+            library TEXT NOT NULL DEFAULT 'local',
+            file_size INTEGER NOT NULL,
+            quick_hash TEXT NOT NULL,
+            capture_day TEXT NOT NULL,
+            probe_state TEXT NOT NULL DEFAULT 'unknown',
+            segment_state TEXT NOT NULL DEFAULT 'unknown',
+            date_state TEXT NOT NULL DEFAULT 'unknown',
+            duration_ms INTEGER,
+            waveform TEXT,
+            UNIQUE(library, path));
+         INSERT INTO sessions (id, capture_day) VALUES (1, '2026-01-01');
+         INSERT INTO recordings (session_id, path, file_size, quick_hash, capture_day, segment_state)
+            VALUES (1, 'a.mp4', 1, 'h', '2026-01-01', 'ready'),
+                   (1, 'b.mp4', 2, 'h2', '2026-01-01', 'unknown');",
+    )
+    .unwrap();
+    // No `segmenter_version` column exists yet — this is the pre-feature shape.
+    assert!(conn
+        .prepare("SELECT segmenter_version FROM recordings LIMIT 0")
+        .is_err());
+    drop(conn);
+
+    // Re-open through `open` so the migration (ADD COLUMN + backfill) runs.
+    let conn = open(Path::new(&db)).unwrap();
+    let ready_v: Option<i64> = conn
+        .query_row(
+            "SELECT segmenter_version FROM recordings WHERE path = 'a.mp4'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let unknown_v: Option<i64> = conn
+        .query_row(
+            "SELECT segmenter_version FROM recordings WHERE path = 'b.mp4'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ready_v, Some(crate::segment::SEGMENTER_VERSION as i64));
+    assert_eq!(unknown_v, None);
+    std::fs::remove_file(&db).ok();
+}
+
+/// A version bump does not disturb bundle receive: a recipient carrying a stale
+/// machine-only draft still applies the bundle's hand-corrected state over it, and
+/// afterwards that recording is hand-touched, so no later bump can re-analyze it.
+#[test]
+fn version_bump_does_not_disturb_bundle_receive() {
+    let lib = TempLib::new();
+    let json = shared_bundle_json(&lib);
+    let mut conn = recipient_db(&lib);
+    // The recipient has scanned and machine-analyzed a.mp4 to a stale draft (v0).
+    scan_library(&mut conn).unwrap();
+    let a_abs = absolute(&lib.0.to_string_lossy(), "a.mp4");
+    let a_id = recording_id(&conn, &a_abs).unwrap().unwrap();
+    save_rallies(
+        &mut conn,
+        a_id,
+        60000,
+        &[crate::segment::Rally {
+            start_ms: 0,
+            end_ms: 100,
+            confidence: 0.5,
+        }],
+        &[],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE recordings SET segmenter_version = 0 WHERE id = ?1",
+        [a_id],
+    )
+    .unwrap();
+
+    // Receiving applies the bundle's review over the machine-only (if stale) draft,
+    // exactly as it does today — the version bump changes nothing here. a.mp4's
+    // hand-touched state applies (machine-only is replaced silently); nothing is
+    // refused or surfaced as a conflict on account of the stale version.
+    let result = receive_session_bundle(&mut conn, &json).unwrap();
+    assert!(result.applied >= 1);
+    assert!(result.refused.is_empty());
+    assert!(result.conflicts.is_empty());
+
+    // The bundle's flagged/annotated state makes the recording hand-touched, so a
+    // subsequent scan (with any version bump) never re-analyzes it.
+    let a_id = recording_id(&conn, &a_abs).unwrap().unwrap();
+    assert!(is_hand_touched(&conn, a_id).unwrap());
+    conn.execute(
+        "UPDATE recordings SET segmenter_version = 0 WHERE id = ?1",
+        [a_id],
+    )
+    .unwrap();
+    scan_library(&mut conn).unwrap();
+    assert_eq!(
+        recording_timeline(&conn, &a_abs).unwrap().unwrap().segment_state,
+        "ready"
+    );
+}

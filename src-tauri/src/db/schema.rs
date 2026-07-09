@@ -47,6 +47,11 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             date_state      TEXT NOT NULL DEFAULT 'unknown',
             duration_ms     INTEGER,
             waveform        TEXT,
+            -- The segmenter version that produced this recording's current draft
+            -- (ADR 0013/0015). NULL until segmented or adopted; governs staleness —
+            -- an untouched recording whose version the active segmenter outranks is
+            -- silently re-analyzed, a hand-touched one never is.
+            segmenter_version INTEGER,
             UNIQUE(library, path)
         );
         CREATE TABLE IF NOT EXISTS rallies (
@@ -138,6 +143,25 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
         "ALTER TABLE rallies ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Version-aware staleness (ADR 0013/0015, issue #80): stamp the segmenter
+    // version onto each recording's draft so a later bump can silently re-analyze
+    // untouched recordings and supersede stale shared Analyses. Backfill every
+    // already-segmented row to the current version — pre-feature drafts predate
+    // versioning, and treating them as the current version keeps the feature inert
+    // until a real bump raises `SEGMENTER_VERSION` above them (untouched
+    // recordings only go stale once the active segmenter outranks their stamp).
+    let fresh_version_column = conn
+        .execute(
+            "ALTER TABLE recordings ADD COLUMN segmenter_version INTEGER",
+            [],
+        )
+        .is_ok();
+    if fresh_version_column {
+        conn.execute(
+            "UPDATE recordings SET segmenter_version = ?1 WHERE segment_state = 'ready'",
+            [crate::segment::SEGMENTER_VERSION],
+        )?;
+    }
     // Two typed libraries (issue #62): the shared library adds a `mount` locality
     // to `libraries`, and every session/recording is tagged with the library it
     // belongs to so the same relative path or capture day can exist in both. A DB
@@ -247,15 +271,16 @@ fn migrate_to_typed_libraries(conn: &Connection) -> rusqlite::Result<()> {
             date_state      TEXT NOT NULL DEFAULT 'unknown',
             duration_ms     INTEGER,
             waveform        TEXT,
+            segmenter_version INTEGER,
             UNIQUE(library, path)
          );
          INSERT INTO sessions_new (id, capture_day, library)
             SELECT id, capture_day, 'local' FROM sessions;
          INSERT INTO recordings_new
             (id, session_id, path, library, file_size, quick_hash, capture_day,
-             probe_state, segment_state, date_state, duration_ms, waveform)
+             probe_state, segment_state, date_state, duration_ms, waveform, segmenter_version)
             SELECT id, session_id, path, 'local', file_size, quick_hash, capture_day,
-                   probe_state, segment_state, date_state, duration_ms, waveform
+                   probe_state, segment_state, date_state, duration_ms, waveform, segmenter_version
             FROM recordings;
          DROP TABLE recordings;
          DROP TABLE sessions;
