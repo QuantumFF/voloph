@@ -10,11 +10,14 @@
 //! decelerate after the point, so the rising and falling edges of the motion
 //! envelope land where the rally boundaries actually are — something audio
 //! cannot place, since a serve is preceded by shuttle-bouncing and chatter, and
-//! a rally's end sounds identical to a mid-rally lull. Audio then **confirms**
-//! that a moving span is a rally and not non-rally movement (players walking to
-//! collect shuttles, towelling off): hit *count* over a multi-second span is
-//! robust even though hit *timing* is not. A neighbouring court is out of frame,
-//! so it never drives motion — sidestepping the audio bleed of the old approach.
+//! a rally's end sounds identical to a mid-rally lull. Audio then **modulates
+//! confidence**, but never deletes a span (ADR 0015, issue #79): under the
+//! zero-miss bar no single signal may drop a rally on its own. A moving span
+//! with enough shuttle-hit onsets keeps its motion-derived confidence; one with
+//! too few is still kept but marked uncertain, surfacing as a doubtful region
+//! for review rather than being silently removed. Hit *count* over a multi-second
+//! span is robust even though hit *timing* is not. A neighbouring court is out of
+//! frame, so it never drives motion — sidestepping the audio bleed of old work.
 //!
 //! It is a **tunable heuristic, not a learned model** (ADR 0002). Every threshold
 //! lives in [`Params`] with a documented meaning so the human tuning step can
@@ -30,7 +33,7 @@
 /// The segmenter's identity, stamped into a published Analysis (ADR 0013) so a
 /// future, meaningfully better segmenter can spot stale Analyses. Ignored today;
 /// bump on a change that materially alters the draft timeline it produces.
-pub const SEGMENTER_VERSION: u32 = 1;
+pub const SEGMENTER_VERSION: u32 = 2;
 
 /// A detected rally interval over a recording, in milliseconds from its start,
 /// carrying a per-region confidence in `[0, 1]`. Low-confidence rallies surface
@@ -44,25 +47,28 @@ pub struct Rally {
 
 /// The gate a candidate span hit during segmentation — the Stage 0 diagnostic of
 /// ADR 0015. Every span the segmenter weighs gets exactly one, so running one bad
-/// recording answers "which gate is eating rallies": a real rally missing from the
-/// draft either died at the motion gate ([`GateVerdict::MotionNeverFired`]) or the
-/// audio gate ([`GateVerdict::RejectedByAudio`]). Observational only — the verdict
-/// never feeds back into the draft, this ticket observes and does not fix.
+/// recording answers "which gate is eating rallies". Since audio was demoted to a
+/// confidence modulator (issue #79, Stage 1), only the motion gate can lose a
+/// rally outright ([`GateVerdict::MotionNeverFired`]); audio can only mark one
+/// doubtful ([`GateVerdict::UnconfirmedByAudio`]). Observational only — the
+/// verdict never feeds back into the draft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateVerdict {
     /// Motion fired, the span was long enough, and audio confirmed real play — it
-    /// became a rally.
+    /// became a rally at its motion-derived confidence.
     Kept,
     /// Motion fired and the span was long enough, but too few shuttle-hit onsets
-    /// to confirm play — the audio confirmation gate dropped it. The prime suspect
-    /// for missed rallies on noisy footage (ADR 0015).
-    RejectedByAudio,
+    /// to confirm play. The span is still kept — audio never deletes a rally
+    /// (issue #79) — with its confidence capped at
+    /// [`Params::unconfirmed_confidence`], so this marks a doubtful rally, not a
+    /// dropped one. Still the verdict to watch on noisy footage (ADR 0015).
+    UnconfirmedByAudio,
     /// A candidate span too brief to be a rally (below [`Params::min_rally_ms`]).
     TooShort,
     /// Audio confirmed play here, but the motion envelope never crossed its
     /// threshold, so the span never entered the rally pass — the motion gate's
-    /// silent counterpart to [`GateVerdict::RejectedByAudio`]. Invisible without this
-    /// instrumentation, since motion is primary.
+    /// silent counterpart to [`GateVerdict::UnconfirmedByAudio`]. Invisible without
+    /// this instrumentation, since motion is primary.
     MotionNeverFired,
 }
 
@@ -71,7 +77,7 @@ impl GateVerdict {
     pub fn label(self) -> &'static str {
         match self {
             GateVerdict::Kept => "kept",
-            GateVerdict::RejectedByAudio => "rejected-by-audio",
+            GateVerdict::UnconfirmedByAudio => "unconfirmed-by-audio",
             GateVerdict::TooShort => "too-short",
             GateVerdict::MotionNeverFired => "motion-never-fired",
         }
@@ -132,11 +138,22 @@ pub struct Params {
     /// multiple of the clip's mean motion. The dominant play/gap decision.
     pub motion_active_ratio: f64,
 
-    // --- fusion / confirmation ---
-    /// A motion span is kept as a rally only if it carries at least this many
-    /// shuttle-hit onsets per second — audio confirming real play, filtering out
-    /// non-rally movement (and motion-free audio bleed never reaches here).
+    // --- fusion / confidence modulation ---
+    /// Onsets-per-second at or above which audio *confirms* a motion span as real
+    /// play, leaving its motion-derived confidence intact. Below it the span is
+    /// still kept (audio never deletes a rally — ADR 0015, issue #79); its
+    /// confidence is instead pulled down toward [`Params::unconfirmed_confidence`]
+    /// so a hit-less moving span surfaces as an uncertain region rather than
+    /// vanishing. This is a confidence knob now, not an inclusion gate.
     pub confirm_onsets_per_sec: f64,
+    /// The confidence ceiling for a motion span audio does **not** confirm (onset
+    /// density below [`Params::confirm_onsets_per_sec`]). Kept below the review
+    /// UI's uncertain threshold — `UNCERTAIN_CONFIDENCE` (0.5) in
+    /// `src/components/recording-player-transport.ts`, duplicated here as a bare
+    /// number since it lives across the Rust/TS boundary; keep this strictly under
+    /// it — so such a span reliably surfaces as an amber "check this" region during
+    /// review, never a silent deletion (issue #79).
+    pub unconfirmed_confidence: f64,
 
     // --- structure ---
     /// Length of the analysis block, in milliseconds. The grain at which motion
@@ -161,6 +178,7 @@ impl Default for Params {
             onset_floor_ratio: 0.75,
             motion_active_ratio: 1.2,
             confirm_onsets_per_sec: 0.2,
+            unconfirmed_confidence: 0.3,
             block_ms: 500,
             bridge_gap_ms: 2900,
             min_rally_ms: 2000,
@@ -292,11 +310,19 @@ pub fn segment_with(
         merged.push((start, end, active_blocks));
     }
 
-    // 8. Confirm each span with audio and drop the too-short, then convert to
-    //    padded ms intervals. Confidence is the share of the span that was real
-    //    movement (bridged downtime lowers it → surfaces as an uncertain region).
+    // 8. Drop the too-short, then convert to padded ms intervals. Confidence
+    //    starts as the share of the span that was real movement (bridged downtime
+    //    lowers it → surfaces as an uncertain region), then audio *modulates* it.
     //    Every span the segmenter weighs here records its gate verdict (ADR 0015
-    //    Stage 0) at the raw block boundaries — kept, or which gate dropped it.
+    //    Stage 0) at the raw block boundaries.
+    //
+    //    Audio no longer hard-gates (ADR 0015, issue #79): under the zero-miss bar
+    //    no single signal may delete a rally on its own. A moving span with too
+    //    few shuttle-hit onsets is still kept — its confidence is instead capped
+    //    at `unconfirmed_confidence` (below the review UI's uncertain threshold)
+    //    so it surfaces as a doubtful region rather than vanishing. Hits present
+    //    leave the motion-derived confidence intact. (Motion-free audio bleed
+    //    never reaches here — with no motion there is no span to modulate.)
     let min_blocks = (p.min_rally_ms / block_ms.max(1)).max(1) as usize;
     let mut rallies: Vec<Rally> = Vec::new();
     let mut verdicts: Vec<SpanVerdict> = Vec::new();
@@ -314,20 +340,19 @@ pub fn segment_with(
         }
         let onsets: usize = block_onsets[start..end].iter().sum();
         let span_secs = span_blocks as f64 * block_secs;
-        // Audio confirmation: a moving span with too few hits is not a rally.
-        if span_secs > 0.0 && (onsets as f64 / span_secs) < p.confirm_onsets_per_sec {
-            verdicts.push(SpanVerdict {
-                start_ms: raw_start,
-                end_ms: raw_end,
-                verdict: GateVerdict::RejectedByAudio,
-            });
-            continue;
+        let mut confidence = (active_blocks as f64 / span_blocks as f64).clamp(0.0, 1.0);
+        let confirmed = span_secs > 0.0 && (onsets as f64 / span_secs) >= p.confirm_onsets_per_sec;
+        if !confirmed {
+            confidence = confidence.min(p.unconfirmed_confidence);
         }
-        let confidence = (active_blocks as f64 / span_blocks as f64).clamp(0.0, 1.0);
         verdicts.push(SpanVerdict {
             start_ms: raw_start,
             end_ms: raw_end,
-            verdict: GateVerdict::Kept,
+            verdict: if confirmed {
+                GateVerdict::Kept
+            } else {
+                GateVerdict::UnconfirmedByAudio
+            },
         });
         rallies.push(Rally {
             start_ms: (raw_start - p.pad_ms).max(0),
@@ -339,7 +364,7 @@ pub fn segment_with(
     // 8b. Motion-never-fired (ADR 0015 Stage 0): audio-confirmed regions the motion
     //     gate never opened for. Motion is primary, so these never reach the pass
     //     above and a rally lost to the motion gate would be invisible — this is the
-    //     symmetric counterpart to `rejected-by-audio`. Group the shuttle-hit blocks
+    //     symmetric counterpart to `unconfirmed-by-audio`. Group the shuttle-hit blocks
     //     with the same bridging, then flag only spans that are rally-length,
     //     audio-confirmed, and carry no motion (a span with motion already spoke
     //     above). Shorter or unconfirmed audio is not a candidate rally.
@@ -555,18 +580,33 @@ mod tests {
     }
 
     #[test]
-    fn motion_without_hits_is_not_a_rally() {
+    fn motion_without_hits_is_kept_but_uncertain() {
         // Whole-court movement but no shuttle hits (e.g. players walking around):
-        // audio confirmation rejects it. This is the hybrid's key behaviour.
+        // audio can no longer *delete* the span (issue #79, ADR 0015). Under the
+        // zero-miss bar no single signal drops a rally on its own — the worst
+        // audio does is mark it doubtful. So the motion span survives as a rally
+        // whose confidence is pushed into the uncertain zone (below the review
+        // UI's UNCERTAIN_CONFIDENCE = 0.5), surfacing as an amber "check this".
         let audio = synth_audio(20.0, &[], 1.0); // no hits
         let motion = synth_motion(20.0, &[(4.0, 16.0)]);
-        assert!(segment(&audio, SR, &motion).rallies.is_empty());
+        let rallies = segment(&audio, SR, &motion).rallies;
+        assert_eq!(
+            rallies.len(),
+            1,
+            "span must be kept, not dropped: {rallies:?}"
+        );
+        assert!(
+            rallies[0].confidence < 0.5,
+            "unconfirmed span should surface as uncertain: {rallies:?}"
+        );
     }
 
     #[test]
     fn hits_without_motion_are_ignored() {
         // Shuttle-like hits but no on-court motion (e.g. a neighbouring court
-        // bleeding into the audio): motion is primary, so nothing is detected.
+        // bleeding into the audio): motion is the only signal that *proposes* a
+        // rally, so with no on-court movement there is nothing to keep. Audio
+        // modulates confidence but never conjures a span (issue #79).
         let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
         let motion = synth_motion(20.0, &[]); // still court
         assert!(segment(&audio, SR, &motion).rallies.is_empty());
@@ -634,16 +674,18 @@ mod tests {
     }
 
     #[test]
-    fn motion_without_hits_records_rejected_by_audio() {
-        // Whole-court movement but no shuttle hits: the audio confirmation gate
-        // drops it — the prime suspect for missed rallies on noisy footage.
+    fn motion_without_hits_records_unconfirmed_by_audio() {
+        // Whole-court movement but no shuttle hits: since #79 the audio gate no
+        // longer drops the span — it is kept as a doubtful rally and the verdict
+        // records that audio never confirmed it, still the signal to watch on
+        // noisy footage.
         let audio = synth_audio(20.0, &[], 1.0);
         let motion = synth_motion(20.0, &[(4.0, 16.0)]);
         let seg = segment(&audio, SR, &motion);
-        assert!(seg.rallies.is_empty(), "{:?}", seg.rallies);
+        assert_eq!(seg.rallies.len(), 1, "{:?}", seg.rallies);
         assert_eq!(
             verdict_kinds(&seg.verdicts),
-            vec![GateVerdict::RejectedByAudio],
+            vec![GateVerdict::UnconfirmedByAudio],
             "{:?}",
             seg.verdicts
         );
