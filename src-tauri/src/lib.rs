@@ -1,4 +1,7 @@
 mod db;
+/// The eval harness (ADR 0015): a dev CLI that referees the segmenter against
+/// hand-corrected timelines. Public so the `eval-harness` bin can drive it.
+pub mod eval;
 mod export;
 mod media;
 mod media_worker;
