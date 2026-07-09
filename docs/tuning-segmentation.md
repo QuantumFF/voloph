@@ -41,10 +41,13 @@ them; you only change the numbers.
 
 ## How the two signals combine
 
-**Motion decides where rallies are and where their edges fall.** **Audio decides
-whether a moving span is actually a rally** (enough shuttle hits) or just
-movement to ignore. So tune motion first to get the spans and boundaries right,
-then use the audio knobs only to fix wrong inclusions/exclusions.
+**Motion decides where rallies are, where their edges fall, and *whether* a span
+is kept at all.** **Audio only steers confidence** — how sure we are a kept span
+is real play (ADR 0015, issue #79). Audio never deletes a span: under the
+zero-miss bar no single signal may drop a rally on its own, so the worst a
+hit-less moving span suffers is being marked uncertain (amber), not removed. So
+tune motion first to get the spans and boundaries right, then use the audio knobs
+only to move spans between "confident" and "uncertain".
 
 ### Motion — the play/gap decision and boundaries
 
@@ -58,19 +61,26 @@ If motion fails to separate play from gaps at *any* `motion_active_ratio`, the
 frames themselves likely lack contrast — check the static-camera assumption, or
 that the court fills enough of the frame for player movement to register.
 
-### Audio — the rally/not-a-rally confirmation
+### Audio — the confidence modulator
+
+These knobs steer **confidence, not inclusion** (issue #79). A moving span is
+always kept; audio decides whether it reads as confident or uncertain (amber).
 
 | Symptom | Knob (default) | Direction |
 | --- | --- | --- |
-| Real rally dropped as "not enough hits" | `confirm_onsets_per_sec` (0.2) | ↓ lower |
-| Non-rally movement kept as a rally | `confirm_onsets_per_sec` | ↑ raise |
-| Hits not registering (so quiet rallies get dropped) | `onset_ratio` (2.5) | ↓ lower |
+| Real rallies wrongly flagged uncertain ("not enough hits") | `confirm_onsets_per_sec` (0.2) | ↓ lower |
+| Non-rally movement reads as confident play | `confirm_onsets_per_sec` | ↑ raise |
+| Unconfirmed spans not amber enough / too amber | `unconfirmed_confidence` (0.3) | ↓ lower = more doubtful |
+| Hits not registering (so real rallies read uncertain) | `onset_ratio` (2.2) | ↓ lower |
 | Spurious hits in near-silence | `onset_floor_ratio` (0.75) | ↑ raise |
 
-`frame` (1024 ≈ 64 ms) and `baseline_ms` (1000) set the grain of hit detection
-and rarely need touching. Note the audio step only *confirms* — it filters
-movement that has no hits (warm-up wandering, collecting shuttles); it can't tell
-a knock-up apart from a real rally, since both have hits.
+A span whose onset density reaches `confirm_onsets_per_sec` keeps its
+motion-derived confidence; one below it is kept but capped at
+`unconfirmed_confidence`, which sits below the review UI's uncertain threshold
+(0.5) so it reliably surfaces as amber. `frame` (1024 ≈ 64 ms) and `baseline_ms`
+(1000) set the grain of hit detection and rarely need touching. Audio can't tell
+a knock-up apart from a real rally (both have hits) — that is a review-time call,
+which is exactly why audio now only nudges confidence and never deletes.
 
 ### Structure — merging and trimming (applies to the motion spans)
 
