@@ -378,7 +378,7 @@ fn score_and_report(recordings: &[CorpusRecording]) {
 /// extraction failure as an error string so the caller can report and skip it.
 fn rerun_segmenter(abs_path: &str) -> Result<(Vec<Interval>, i64), String> {
     let samples = media::extract_pcm(abs_path)?;
-    let energy = media::extract_motion(abs_path)?;
+    let energy = media::extract_motion(abs_path, |_| {})?; // dev CLI: no progress UI
     let motion = segment::MotionTrack {
         fps: f64::from(media::MOTION_FPS),
         energy,

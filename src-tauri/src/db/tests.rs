@@ -1806,11 +1806,12 @@ fn declining_after_adoption_keeps_the_draft_and_runs_no_analysis() {
 // --- Publishing the Analysis at completion (ADR 0013, issue #69) ---------
 
 /// Read the `.vanalysis` published for `abs` under the shared library `root`, if
-/// any. Content-keyed by quick hash + size (ADR 0013).
+/// any. Content-keyed by quick hash + size (ADR 0013), at the *active* segmenter
+/// version's file name — where a fresh publish lands (issue #80).
 fn read_published_analysis(root: &Path, abs: &Path) -> Option<Analysis> {
     let meta = std::fs::metadata(abs).unwrap();
     let hash = quick_hash(abs, meta.len()).unwrap();
-    let name = format!("{hash}_{}.vanalysis", meta.len());
+    let name = analysis_file_name(&hash, meta.len() as i64, crate::segment::SEGMENTER_VERSION);
     let path = root.join(".voloph").join("analysis").join(name);
     std::fs::read(path)
         .ok()
@@ -2127,7 +2128,9 @@ fn publish_test_analysis(lib: &TempLib, abs: &Path, rallies: Vec<AnalysisRally>)
     };
     let dir = lib.0.join(".voloph").join("analysis");
     std::fs::create_dir_all(&dir).unwrap();
-    let name = format!("{hash}_{}.vanalysis", meta.len());
+    // At the active version's file name, mirroring where a real publish lands
+    // (and where `read_published_analysis` looks).
+    let name = analysis_file_name(&hash, meta.len() as i64, crate::segment::SEGMENTER_VERSION);
     std::fs::write(dir.join(name), serde_json::to_vec(&analysis).unwrap()).unwrap();
 }
 
@@ -2585,6 +2588,12 @@ fn publish_writes_alongside_without_deleting_the_older_version() {
             confidence: 0.5,
         }],
         &[],
+    )
+    .unwrap();
+    // Stamp the row as a v1 draft (a stale, pre-bump publish) and publish it.
+    conn.execute(
+        "UPDATE recordings SET segmenter_version = 1 WHERE id = ?1",
+        [id],
     )
     .unwrap();
     publish_analysis(&conn, id);
