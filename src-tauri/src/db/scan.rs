@@ -261,10 +261,19 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
         registered += 1;
     }
 
+    // Silently re-queue untouched recordings whose draft an outranked segmenter
+    // produced (ADR 0013/0015, issue #80): reset them to `unknown` so the steps
+    // below and the background worker regenerate the draft under the active
+    // segmenter. Ahead of adoption so a stale shared recording with a newer
+    // published Analysis adopts it (below) rather than re-computing; hand-touched
+    // recordings are left untouched. Inert until a real `SEGMENTER_VERSION` bump.
+    super::resegment_stale_untouched(&tx)?;
+
     // Silently adopt any published Analysis (ADR 0013) for recordings this scan
-    // left unanalyzed — freshly registered or known-but-queued — so covered files
-    // arrive playable with their draft timeline, skipping the whole probe/segment
-    // pipeline. A no-op outside the shared library.
+    // left unanalyzed — freshly registered, known-but-queued, or just reset for
+    // being stale — so covered files arrive playable with their (best-version)
+    // draft timeline, skipping the whole probe/segment pipeline. A no-op outside
+    // the shared library.
     super::adopt_analyses(&tx)?;
 
     tx.commit()?;
