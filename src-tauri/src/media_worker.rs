@@ -208,7 +208,19 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
             return;
         }
     };
-    let rallies = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
+    let segmentation = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
+    let rallies = segmentation.rallies;
+    // Per-span gate verdicts (ADR 0015 Stage 0): one line per candidate span the
+    // segmenter weighed, so running a bad recording shows which gate ate a rally.
+    // Diagnostic only — the draft above is unaffected.
+    for v in &segmentation.verdicts {
+        log::info!(
+            "media worker: gate verdict {} for span {}-{} ms of {path}",
+            v.verdict.label(),
+            v.start_ms,
+            v.end_ms
+        );
+    }
     // The displayed waveform for the timeline strip (issue #6), reduced from the
     // same samples while we still hold them in memory.
     let waveform = segment::waveform(&samples);

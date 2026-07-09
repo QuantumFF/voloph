@@ -42,6 +42,62 @@ pub struct Rally {
     pub confidence: f64,
 }
 
+/// The gate a candidate span hit during segmentation — the Stage 0 diagnostic of
+/// ADR 0015. Every span the segmenter weighs gets exactly one, so running one bad
+/// recording answers "which gate is eating rallies": a real rally missing from the
+/// draft either died at the motion gate ([`GateVerdict::MotionNeverFired`]) or the
+/// audio gate ([`GateVerdict::RejectedByAudio`]). Observational only — the verdict
+/// never feeds back into the draft, this ticket observes and does not fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateVerdict {
+    /// Motion fired, the span was long enough, and audio confirmed real play — it
+    /// became a rally.
+    Kept,
+    /// Motion fired and the span was long enough, but too few shuttle-hit onsets
+    /// to confirm play — the audio confirmation gate dropped it. The prime suspect
+    /// for missed rallies on noisy footage (ADR 0015).
+    RejectedByAudio,
+    /// A candidate span too brief to be a rally (below [`Params::min_rally_ms`]).
+    TooShort,
+    /// Audio confirmed play here, but the motion envelope never crossed its
+    /// threshold, so the span never entered the rally pass — the motion gate's
+    /// silent counterpart to [`GateVerdict::RejectedByAudio`]. Invisible without this
+    /// instrumentation, since motion is primary.
+    MotionNeverFired,
+}
+
+impl GateVerdict {
+    /// Stable, hyphenated label for the per-span diagnostic log line.
+    pub fn label(self) -> &'static str {
+        match self {
+            GateVerdict::Kept => "kept",
+            GateVerdict::RejectedByAudio => "rejected-by-audio",
+            GateVerdict::TooShort => "too-short",
+            GateVerdict::MotionNeverFired => "motion-never-fired",
+        }
+    }
+}
+
+/// One candidate span and the [`GateVerdict`] the segmenter reached for it, in
+/// milliseconds from the recording start at the raw (unpadded) block boundaries
+/// the segmenter actually saw. Diagnostic output of Stage 0 (ADR 0015).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanVerdict {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub verdict: GateVerdict,
+}
+
+/// The pure segmentation output: the draft rally intervals plus a per-span gate
+/// [`GateVerdict`] for every candidate span the segmenter considered (ADR 0015 Stage
+/// 0). The seam carries the verdicts out so the worker can log them without
+/// reaching into gate internals — no I/O happens inside the seam.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segmentation {
+    pub rallies: Vec<Rally>,
+    pub verdicts: Vec<SpanVerdict>,
+}
+
 /// A per-frame motion track: `energy[i]` is the mean absolute pixel difference
 /// between sampled frame `i+1` and frame `i` (so sample `i` lands at time
 /// `(i + 1) / fps` seconds). Produced by [`crate::media::extract_motion`].
@@ -113,24 +169,31 @@ impl Default for Params {
     }
 }
 
-/// Segment a recording into draft rally intervals from its audio and motion
-/// tracks, using the default tuned parameters (ADR 0006).
-pub fn segment(samples: &[f32], sample_rate: u32, motion: &MotionTrack) -> Vec<Rally> {
+/// Segment a recording into a draft [`Segmentation`] — rally intervals plus the
+/// per-span gate verdicts (ADR 0015 Stage 0) — from its audio and motion tracks,
+/// using the default tuned parameters (ADR 0006).
+pub fn segment(samples: &[f32], sample_rate: u32, motion: &MotionTrack) -> Segmentation {
     segment_with(samples, sample_rate, motion, &Params::default())
 }
 
-/// Segment with explicit parameters. Separated from [`segment`] so tests (and
-/// the human tuning step) can exercise the algorithm at different thresholds.
+/// Segment with explicit parameters. This is the pure seam: signal tracks +
+/// params in, rally intervals and per-span verdicts out, no I/O. Separated from
+/// [`segment`] so tests (and the human tuning step) can exercise the algorithm at
+/// different thresholds. The verdicts are a strictly additional observation over
+/// the old rally-only output — they never alter the draft (ADR 0015 Stage 0).
 pub fn segment_with(
     samples: &[f32],
     sample_rate: u32,
     motion: &MotionTrack,
     p: &Params,
-) -> Vec<Rally> {
+) -> Segmentation {
     let sr = sample_rate as f64;
     let total_ms = (samples.len() as f64 / sr * 1000.0) as i64;
     if samples.len() < p.frame * 2 {
-        return Vec::new();
+        return Segmentation {
+            rallies: Vec::new(),
+            verdicts: Vec::new(),
+        };
     }
 
     // 1. Per-frame audio energy (mean square), non-overlapping frames.
@@ -210,19 +273,7 @@ pub fn segment_with(
         .collect();
 
     // 6. Group consecutive active blocks into runs.
-    let mut runs: Vec<(usize, usize)> = Vec::new(); // [start, end) half-open
-    let mut i = 0;
-    while i < active.len() {
-        if active[i] {
-            let start = i;
-            while i < active.len() && active[i] {
-                i += 1;
-            }
-            runs.push((start, i));
-        } else {
-            i += 1;
-        }
-    }
+    let runs = mask_runs(&active); // [start, end) half-open
 
     // 7. Bridge runs separated by a short gap (inclusion bias). Track active vs
     //    total blocks per merged span so confidence reflects how much was real
@@ -244,22 +295,40 @@ pub fn segment_with(
     // 8. Confirm each span with audio and drop the too-short, then convert to
     //    padded ms intervals. Confidence is the share of the span that was real
     //    movement (bridged downtime lowers it → surfaces as an uncertain region).
+    //    Every span the segmenter weighs here records its gate verdict (ADR 0015
+    //    Stage 0) at the raw block boundaries — kept, or which gate dropped it.
     let min_blocks = (p.min_rally_ms / block_ms.max(1)).max(1) as usize;
     let mut rallies: Vec<Rally> = Vec::new();
+    let mut verdicts: Vec<SpanVerdict> = Vec::new();
     for (start, end, active_blocks) in merged {
         let span_blocks = end - start;
+        let raw_start = start as i64 * block_ms;
+        let raw_end = end as i64 * block_ms;
         if span_blocks < min_blocks {
+            verdicts.push(SpanVerdict {
+                start_ms: raw_start,
+                end_ms: raw_end,
+                verdict: GateVerdict::TooShort,
+            });
             continue;
         }
         let onsets: usize = block_onsets[start..end].iter().sum();
         let span_secs = span_blocks as f64 * block_secs;
         // Audio confirmation: a moving span with too few hits is not a rally.
         if span_secs > 0.0 && (onsets as f64 / span_secs) < p.confirm_onsets_per_sec {
+            verdicts.push(SpanVerdict {
+                start_ms: raw_start,
+                end_ms: raw_end,
+                verdict: GateVerdict::RejectedByAudio,
+            });
             continue;
         }
         let confidence = (active_blocks as f64 / span_blocks as f64).clamp(0.0, 1.0);
-        let raw_start = start as i64 * block_ms;
-        let raw_end = end as i64 * block_ms;
+        verdicts.push(SpanVerdict {
+            start_ms: raw_start,
+            end_ms: raw_end,
+            verdict: GateVerdict::Kept,
+        });
         rallies.push(Rally {
             start_ms: (raw_start - p.pad_ms).max(0),
             end_ms: (raw_end + p.pad_ms).min(total_ms),
@@ -267,8 +336,76 @@ pub fn segment_with(
         });
     }
 
+    // 8b. Motion-never-fired (ADR 0015 Stage 0): audio-confirmed regions the motion
+    //     gate never opened for. Motion is primary, so these never reach the pass
+    //     above and a rally lost to the motion gate would be invisible — this is the
+    //     symmetric counterpart to `rejected-by-audio`. Group the shuttle-hit blocks
+    //     with the same bridging, then flag only spans that are rally-length,
+    //     audio-confirmed, and carry no motion (a span with motion already spoke
+    //     above). Shorter or unconfirmed audio is not a candidate rally.
+    let audio_hot: Vec<bool> = block_onsets.iter().map(|&n| n > 0).collect();
+    let audio_spans = bridge_runs(mask_runs(&audio_hot), bridge_blocks);
+    for (start, end) in audio_spans {
+        let span_blocks = end - start;
+        if span_blocks < min_blocks {
+            continue;
+        }
+        if active[start..end].iter().any(|&a| a) {
+            continue; // motion fired here → already covered by a span above
+        }
+        let onsets: usize = block_onsets[start..end].iter().sum();
+        let span_secs = span_blocks as f64 * block_secs;
+        if span_secs > 0.0 && (onsets as f64 / span_secs) < p.confirm_onsets_per_sec {
+            continue; // audio itself never confirmed play here
+        }
+        verdicts.push(SpanVerdict {
+            start_ms: start as i64 * block_ms,
+            end_ms: end as i64 * block_ms,
+            verdict: GateVerdict::MotionNeverFired,
+        });
+    }
+    verdicts.sort_by_key(|v| v.start_ms);
+
     // 9. Padding can make neighbours overlap; coalesce them.
-    merge_overlaps(rallies)
+    Segmentation {
+        rallies: merge_overlaps(rallies),
+        verdicts,
+    }
+}
+
+/// Merge `[start, end)` runs separated by a gap of at most `bridge_blocks` blocks
+/// into single spans (inclusion bias — a brief lull shouldn't shatter a span).
+/// Runs are assumed ascending and non-overlapping, as [`mask_runs`] produces them.
+fn bridge_runs(runs: Vec<(usize, usize)>, bridge_blocks: usize) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (start, end) in runs {
+        if let Some(last) = spans.last_mut() {
+            if start - last.1 <= bridge_blocks {
+                last.1 = end;
+                continue;
+            }
+        }
+        spans.push((start, end));
+    }
+    spans
+}
+
+/// Group a per-block boolean mask into maximal `[start, end)` runs of `true`.
+fn mask_runs(mask: &[bool]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < mask.len() {
+        if mask[i] {
+            let start = i;
+            while i < mask.len() && mask[i] {
+                i += 1;
+            }
+            runs.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    runs
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -379,7 +516,7 @@ mod tests {
     fn recovers_two_rallies_from_motion_and_audio() {
         let audio = synth_audio(40.0, &[(5.0, 15.0), (22.0, 32.0)], 0.66);
         let motion = synth_motion(40.0, &[(5.0, 15.0), (22.0, 32.0)]);
-        let rallies = segment(&audio, SR, &motion);
+        let rallies = segment(&audio, SR, &motion).rallies;
         assert_eq!(rallies.len(), 2, "expected two rallies, got {rallies:?}");
 
         // Motion edges + padding place the boundaries; inclusion bias means we
@@ -401,7 +538,7 @@ mod tests {
     fn stillness_and_silence_yield_no_rallies() {
         let audio = synth_audio(20.0, &[], 1.0);
         let motion = synth_motion(20.0, &[]);
-        assert!(segment(&audio, SR, &motion).is_empty());
+        assert!(segment(&audio, SR, &motion).rallies.is_empty());
     }
 
     #[test]
@@ -409,7 +546,7 @@ mod tests {
         // Two movement bursts 2 s apart (< 2.5 s bridge) → one rally.
         let audio = synth_audio(30.0, &[(4.0, 10.0), (12.0, 20.0)], 0.6);
         let motion = synth_motion(30.0, &[(4.0, 10.0), (12.0, 20.0)]);
-        let rallies = segment(&audio, SR, &motion);
+        let rallies = segment(&audio, SR, &motion).rallies;
         assert_eq!(rallies.len(), 1, "lull should bridge: {rallies:?}");
         assert!(
             rallies[0].confidence < 1.0,
@@ -423,7 +560,7 @@ mod tests {
         // audio confirmation rejects it. This is the hybrid's key behaviour.
         let audio = synth_audio(20.0, &[], 1.0); // no hits
         let motion = synth_motion(20.0, &[(4.0, 16.0)]);
-        assert!(segment(&audio, SR, &motion).is_empty());
+        assert!(segment(&audio, SR, &motion).rallies.is_empty());
     }
 
     #[test]
@@ -432,7 +569,7 @@ mod tests {
         // bleeding into the audio): motion is primary, so nothing is detected.
         let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
         let motion = synth_motion(20.0, &[]); // still court
-        assert!(segment(&audio, SR, &motion).is_empty());
+        assert!(segment(&audio, SR, &motion).rallies.is_empty());
     }
 
     #[test]
@@ -468,6 +605,104 @@ mod tests {
         // A momentary movement (someone reaching across) is below min_rally_ms.
         let audio = synth_audio(20.0, &[(10.0, 10.3)], 0.1);
         let motion = synth_motion(20.0, &[(10.0, 10.3)]);
-        assert!(segment(&audio, SR, &motion).is_empty());
+        assert!(segment(&audio, SR, &motion).rallies.is_empty());
+    }
+
+    // --- Per-span gate verdicts (ADR 0015 Stage 0) ---------------------------
+    //
+    // Each test drives the same synthetic tracks as the behaviour tests above,
+    // but through the widened seam, and asserts the diagnostic verdict a rally's
+    // fate produces. The seam only observes: every test also confirms the draft
+    // rallies match the un-instrumented behaviour.
+
+    fn verdict_kinds(v: &[SpanVerdict]) -> Vec<GateVerdict> {
+        v.iter().map(|s| s.verdict).collect()
+    }
+
+    #[test]
+    fn each_kept_rally_records_a_kept_verdict() {
+        let audio = synth_audio(40.0, &[(5.0, 15.0), (22.0, 32.0)], 0.66);
+        let motion = synth_motion(40.0, &[(5.0, 15.0), (22.0, 32.0)]);
+        let seg = segment(&audio, SR, &motion);
+        assert_eq!(seg.rallies.len(), 2, "{:?}", seg.rallies);
+        assert_eq!(
+            verdict_kinds(&seg.verdicts),
+            vec![GateVerdict::Kept, GateVerdict::Kept],
+            "two rallies → two kept verdicts: {:?}",
+            seg.verdicts
+        );
+    }
+
+    #[test]
+    fn motion_without_hits_records_rejected_by_audio() {
+        // Whole-court movement but no shuttle hits: the audio confirmation gate
+        // drops it — the prime suspect for missed rallies on noisy footage.
+        let audio = synth_audio(20.0, &[], 1.0);
+        let motion = synth_motion(20.0, &[(4.0, 16.0)]);
+        let seg = segment(&audio, SR, &motion);
+        assert!(seg.rallies.is_empty(), "{:?}", seg.rallies);
+        assert_eq!(
+            verdict_kinds(&seg.verdicts),
+            vec![GateVerdict::RejectedByAudio],
+            "{:?}",
+            seg.verdicts
+        );
+    }
+
+    #[test]
+    fn hits_without_motion_records_motion_never_fired() {
+        // Shuttle-like hits confirming play, but the court never moved (a rally the
+        // motion gate would silently miss). The audio surfaces it as a candidate.
+        let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
+        let motion = synth_motion(20.0, &[]);
+        let seg = segment(&audio, SR, &motion);
+        assert!(seg.rallies.is_empty(), "{:?}", seg.rallies);
+        assert_eq!(
+            verdict_kinds(&seg.verdicts),
+            vec![GateVerdict::MotionNeverFired],
+            "{:?}",
+            seg.verdicts
+        );
+    }
+
+    #[test]
+    fn a_sub_threshold_run_records_too_short() {
+        // A momentary burst with hits: a motion run forms and audio is present,
+        // but it is below min_rally_ms, so the length gate drops it.
+        let audio = synth_audio(20.0, &[(10.0, 10.3)], 0.1);
+        let motion = synth_motion(20.0, &[(10.0, 10.3)]);
+        let seg = segment(&audio, SR, &motion);
+        assert!(seg.rallies.is_empty(), "{:?}", seg.rallies);
+        assert_eq!(
+            verdict_kinds(&seg.verdicts),
+            vec![GateVerdict::TooShort],
+            "{:?}",
+            seg.verdicts
+        );
+    }
+
+    #[test]
+    fn stillness_and_silence_yield_no_verdicts() {
+        let audio = synth_audio(20.0, &[], 1.0);
+        let motion = synth_motion(20.0, &[]);
+        let seg = segment(&audio, SR, &motion);
+        assert!(seg.rallies.is_empty());
+        assert!(seg.verdicts.is_empty(), "{:?}", seg.verdicts);
+    }
+
+    #[test]
+    fn verdict_span_times_are_the_raw_unpadded_boundaries() {
+        // A kept span's verdict reports the block boundaries the segmenter saw,
+        // not the padded rally interval — the honest view for diagnosis.
+        let audio = synth_audio(40.0, &[(5.0, 15.0)], 0.66);
+        let motion = synth_motion(40.0, &[(5.0, 15.0)]);
+        let seg = segment(&audio, SR, &motion);
+        assert_eq!(seg.verdicts.len(), 1, "{:?}", seg.verdicts);
+        let span = &seg.verdicts[0];
+        assert_eq!(span.verdict, GateVerdict::Kept);
+        let rally = &seg.rallies[0];
+        // Padding widens the rally past the raw span on both edges.
+        assert!(rally.start_ms <= span.start_ms, "{seg:?}");
+        assert!(rally.end_ms >= span.end_ms, "{seg:?}");
     }
 }
