@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react"
+import { listen } from "@tauri-apps/api/event"
 import { open, save } from "@tauri-apps/plugin-dialog"
 
 import { trackedInvoke } from "@/lib/tauri"
 
+import {
+  remainingByRecording as deriveRemaining,
+  type AnalysisProgress,
+} from "./analysis-progress"
 import { isProcessing } from "./recording-state"
 import type {
   Browsing,
@@ -302,6 +307,32 @@ export function useSessionList(rescanOnMount: boolean) {
     return () => clearInterval(interval)
   }, [stillWorking, refresh])
 
+  // Live analysis-time estimate (issue #81, spec #75 user story #13). The media
+  // worker emits `analysis:progress` as it decodes each recording; we keep the
+  // latest tick per recording and turn it into a remaining-ms estimate the row
+  // renders. One listener for the list's lifetime — a recording's analysis
+  // outlives any single poll. A ready/failed recording drops out of the map on
+  // the next refresh (it is no longer processing), so stale ticks never linger.
+  const [progress, setProgress] = useState<Map<number, AnalysisProgress>>(
+    new Map()
+  )
+  useEffect(() => {
+    const unlisten = listen<AnalysisProgress>("analysis:progress", (e) =>
+      setProgress((prev) => new Map(prev).set(e.payload.recording_id, e.payload))
+    )
+    return () => {
+      void unlisten.then((off) => off())
+    }
+  }, [])
+  // Only recordings still analyzing carry an estimate; keying on ids keeps the
+  // map from growing unbounded across a long session of imports.
+  const analyzing = new Set(
+    sessions.flatMap((s) =>
+      s.recordings.filter((r) => isProcessing(r)).map((r) => r.id)
+    )
+  )
+  const remainingByRecording = deriveRemaining(analyzing, progress)
+
   // Designate (or re-designate) a library of `kind` ("local" | "shared") with the
   // folder where it is mounted here and its declared `mount` locality ("local" |
   // "network"; ADR 0011). Adopts every known recording of this kind under it to
@@ -537,6 +568,7 @@ export function useSessionList(rescanOnMount: boolean) {
     setBrowsing,
     library,
     carryByPath,
+    remainingByRecording,
     handleCarry,
     handleDismiss,
     handleReceiveOffer,

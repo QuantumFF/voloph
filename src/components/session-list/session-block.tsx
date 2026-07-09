@@ -25,6 +25,7 @@ import {
 import { fileName, formatSize } from "@/lib/format"
 import { formatCaptureDay } from "@/lib/utils"
 
+import { formatEta } from "./analysis-progress"
 import {
   isAnalyzing,
   isPreparing,
@@ -39,6 +40,7 @@ function RecordingRow({
   recording,
   recordingIndex,
   carryOffer,
+  remainingMs,
   onPlay,
   onCarry,
   onDismissCarry,
@@ -48,6 +50,8 @@ function RecordingRow({
   recording: Recording
   recordingIndex: number
   carryOffer: CarryOffer | undefined
+  /** Estimated analysis time left for this recording, if being analyzed (#81). */
+  remainingMs: number | undefined
   onPlay: (
     recordings: { path: string }[],
     startIndex: number,
@@ -88,11 +92,17 @@ function RecordingRow({
           </span>
         ) : isAnalyzing(recording) ? (
           <span
-            className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground"
+            className="ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground tabular-nums"
             title="Detecting rallies in this recording…"
           >
             <Loader2Icon className="size-3.5 animate-spin" />
             Analyzing…
+            {/* A live remaining-time estimate once the pass has measured its
+                pace (#81). Absent until the first ticks arrive, so the label
+                simply reads "Analyzing…" for the first moment. */}
+            {remainingMs != null ? (
+              <span className="text-xs">{formatEta(remainingMs)}</span>
+            ) : null}
           </span>
         ) : (
           <span className="ml-auto flex shrink-0 items-center gap-3 text-muted-foreground tabular-nums">
@@ -177,6 +187,7 @@ export function SessionBlock({
   session,
   active,
   carryByPath,
+  remainingByRecording,
   onPlay,
   onBrowseBundles,
   onShare,
@@ -187,6 +198,8 @@ export function SessionBlock({
   session: Session
   active: string
   carryByPath: Map<string, CarryOffer>
+  /** Per-recording analysis-time estimate (ms left), keyed by recording id (#81). */
+  remainingByRecording: Map<number, number>
   onPlay: (
     recordings: { path: string }[],
     startIndex: number,
@@ -280,6 +293,7 @@ export function SessionBlock({
             recording={recording}
             recordingIndex={recordingIndex}
             carryOffer={carryByPath.get(recording.path)}
+            remainingMs={remainingByRecording.get(recording.id)}
             onPlay={onPlay}
             onCarry={onCarry}
             onDismissCarry={onDismissCarry}

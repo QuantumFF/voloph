@@ -8,11 +8,33 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rusqlite::Connection;
-use tauri::{AppHandle, Manager};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{db, media, segment, staging};
+
+/// Tauri event carrying how far a recording's background analysis has progressed
+/// (issue #81, spec #75 user story #13), so the session list can show a
+/// remaining-time estimate on the "Analyzing…" row. Emitted repeatedly as the
+/// pass decodes the recording, then once more at completion.
+pub const EVENT_ANALYSIS_PROGRESS: &str = "analysis:progress";
+
+/// One `analysis:progress` tick: how much of recording `recording_id`'s footage
+/// the current pass has processed (`processed_ms`) out of its total
+/// (`total_ms`), and how long the pass has been running (`elapsed_ms`). The
+/// frontend turns processed-vs-total, paced by elapsed wall time, into a live
+/// estimate — no rate is hardcoded anywhere. `total_ms` is `None` when the
+/// recording's duration could not be probed; the UI then shows a bare spinner.
+#[derive(Clone, Serialize)]
+struct AnalysisProgress {
+    recording_id: i64,
+    processed_ms: i64,
+    total_ms: Option<i64>,
+    elapsed_ms: i64,
+}
 
 /// The single SQLite metadata connection. An `Arc` so the background media
 /// worker can share it with the Tauri commands.
@@ -45,8 +67,9 @@ pub(crate) fn spawn_media_worker(app: &AppHandle) {
 
     let conn = app.state::<Db>().0.clone();
     let staging_dir = app.state::<StagingDir>().0.clone();
+    let app = app.clone();
     std::thread::spawn(move || {
-        run_media_worker(&conn, &staging_dir);
+        run_media_worker(&app, &conn, &staging_dir);
         running.store(false, Ordering::SeqCst);
     });
 }
@@ -60,7 +83,7 @@ pub(crate) fn spawn_media_worker(app: &AppHandle) {
 /// copied once into `staging_dir`, analyzed locally, then evicted. The
 /// capture-date phase always streams — it reads only container headers, so
 /// staging would not save a network crossing.
-fn run_media_worker(conn: &Mutex<Connection>, staging_dir: &std::path::Path) {
+fn run_media_worker(app: &AppHandle, conn: &Mutex<Connection>, staging_dir: &std::path::Path) {
     loop {
         let work = match conn.lock() {
             Ok(c) => db::next_media_work(&c),
@@ -85,13 +108,15 @@ fn run_media_worker(conn: &Mutex<Connection>, staging_dir: &std::path::Path) {
                     // Stage the whole pending batch once (copy-ahead overlaps the
                     // next copy with the current analysis), then loop to pick up
                     // any capture-date work or newly-arrived recordings.
-                    run_staged_analysis(conn, staging_dir);
+                    run_staged_analysis(app, conn, staging_dir);
                 } else {
                     match work {
                         db::MediaWork::Probe(id, path) => {
                             probe_recording(conn, id, &path);
                         }
-                        db::MediaWork::Segment(id, path) => segment_recording(conn, id, &path),
+                        db::MediaWork::Segment(id, path) => {
+                            segment_recording(app, conn, id, &path)
+                        }
                         db::MediaWork::CaptureDate(..) => unreachable!(),
                     }
                 }
@@ -114,7 +139,7 @@ fn is_network_mount(conn: &Mutex<Connection>) -> bool {
 /// probe/segment phases against the local copy, and evict it (ADR 0011). Copy-
 /// ahead stages the next recording while the current one is analyzed. Returns
 /// after one pass over the snapshot; the caller loops to catch new work.
-fn run_staged_analysis(conn: &Mutex<Connection>, staging_dir: &std::path::Path) {
+fn run_staged_analysis(app: &AppHandle, conn: &Mutex<Connection>, staging_dir: &std::path::Path) {
     let pending = match conn.lock() {
         Ok(c) => db::pending_analysis(&c).unwrap_or_default(),
         Err(e) => {
@@ -159,7 +184,7 @@ fn run_staged_analysis(conn: &Mutex<Connection>, staging_dir: &std::path::Path) 
             true
         };
         if item.needs_segment && probe_ok {
-            segment_recording(conn, item.id, &local);
+            segment_recording(app, conn, item.id, &local);
         }
         // `staged` drops here → the copy is evicted before the next iteration.
     }
@@ -188,7 +213,12 @@ fn probe_recording(conn: &Mutex<Connection>, id: i64, path: &str) -> &'static st
 /// Extract the recording's audio and motion tracks and run the hybrid segmenter
 /// (ADR 0006), persisting the draft timeline. The slow extraction + segmentation
 /// happen unlocked; only the final persist (and the failure mark) takes the lock.
-fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
+fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &str) {
+    // The recording's total duration paces the remaining-time estimate (issue
+    // #81): each progress tick reports footage decoded so far out of this total.
+    // A missing duration is non-fatal — the estimate just does not show.
+    let total_ms = media::probe_duration_ms(path);
+
     let samples = match media::extract_pcm(path) {
         Ok(s) => s,
         Err(e) => {
@@ -197,7 +227,19 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
             return;
         }
     };
-    let motion = match media::extract_motion(path) {
+    // Motion extraction is the long pole of analysis; report footage decoded as
+    // frames stream in, throttled to avoid flooding the frontend with events. The
+    // wall clock starts here, at the phase the ticks measure, so the frontend's
+    // speed = processed ÷ elapsed is a clean ratio rather than one skewed by the
+    // (untracked) audio-extraction time that ran first.
+    let started = Instant::now();
+    let mut last_emit = Instant::now();
+    let motion = match media::extract_motion(path, |processed_ms| {
+        if last_emit.elapsed().as_millis() >= 500 {
+            last_emit = Instant::now();
+            emit_progress(app, id, processed_ms, total_ms, &started);
+        }
+    }) {
         Ok(energy) => segment::MotionTrack {
             fps: f64::from(media::MOTION_FPS),
             energy,
@@ -225,6 +267,11 @@ fn segment_recording(conn: &Mutex<Connection>, id: i64, path: &str) {
     // same samples while we still hold them in memory.
     let waveform = segment::waveform(&samples);
     let duration_ms = (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
+    // Final tick: the pass is done, so processed == total. The waveform-derived
+    // duration is the authoritative length, so report it as both (the container
+    // probe can be slightly off). The UI clears the estimate once the row flips
+    // to `ready` on its next poll; this just avoids a stale mid-pass number.
+    emit_progress(app, id, duration_ms, Some(duration_ms), &started);
     log::info!(
         "media worker: segmented {path} into {} rallies ({duration_ms} ms)",
         rallies.len()
@@ -259,6 +306,27 @@ fn refine_recording_date(conn: &Mutex<Connection>, id: i64, path: &str) {
         }
         Err(e) => log::error!("media worker: db lock poisoned refining date for {path}: {e}"),
     }
+}
+
+/// Push one [`EVENT_ANALYSIS_PROGRESS`] tick to the frontend (issue #81). Fire-
+/// and-forget: a dropped tick only means one skipped UI update, and the next
+/// tick (or the row flipping to `ready`) corrects it.
+fn emit_progress(
+    app: &AppHandle,
+    recording_id: i64,
+    processed_ms: i64,
+    total_ms: Option<i64>,
+    started: &Instant,
+) {
+    let _ = app.emit(
+        EVENT_ANALYSIS_PROGRESS,
+        AnalysisProgress {
+            recording_id,
+            processed_ms,
+            total_ms,
+            elapsed_ms: started.elapsed().as_millis() as i64,
+        },
+    );
 }
 
 /// Update a recording's segmentation state under a brief lock, logging on failure.
