@@ -103,6 +103,35 @@ pub struct DetectionTrack {
     pub samples: Vec<Vec<Box>>,
 }
 
+impl DetectionTrack {
+    /// Convert to the pure [`crate::segment::OccupancyTrack`] the segmentation seam
+    /// consumes (issue #84). Drops the detector score — a box reaching this track
+    /// already cleared thresholding, and fusion reasons about *where* people are, not
+    /// the detector's confidence — and widens the coordinates to `f64` so the pure
+    /// seam carries no `f32`/`ort` residue. This is the one crossing from the
+    /// detector's world into the segmenter's.
+    pub fn to_occupancy_track(&self) -> crate::segment::OccupancyTrack {
+        crate::segment::OccupancyTrack {
+            fps: self.fps,
+            samples: self
+                .samples
+                .iter()
+                .map(|frame| {
+                    frame
+                        .iter()
+                        .map(|b| crate::segment::DetBox {
+                            x: f64::from(b.x),
+                            y: f64::from(b.y),
+                            w: f64::from(b.w),
+                            h: f64::from(b.h),
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A loaded detector: the ONNX Runtime session plus the resolved input tensor name.
 /// Building one probes the execution providers (GPU where present, else CPU); running
 /// inference is [`Detector::infer`].

@@ -250,17 +250,23 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
             return;
         }
     };
-    let segmentation = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
+    // Occupancy detection extraction (ADR 0015 Stage 2, issue #84): compute the
+    // per-recording person-detection track alongside motion so occupancy can *propose*
+    // candidate play spans in fusion below. Load the nano detector (GPU probed, silent
+    // CPU fallback), run it over the recording, and hand the pure track to the seam.
+    //
+    // Degradation (the zero-miss bar, ADR 0015): any failure — model missing, ort init,
+    // ffmpeg, inference — is logged and swallowed, yielding `None`. The seam then falls
+    // back to motion-proposes (pre-#84 behavior); a failed detector must never turn into
+    // deleted play, so analysis still completes with a full draft timeline.
+    let occupancy = extract_occupancy_track(path);
+    let segmentation = segment::segment(
+        &samples,
+        media::SEGMENT_SAMPLE_RATE,
+        &motion,
+        occupancy.as_ref(),
+    );
     let rallies = segmentation.rallies;
-
-    // Occupancy detection extraction (ADR 0015 Stage 2, issue #83): compute the
-    // per-recording person-detection track alongside motion. It feeds nothing today —
-    // fusion is issue #84 — so this is diagnostic only: load the nano detector (GPU
-    // probed, silent CPU fallback), run it over the recording, and log a one-line
-    // summary of what it saw. Any failure (model missing, ffmpeg, inference) is logged
-    // and swallowed: the draft timeline above is already complete and must not fail
-    // because a not-yet-wired signal could not be produced.
-    extract_detection_track(path);
     // Per-span gate verdicts (ADR 0015 Stage 0): one line per candidate span the
     // segmenter weighed, so running a bad recording shows which gate ate a rally.
     // Diagnostic only — the draft above is unaffected.
@@ -301,25 +307,28 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
     }
 }
 
-/// Compute and log the occupancy detection track for a recording (ADR 0015 Stage 2,
-/// issue #83) as a diagnostic side pass. Loads the vendored nano detector (probing a
-/// GPU, falling back to CPU silently), runs it over the recording, and logs the total
-/// person boxes plus the peak simultaneous count — enough to confirm the track exists
-/// and is sane in the app log without any UI. Never affects the draft timeline: every
-/// failure path only logs, since the occupancy signal is not yet wired to fusion.
-fn extract_detection_track(path: &str) {
+/// Compute the occupancy detection track for a recording (ADR 0015 Stage 2, issue #84)
+/// and hand back the pure [`segment::OccupancyTrack`] fusion consumes. Loads the
+/// vendored nano detector (probing a GPU, falling back to CPU silently), runs it over
+/// the recording, converts, and logs a one-line summary of what it saw.
+///
+/// Returns `None` on **every** failure path — no vendored model, ort init failure,
+/// ffmpeg or inference error. This is the graceful degradation the zero-miss bar (ADR
+/// 0015) demands: the segmenter falls back to motion-proposes when occupancy is
+/// `None`, so a detector that cannot load or run costs precision, never a rally.
+fn extract_occupancy_track(path: &str) -> Option<segment::OccupancyTrack> {
     let model_path = match detect::vendored_model_path() {
         Ok(p) => p,
         Err(e) => {
-            log::warn!("media worker: detector model unavailable, skipping occupancy: {e}");
-            return;
+            log::warn!("media worker: detector model unavailable, occupancy disabled: {e}");
+            return None;
         }
     };
     let mut detector = match detect::Detector::load(&model_path) {
         Ok(d) => d,
         Err(e) => {
-            log::warn!("media worker: detector failed to load, skipping occupancy: {e}");
-            return;
+            log::warn!("media worker: detector failed to load, occupancy disabled: {e}");
+            return None;
         }
     };
     let started = Instant::now();
@@ -334,8 +343,12 @@ fn extract_detection_track(path: &str) {
                 track.fps,
                 started.elapsed().as_millis(),
             );
+            Some(track.to_occupancy_track())
         }
-        Err(e) => log::warn!("media worker: occupancy extraction failed for {path}: {e}"),
+        Err(e) => {
+            log::warn!("media worker: occupancy extraction failed for {path}, disabled: {e}");
+            None
+        }
     }
 }
 

@@ -383,7 +383,17 @@ fn rerun_segmenter(abs_path: &str) -> Result<(Vec<Interval>, i64), String> {
         fps: f64::from(media::MOTION_FPS),
         energy,
     };
-    let seg = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
+    // The harness re-runs the exact production fusion (ADR 0015): occupancy proposes
+    // when the detector is available, else motion-proposes. A detector that cannot
+    // load/run (missing model, ort init failure) yields no occupancy track — analysis
+    // still completes and no rally is lost (the zero-miss bar).
+    let occupancy = extract_occupancy(abs_path);
+    let seg = segment::segment(
+        &samples,
+        media::SEGMENT_SAMPLE_RATE,
+        &motion,
+        occupancy.as_ref(),
+    );
     let draft = seg
         .rallies
         .into_iter()
@@ -394,6 +404,36 @@ fn rerun_segmenter(abs_path: &str) -> Result<(Vec<Interval>, i64), String> {
         .collect();
     let duration_ms = (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
     Ok((draft, duration_ms))
+}
+
+/// Run the occupancy detector over a recording and return the pure track for fusion,
+/// or `None` if the detector is unavailable for any reason (no vendored model, ort
+/// init failure, ffmpeg/inference error). The harness must still score a draft when
+/// the detector cannot run — the same graceful degradation the media worker uses
+/// (ADR 0015: a failed detector never loses a rally). Failures are printed, not
+/// fatal, so the harness numbers reflect the motion-proposes fallback honestly.
+fn extract_occupancy(abs_path: &str) -> Option<segment::OccupancyTrack> {
+    let model_path = match crate::detect::vendored_model_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("      (occupancy disabled — model unavailable: {e})");
+            return None;
+        }
+    };
+    let mut detector = match crate::detect::Detector::load(&model_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("      (occupancy disabled — detector load failed: {e})");
+            return None;
+        }
+    };
+    match crate::detect::extract_detections(abs_path, &mut detector, |_| {}) {
+        Ok(track) => Some(track.to_occupancy_track()),
+        Err(e) => {
+            eprintln!("      (occupancy disabled — extraction failed: {e})");
+            None
+        }
+    }
 }
 
 /// One recording's line block: the headline path, then the three numbers with the
