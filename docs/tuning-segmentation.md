@@ -53,7 +53,7 @@ only to move spans between "confident" and "uncertain".
 
 | Symptom | Knob (default) | Direction |
 | --- | --- | --- |
-| Misses rallies; edges start late / end early | `motion_active_ratio` (1.4) | ↓ lower |
+| Misses rallies; edges start late / end early | `motion_active_ratio` (1.1) | ↓ lower — but keep it **above 1.0**: at ≤ 1.0 a flat, no-play recording reads as one giant rally (the threshold falls to the clip's own mean) |
 | Gaps (players milling, walking to net) detected as play | `motion_active_ratio` | ↑ raise |
 | Boundaries feel coarse (≈0.5 s steps) | `block_ms` (500) | ↓ lower (costs CPU) |
 
@@ -86,10 +86,10 @@ which is exactly why audio now only nudges confidence and never deletes.
 
 | Symptom | Knob (default) | Direction |
 | --- | --- | --- |
-| One rally shattered into fragments | `bridge_gap_ms` (2500) | ↑ raise |
+| One rally shattered into fragments | `bridge_gap_ms` (2900) | ↑ raise |
 | A rally and the downtime after it fused into one | `bridge_gap_ms` | ↓ lower |
-| Serve or final shot clipped off | `pad_ms` (600) | ↑ raise |
-| Brief movements become "rallies" | `min_rally_ms` (2000) | ↑ raise |
+| Serve or final shot clipped off | `pad_ms` (1200) | ↑ raise |
+| Brief movements become "rallies" | `min_rally_ms` (1500) | ↑ raise — effective in whole `block_ms`-grid steps (~512 ms): values that truncate to a single block let any one flickering block through |
 
 The "uncertain" amber styling is controlled separately by `UNCERTAIN_CONFIDENCE`
 (0.5) in

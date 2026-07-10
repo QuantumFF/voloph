@@ -33,7 +33,7 @@
 /// The segmenter's identity, stamped into a published Analysis (ADR 0013) so a
 /// future, meaningfully better segmenter can spot stale Analyses. Ignored today;
 /// bump on a change that materially alters the draft timeline it produces.
-pub const SEGMENTER_VERSION: u32 = 2;
+pub const SEGMENTER_VERSION: u32 = 3;
 
 /// A detected rally interval over a recording, in milliseconds from its start,
 /// carrying a per-region confidence in `[0, 1]`. Low-confidence rallies surface
@@ -176,12 +176,12 @@ impl Default for Params {
             baseline_ms: 1000,
             onset_ratio: 2.2,
             onset_floor_ratio: 0.75,
-            motion_active_ratio: 1.2,
+            motion_active_ratio: 1.1,
             confirm_onsets_per_sec: 0.2,
             unconfirmed_confidence: 0.3,
             block_ms: 500,
             bridge_gap_ms: 2900,
-            min_rally_ms: 2000,
+            min_rally_ms: 1500,
             pad_ms: 1200,
         }
     }
