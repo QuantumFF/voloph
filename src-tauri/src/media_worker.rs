@@ -312,44 +312,25 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
 /// vendored nano detector (probing a GPU, falling back to CPU silently), runs it over
 /// the recording, converts, and logs a one-line summary of what it saw.
 ///
-/// Returns `None` on **every** failure path — no vendored model, ort init failure,
-/// ffmpeg or inference error. This is the graceful degradation the zero-miss bar (ADR
-/// 0015) demands: the segmenter falls back to motion-proposes when occupancy is
-/// `None`, so a detector that cannot load or run costs precision, never a rally.
+/// Returns `None` on **every** failure path — the shared degradation policy in
+/// [`detect::detections_or_none`]: the segmenter falls back to motion-proposes when
+/// occupancy is `None`, so a detector that cannot load or run costs precision,
+/// never a rally (ADR 0015).
 fn extract_occupancy_track(path: &str) -> Option<segment::OccupancyTrack> {
-    let model_path = match detect::vendored_model_path() {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("media worker: detector model unavailable, occupancy disabled: {e}");
-            return None;
-        }
-    };
-    let mut detector = match detect::Detector::load(&model_path) {
-        Ok(d) => d,
-        Err(e) => {
-            log::warn!("media worker: detector failed to load, occupancy disabled: {e}");
-            return None;
-        }
-    };
     let started = Instant::now();
-    match detect::extract_detections(path, &mut detector, |_| {}) {
-        Ok(track) => {
-            let total: usize = track.samples.iter().map(Vec::len).sum();
-            let peak = track.samples.iter().map(Vec::len).max().unwrap_or(0);
-            log::info!(
-                "media worker: occupancy track for {path} — {} samples @ {} fps, \
-                 {total} person boxes, peak {peak} simultaneous ({} ms)",
-                track.samples.len(),
-                track.fps,
-                started.elapsed().as_millis(),
-            );
-            Some(track.to_occupancy_track())
-        }
-        Err(e) => {
-            log::warn!("media worker: occupancy extraction failed for {path}, disabled: {e}");
-            None
-        }
-    }
+    let track = detect::detections_or_none(path, |why| {
+        log::warn!("media worker: occupancy disabled for {path}: {why}");
+    })?;
+    let total: usize = track.samples.iter().map(Vec::len).sum();
+    let peak = track.samples.iter().map(Vec::len).max().unwrap_or(0);
+    log::info!(
+        "media worker: occupancy track for {path} — {} samples @ {} fps, \
+         {total} person boxes, peak {peak} simultaneous ({} ms)",
+        track.samples.len(),
+        track.fps,
+        started.elapsed().as_millis(),
+    );
+    Some(track.to_occupancy_track())
 }
 
 /// Read a recording's embedded capture date with ffprobe and re-home its session

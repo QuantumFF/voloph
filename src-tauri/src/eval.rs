@@ -407,33 +407,15 @@ fn rerun_segmenter(abs_path: &str) -> Result<(Vec<Interval>, i64), String> {
 }
 
 /// Run the occupancy detector over a recording and return the pure track for fusion,
-/// or `None` if the detector is unavailable for any reason (no vendored model, ort
-/// init failure, ffmpeg/inference error). The harness must still score a draft when
-/// the detector cannot run — the same graceful degradation the media worker uses
-/// (ADR 0015: a failed detector never loses a rally). Failures are printed, not
-/// fatal, so the harness numbers reflect the motion-proposes fallback honestly.
+/// or `None` if the detector is unavailable for any reason (the shared degradation
+/// policy in [`crate::detect::detections_or_none`]). The harness must still score a
+/// draft when the detector cannot run — failures are printed, not fatal, so the
+/// harness numbers reflect the motion-proposes fallback honestly.
 fn extract_occupancy(abs_path: &str) -> Option<segment::OccupancyTrack> {
-    let model_path = match crate::detect::vendored_model_path() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("      (occupancy disabled — model unavailable: {e})");
-            return None;
-        }
-    };
-    let mut detector = match crate::detect::Detector::load(&model_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("      (occupancy disabled — detector load failed: {e})");
-            return None;
-        }
-    };
-    match crate::detect::extract_detections(abs_path, &mut detector, |_| {}) {
-        Ok(track) => Some(track.to_occupancy_track()),
-        Err(e) => {
-            eprintln!("      (occupancy disabled — extraction failed: {e})");
-            None
-        }
-    }
+    crate::detect::detections_or_none(abs_path, |why| {
+        eprintln!("      (occupancy disabled — {why})");
+    })
+    .map(|track| track.to_occupancy_track())
 }
 
 /// One recording's line block: the headline path, then the three numbers with the

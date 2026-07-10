@@ -440,8 +440,8 @@ fn probe_dimensions(path: &str) -> Option<(u32, u32)> {
 /// letterboxed `MODEL_SIZE` BGR frames from the ffmpeg sidecar at [`DETECT_FPS`], run
 /// the detector on each, and collect the person boxes in source-normalized coordinates.
 /// Parallel to [`crate::media::extract_motion`] and living entirely outside the pure
-/// segmentation seam (ADR 0015) — it produces the occupancy raw material without
-/// feeding it anywhere yet (fusion is issue #84).
+/// segmentation seam (ADR 0015) — it produces the occupancy raw material that fusion
+/// consumes via [`DetectionTrack::to_occupancy_track`].
 ///
 /// `on_progress` reports the footage position in ms as each frame is processed, so a
 /// caller can pace an estimate exactly as motion extraction does. `detector` is loaded
@@ -511,6 +511,36 @@ pub fn extract_detections(
         fps: f64::from(DETECT_FPS),
         samples,
     })
+}
+
+/// Load the vendored detector and run it over one recording, degrading to `None` on
+/// **every** failure path — no vendored model, ort init failure, ffmpeg or inference
+/// error. This is the one load-run-degrade policy the zero-miss bar (ADR 0015) demands
+/// of every occupancy consumer: fusion falls back to motion-proposes on `None`, so a
+/// detector that cannot load or run costs precision, never a rally. Each failure is
+/// reported once through `on_fail` in the caller's own log sink.
+pub fn detections_or_none(path: &str, on_fail: impl Fn(&str)) -> Option<DetectionTrack> {
+    let model_path = match vendored_model_path() {
+        Ok(p) => p,
+        Err(e) => {
+            on_fail(&format!("model unavailable: {e}"));
+            return None;
+        }
+    };
+    let mut detector = match Detector::load(&model_path) {
+        Ok(d) => d,
+        Err(e) => {
+            on_fail(&format!("detector load failed: {e}"));
+            return None;
+        }
+    };
+    match extract_detections(path, &mut detector, |_| {}) {
+        Ok(track) => Some(track),
+        Err(e) => {
+            on_fail(&format!("extraction failed: {e}"));
+            None
+        }
+    }
 }
 
 // ── `detect-dump` dev CLI shell ─────────────────────────────────────────────────
