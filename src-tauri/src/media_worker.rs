@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::{db, media, segment, staging};
+use crate::{db, detect, media, segment, staging};
 
 /// Tauri event carrying how far a recording's background analysis has progressed
 /// (issue #81, spec #75 user story #13), so the session list can show a
@@ -252,6 +252,15 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
     };
     let segmentation = segment::segment(&samples, media::SEGMENT_SAMPLE_RATE, &motion);
     let rallies = segmentation.rallies;
+
+    // Occupancy detection extraction (ADR 0015 Stage 2, issue #83): compute the
+    // per-recording person-detection track alongside motion. It feeds nothing today —
+    // fusion is issue #84 — so this is diagnostic only: load the nano detector (GPU
+    // probed, silent CPU fallback), run it over the recording, and log a one-line
+    // summary of what it saw. Any failure (model missing, ffmpeg, inference) is logged
+    // and swallowed: the draft timeline above is already complete and must not fail
+    // because a not-yet-wired signal could not be produced.
+    extract_detection_track(path);
     // Per-span gate verdicts (ADR 0015 Stage 0): one line per candidate span the
     // segmenter weighed, so running a bad recording shows which gate ate a rally.
     // Diagnostic only — the draft above is unaffected.
@@ -289,6 +298,44 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
             }
         }
         Err(e) => log::error!("media worker: db lock poisoned saving {path}: {e}"),
+    }
+}
+
+/// Compute and log the occupancy detection track for a recording (ADR 0015 Stage 2,
+/// issue #83) as a diagnostic side pass. Loads the vendored nano detector (probing a
+/// GPU, falling back to CPU silently), runs it over the recording, and logs the total
+/// person boxes plus the peak simultaneous count — enough to confirm the track exists
+/// and is sane in the app log without any UI. Never affects the draft timeline: every
+/// failure path only logs, since the occupancy signal is not yet wired to fusion.
+fn extract_detection_track(path: &str) {
+    let model_path = match detect::vendored_model_path() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("media worker: detector model unavailable, skipping occupancy: {e}");
+            return;
+        }
+    };
+    let mut detector = match detect::Detector::load(&model_path) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("media worker: detector failed to load, skipping occupancy: {e}");
+            return;
+        }
+    };
+    let started = Instant::now();
+    match detect::extract_detections(path, &mut detector, |_| {}) {
+        Ok(track) => {
+            let total: usize = track.samples.iter().map(Vec::len).sum();
+            let peak = track.samples.iter().map(Vec::len).max().unwrap_or(0);
+            log::info!(
+                "media worker: occupancy track for {path} — {} samples @ {} fps, \
+                 {total} person boxes, peak {peak} simultaneous ({} ms)",
+                track.samples.len(),
+                track.fps,
+                started.elapsed().as_millis(),
+            );
+        }
+        Err(e) => log::warn!("media worker: occupancy extraction failed for {path}: {e}"),
     }
 }
 

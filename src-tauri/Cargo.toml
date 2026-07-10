@@ -24,6 +24,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "eval-harness"
 path = "src/bin/eval-harness.rs"
 
+# The detection dump (ADR 0015 Stage 2, issue #83): a dev CLI that runs the occupancy
+# detector on one recording and prints its per-sample box track. Reuses the app's DB,
+# media, and detect code via the lib.
+[[bin]]
+name = "detect-dump"
+path = "src/bin/detect-dump.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -41,6 +48,13 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 walkdir = "2"
+# Occupancy detector inference (ADR 0015 Stage 2, issue #83): the nano person
+# detector (YOLOX-nano ONNX) runs through ONNX Runtime via `ort`. `download-binaries`
+# fetches a prebuilt ONNX Runtime so no system install is needed. GPU execution
+# providers are enabled as *build* features per-OS below; at runtime ort probes for
+# the hardware and silently falls back to CPU when none is present (identical output,
+# only wall-clock differs — no user choice). Probing an unavailable EP is a no-op.
+ort = "=2.0.0-rc.10"
 
 
 [profile.dev]
@@ -61,6 +75,10 @@ strip = true      # Ensures debug symbols are removed.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 glib = "0.18"
+# CUDA execution provider for the occupancy detector (issue #83). A build-time
+# feature only: it lets ort *probe* for an NVIDIA GPU at runtime; with none present
+# ort falls back to CPU silently, so this never becomes a runtime requirement.
+ort = { version = "=2.0.0-rc.10", features = ["cuda"] }
 
 # Embedded libmpv playback on Windows (ADR 0014): the same client API, linked
 # from libmpv-2.dll via `raw-dylib` (no import library) and rendered by mpv
@@ -74,6 +92,10 @@ windows-sys = { version = "0.60", features = [
   "Win32_UI_HiDpi",
 ] }
 raw-window-handle = "0.6"
+# DirectML execution provider for the occupancy detector (issue #83). Build-time
+# feature only: ort probes for a DirectX 12 GPU at runtime and falls back to CPU
+# silently when none is usable, so it never becomes a runtime requirement.
+ort = { version = "=2.0.0-rc.10", features = ["directml"] }
 
 # Vendored wry 0.55.1 with one patch (see ADR 0009): IPC custom-protocol
 # responses are delivered at glib DEFAULT priority instead of DEFAULT_IDLE,

@@ -1,4 +1,8 @@
 mod db;
+/// Occupancy detection extraction (ADR 0015 Stage 2, issue #83): the nano person
+/// detector behind the sidecar. Public so the `detect-dump` dev CLI can drive it.
+/// Feeds nothing yet — fusion is issue #84.
+pub mod detect;
 /// The eval harness (ADR 0015): a dev CLI that referees the segmenter against
 /// hand-corrected timelines. Public so the `eval-harness` bin can drive it.
 pub mod eval;
