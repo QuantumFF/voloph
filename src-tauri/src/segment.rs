@@ -358,46 +358,17 @@ pub fn segment_with(
     }
 
     // 3. Block grid (from the audio frames). Per block, count onsets.
-    let frames_per_block = ((p.block_ms as f64) / frame_ms).round().max(1.0) as usize;
-    let block_secs = (frames_per_block as f64 * frame_ms) / 1000.0;
-    let block_ms = (block_secs * 1000.0).round() as i64;
+    let grid = block_grid(energy.len(), sample_rate, p);
+    let (block_secs, block_ms) = (grid.block_secs, grid.block_ms);
     let block_onsets: Vec<usize> = onset
-        .chunks(frames_per_block)
+        .chunks(grid.frames_per_block)
         .map(|chunk| chunk.iter().filter(|&&o| o).count())
         .collect();
     let num_blocks = block_onsets.len();
 
-    // 4. Map the motion track onto the same block grid: each block's motion is
-    //    the mean of the motion samples whose timestamp falls inside it.
-    let motion_dt_ms = if motion.fps > 0.0 {
-        1000.0 / motion.fps
-    } else {
-        f64::INFINITY
-    };
-    let mut motion_sum = vec![0.0; num_blocks];
-    let mut motion_count = vec![0u32; num_blocks];
-    for (j, &m) in motion.energy.iter().enumerate() {
-        let t_ms = (j as f64 + 1.0) * motion_dt_ms;
-        let b = (t_ms / block_ms.max(1) as f64) as usize;
-        if b < num_blocks {
-            motion_sum[b] += m;
-            motion_count[b] += 1;
-        }
-    }
-    let clip_motion_mean = mean(&motion.energy).max(f64::MIN_POSITIVE);
-    let motion_threshold = p.motion_active_ratio * clip_motion_mean;
-
-    // 5. A block is play when its motion clears the threshold (motion is primary).
-    let active: Vec<bool> = (0..num_blocks)
-        .map(|b| {
-            let level = if motion_count[b] > 0 {
-                motion_sum[b] / motion_count[b] as f64
-            } else {
-                0.0
-            };
-            level >= motion_threshold
-        })
-        .collect();
+    // 4–5. Map the motion track onto the same block grid and threshold it: a block
+    //    is play when its mean motion clears the threshold (motion is primary).
+    let active = motion_mask(motion, num_blocks, block_ms, p);
 
     // 5b. Occupancy *proposes* candidate play spans (ADR 0016, issue #91): samples
     //     showing two plausible players with near/far size structure and real
@@ -527,6 +498,103 @@ pub fn segment_with(
     Segmentation {
         rallies: merge_overlaps(rallies),
         verdicts,
+    }
+}
+
+/// The block grid segmentation runs on: audio energy frames group into fixed
+/// blocks, and every per-block mask (motion, occupancy, candidate) indexes it.
+/// Derived from the frame count and [`Params`] alone, so [`segment_with`] and the
+/// observational [`fusion_blocks`] seam are guaranteed the same grid.
+struct BlockGrid {
+    frames_per_block: usize,
+    block_secs: f64,
+    block_ms: i64,
+    num_blocks: usize,
+}
+
+/// Compute the [`BlockGrid`] for `num_frames` audio energy frames.
+fn block_grid(num_frames: usize, sample_rate: u32, p: &Params) -> BlockGrid {
+    let frame_ms = p.frame as f64 / sample_rate as f64 * 1000.0;
+    let frames_per_block = ((p.block_ms as f64) / frame_ms).round().max(1.0) as usize;
+    let block_secs = (frames_per_block as f64 * frame_ms) / 1000.0;
+    let block_ms = (block_secs * 1000.0).round() as i64;
+    BlockGrid {
+        frames_per_block,
+        block_secs,
+        block_ms,
+        num_blocks: num_frames.div_ceil(frames_per_block),
+    }
+}
+
+/// Map the motion track onto the block grid and threshold it: each block's motion
+/// is the mean of the motion samples whose timestamp falls inside it, and the
+/// block is active when that mean clears [`Params::motion_active_ratio`] × the
+/// clip mean. The motion half of the union fusion, shared by [`segment_with`] and
+/// [`fusion_blocks`].
+fn motion_mask(motion: &MotionTrack, num_blocks: usize, block_ms: i64, p: &Params) -> Vec<bool> {
+    let motion_dt_ms = if motion.fps > 0.0 {
+        1000.0 / motion.fps
+    } else {
+        f64::INFINITY
+    };
+    let mut motion_sum = vec![0.0; num_blocks];
+    let mut motion_count = vec![0u32; num_blocks];
+    for (j, &m) in motion.energy.iter().enumerate() {
+        let t_ms = (j as f64 + 1.0) * motion_dt_ms;
+        let b = (t_ms / block_ms.max(1) as f64) as usize;
+        if b < num_blocks {
+            motion_sum[b] += m;
+            motion_count[b] += 1;
+        }
+    }
+    let clip_motion_mean = mean(&motion.energy).max(f64::MIN_POSITIVE);
+    let motion_threshold = p.motion_active_ratio * clip_motion_mean;
+    (0..num_blocks)
+        .map(|b| {
+            let level = if motion_count[b] > 0 {
+                motion_sum[b] / motion_count[b] as f64
+            } else {
+                0.0
+            };
+            level >= motion_threshold
+        })
+        .collect()
+}
+
+/// The per-block **provenance masks** behind the union fusion — which blocks
+/// motion fired on and which blocks occupancy proposed — plus the grid's block
+/// length. [`segment_with`] collapses these into a single candidate mask
+/// (motion OR occupancy), so a span's provenance (motion-only vs occupancy-only
+/// vs mixed) is invisible in its output; the eval harness's FP trace (issue #92)
+/// re-reads it through this seam. Observational only — never feeds back into
+/// the draft.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusionBlocks {
+    /// Length of one block in ms — the grid both masks index.
+    pub block_ms: i64,
+    /// Per block: motion cleared its activity threshold there.
+    pub motion: Vec<bool>,
+    /// Per block: the occupancy windowed-density rule proposed it.
+    pub occupancy: Vec<bool>,
+}
+
+/// Compute the union fusion's per-block provenance masks for the same inputs
+/// [`segment_with`] takes, on the identical block grid (both go through
+/// [`block_grid`] / [`motion_mask`] / [`occupancy_blocks`], so the masks here are
+/// exactly the ones the segmenter unioned). Pure and observational (issue #92).
+pub fn fusion_blocks(
+    samples: &[f32],
+    sample_rate: u32,
+    motion: &MotionTrack,
+    occupancy: Option<&OccupancyTrack>,
+    p: &Params,
+) -> FusionBlocks {
+    let num_frames = samples.len().div_ceil(p.frame);
+    let grid = block_grid(num_frames, sample_rate, p);
+    FusionBlocks {
+        block_ms: grid.block_ms.max(1),
+        motion: motion_mask(motion, grid.num_blocks, grid.block_ms, p),
+        occupancy: occupancy_blocks(occupancy, grid.num_blocks, grid.block_ms.max(1), p),
     }
 }
 
@@ -1183,6 +1251,32 @@ mod tests {
         // widens it. Never starts late / ends early (inclusion bias).
         assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
         assert!(rallies[0].end_ms >= 16_000, "end {rallies:?}");
+    }
+
+    #[test]
+    fn fusion_blocks_expose_the_masks_the_segmenter_unions() {
+        // A motion-proposed rally over [5,15) and an occupancy-proposed one over
+        // [22,32): the observational seam (issue #92) must attribute blocks to the
+        // proposer that actually fired there, on the grid the segmenter used.
+        let audio = synth_audio(40.0, &[(5.0, 15.0), (22.0, 32.0)], 0.66);
+        let motion = synth_motion(40.0, &[(5.0, 15.0)]);
+        let occ = synth_occupancy(40.0, |i, t| active_rally_sample(i, t, 22.0, 32.0));
+        let p = Params::default();
+        let rallies = segment_with(&audio, SR, &motion, Some(&occ), &p).rallies;
+        assert_eq!(rallies.len(), 2, "one rally per proposer: {rallies:?}");
+
+        let fb = fusion_blocks(&audio, SR, &motion, Some(&occ), &p);
+        assert_eq!(fb.motion.len(), fb.occupancy.len());
+        let block_at = |ms: i64| (ms / fb.block_ms) as usize;
+        // Inside the motion rally: motion fired, occupancy proposed nothing.
+        assert!(fb.motion[block_at(10_000)]);
+        assert!(!fb.occupancy[block_at(10_000)]);
+        // Inside the occupancy rally: the reverse.
+        assert!(!fb.motion[block_at(27_000)]);
+        assert!(fb.occupancy[block_at(27_000)]);
+        // Downtime far from both rallies: neither mask fires.
+        assert!(!fb.motion[block_at(37_000)]);
+        assert!(!fb.occupancy[block_at(37_000)]);
     }
 
     #[test]

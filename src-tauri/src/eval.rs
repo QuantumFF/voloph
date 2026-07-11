@@ -217,6 +217,9 @@ struct CorpusRecording {
 /// - `--sweep` — instead of one scored run, extract each gold recording's signal
 ///   tracks once and re-score the pure [`segment::segment_with`] seam across a grid
 ///   of occupancy parameters (ADR 0016), printing one line per configuration.
+/// - `--trace` — diagnose every missed gold rally at the default parameters.
+/// - `--fp-trace` — classify every draft span (false positives and true positives
+///   alike) by signal support and price the candidate suppression rules (issue #92).
 /// - `RECORDING` — a path substring; score only recordings whose path contains it
 ///   (default: the whole library).
 pub fn run(args: Vec<String>) -> Result<(), String> {
@@ -263,6 +266,8 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         sweep_and_report(&recordings);
     } else if opts.trace {
         trace_and_report(&recordings);
+    } else if opts.fp_trace {
+        fp_trace_and_report(&recordings);
     } else {
         score_and_report(&recordings);
     }
@@ -721,6 +726,356 @@ fn extract_tracks(
     ))
 }
 
+// ── FP trace (issue #92) ──────────────────────────────────────────────────────
+//
+// The FP-composition measurement of issue #92: classify every draft span on the
+// gold corpus — false positives and true positives alike — by signal support
+// (block provenance, occupancy firing density, audio verdict), then price each
+// obvious suppression rule as a measured pair: FP/h removed vs gold rallies lost.
+// The recall cost is simulated exactly (drop the suppressed spans, re-run the
+// pure scorer), never assumed (ADR 0015: no precision is bought by paying
+// recall). Purely observational — the draft is never altered and
+// `SEGMENTER_VERSION` stays 5.
+
+/// Which proposer(s) put a draft span on the timeline. The union fusion collapses
+/// the motion and occupancy masks into one candidate mask, so this is re-read per
+/// span from [`segment::FusionBlocks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    /// Motion fired somewhere in the span; occupancy proposed none of its blocks.
+    MotionOnly,
+    /// Occupancy proposed blocks; motion never fired inside the span.
+    OccupancyOnly,
+    /// Both proposers contributed blocks.
+    Mixed,
+}
+
+impl Provenance {
+    /// Stable label for report rows.
+    fn label(self) -> &'static str {
+        match self {
+            Provenance::MotionOnly => "motion-only",
+            Provenance::OccupancyOnly => "occ-only",
+            Provenance::Mixed => "mixed",
+        }
+    }
+}
+
+/// One draft span classified by signal support (issue #92): who proposed its
+/// blocks, whether audio confirmed it, how densely the occupancy firing rule
+/// fired inside it, and whether it is a false positive against gold.
+#[derive(Debug, Clone, PartialEq)]
+struct SpanSupport {
+    span: Interval,
+    provenance: Provenance,
+    /// Fraction of the span's blocks that were motion-active / occupancy-proposed.
+    /// The padded edges and bridged downtime count in the denominator, so these
+    /// read as "how much of what the user sees is signal-backed".
+    motion_frac: f64,
+    occupancy_frac: f64,
+    /// Audio confirmed play in the span ([`segment::GateVerdict::Kept`]).
+    audio_confirmed: bool,
+    /// Fraction of detector samples inside the span that fired the occupancy
+    /// rule; `None` when no track covers the span. Finer-grained than
+    /// [`Self::occupancy_frac`]: sub-threshold firing shows up here first.
+    fired_fraction: Option<f64>,
+    /// Overlaps no gold rally — a false positive.
+    is_fp: bool,
+}
+
+impl SpanSupport {
+    /// The six-way support class this span falls in (provenance × audio).
+    fn class(&self) -> (Provenance, bool) {
+        (self.provenance, self.audio_confirmed)
+    }
+}
+
+/// The six support classes in report order, with their row labels.
+const SUPPORT_CLASSES: [(Provenance, bool); 6] = [
+    (Provenance::MotionOnly, false),
+    (Provenance::MotionOnly, true),
+    (Provenance::Mixed, false),
+    (Provenance::Mixed, true),
+    (Provenance::OccupancyOnly, false),
+    (Provenance::OccupancyOnly, true),
+];
+
+/// A support class's row label, e.g. `motion-only / unconfirmed`.
+fn class_label(class: (Provenance, bool)) -> String {
+    format!(
+        "{} / {}",
+        class.0.label(),
+        if class.1 { "confirmed" } else { "unconfirmed" }
+    )
+}
+
+/// Classify one draft span against the provenance masks, the gate verdicts, and
+/// gold. Pure — interval and mask arithmetic only, so it is unit-testable with
+/// synthetic fixtures. `firing` is the occupancy per-sample diagnostic with its
+/// sample rate, absent when the detector did not run.
+fn classify_span(
+    span: Interval,
+    blocks: &segment::FusionBlocks,
+    verdicts: &[segment::SpanVerdict],
+    firing: Option<(&[segment::OccupancySample], f64)>,
+    gold: &[Interval],
+) -> SpanSupport {
+    // Blocks overlapping the padded span: block b covers [b·block_ms, (b+1)·block_ms).
+    let bm = blocks.block_ms.max(1);
+    let lo = ((span.start_ms.max(0)) / bm) as usize;
+    let hi = (span.end_ms.max(0) as u64).div_ceil(bm as u64) as usize;
+    let hi = hi.min(blocks.motion.len()).min(blocks.occupancy.len());
+    let lo = lo.min(hi);
+    let total = (hi - lo).max(1);
+    let motion_blocks = blocks.motion[lo..hi].iter().filter(|&&m| m).count();
+    let occupancy_blocks = blocks.occupancy[lo..hi].iter().filter(|&&o| o).count();
+    let provenance = match (motion_blocks > 0, occupancy_blocks > 0) {
+        (true, false) => Provenance::MotionOnly,
+        (false, true) => Provenance::OccupancyOnly,
+        (true, true) => Provenance::Mixed,
+        // A rally span exists because some block fired, so this only happens on
+        // degenerate fixtures; read it as the motion-proposes fallback.
+        (false, false) => Provenance::MotionOnly,
+    };
+
+    // Audio verdict: the rally-producing gate verdicts sit at the raw unpadded
+    // block boundaries inside the padded span, so match by overlap. A merged span
+    // covering several raw spans is confirmed when any of them was.
+    let audio_confirmed = verdicts.iter().any(|v| {
+        matches!(v.verdict, segment::GateVerdict::Kept)
+            && span.overlaps(&Interval {
+                start_ms: v.start_ms,
+                end_ms: v.end_ms,
+            })
+    });
+
+    SpanSupport {
+        span,
+        provenance,
+        motion_frac: motion_blocks as f64 / total as f64,
+        occupancy_frac: occupancy_blocks as f64 / total as f64,
+        audio_confirmed,
+        fired_fraction: firing.and_then(|(f, fps)| fired_fraction(span, f, fps)),
+        is_fp: !gold.iter().any(|g| span.overlaps(g)),
+    }
+}
+
+/// Fraction of the detector samples inside `span` that fired the occupancy rule,
+/// or `None` when the track holds no sample there (span beyond the track's end,
+/// or an empty track).
+fn fired_fraction(span: Interval, firing: &[segment::OccupancySample], fps: f64) -> Option<f64> {
+    if fps <= 0.0 {
+        return None;
+    }
+    let lo = (((span.start_ms.max(0) as f64) / 1000.0) * fps) as usize;
+    let hi = ((((span.end_ms.max(0) as f64) / 1000.0) * fps) as usize).min(firing.len());
+    let lo = lo.min(hi);
+    let window = &firing[lo..hi];
+    if window.is_empty() {
+        return None;
+    }
+    Some(window.iter().filter(|s| s.fired).count() as f64 / window.len() as f64)
+}
+
+/// One traced recording: every draft span classified, plus what the pure scorer
+/// needs to re-score a suppressed draft (gold and duration).
+struct TracedRecording {
+    spans: Vec<SpanSupport>,
+    gold: Vec<Interval>,
+    duration_ms: i64,
+}
+
+/// The measured price of one candidate suppression rule over the corpus: spans
+/// matching `suppress` are dropped and the remainder re-scored, so the recall
+/// cost is exact, not assumed. Returns
+/// `(fp_removed, fp_per_hour_remaining, gold_lost)` where `gold_lost` is the
+/// misses *added* relative to the unsuppressed draft.
+fn price_rule(
+    recs: &[TracedRecording],
+    suppress: impl Fn(&SpanSupport) -> bool,
+) -> (usize, f64, usize) {
+    let mut baseline_misses = 0usize;
+    let mut misses = 0usize;
+    let mut fp_removed = 0usize;
+    let mut fp_remaining = 0usize;
+    let mut total_ms = 0i64;
+    for rec in recs {
+        let full: Vec<Interval> = rec.spans.iter().map(|s| s.span).collect();
+        let kept: Vec<Interval> = rec
+            .spans
+            .iter()
+            .filter(|s| !suppress(s))
+            .map(|s| s.span)
+            .collect();
+        baseline_misses += score(&full, &rec.gold, rec.duration_ms).misses;
+        let s = score(&kept, &rec.gold, rec.duration_ms);
+        misses += s.misses;
+        fp_remaining += s.false_positives;
+        fp_removed += rec.spans.iter().filter(|s| s.is_fp && suppress(s)).count();
+        total_ms += rec.duration_ms;
+    }
+    (
+        fp_removed,
+        per_hour(fp_remaining, total_ms),
+        misses - baseline_misses,
+    )
+}
+
+/// Classify every draft span on the gold corpus by signal support, print the
+/// FP/TP composition per recording and aggregated, and price the candidate
+/// suppression rules (issue #92). Same extraction shell as a scored run; all
+/// judgement lives in [`classify_span`], [`fired_fraction`], and [`price_rule`].
+fn fp_trace_and_report(recordings: &[CorpusRecording]) {
+    let p = segment::Params::default();
+    let mut traced: Vec<TracedRecording> = Vec::new();
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            continue;
+        }
+        let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let seg = segment::segment_with(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occupancy.as_ref(),
+            &p,
+        );
+        let blocks = segment::fusion_blocks(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occupancy.as_ref(),
+            &p,
+        );
+        let firing = occupancy
+            .as_ref()
+            .map(|o| (segment::occupancy_firing(o, &p), o.fps));
+        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
+            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+        );
+        let spans: Vec<SpanSupport> = seg
+            .rallies
+            .iter()
+            .map(|r| {
+                classify_span(
+                    Interval {
+                        start_ms: r.start_ms,
+                        end_ms: r.end_ms,
+                    },
+                    &blocks,
+                    &seg.verdicts,
+                    firing.as_ref().map(|(f, fps)| (f.as_slice(), *fps)),
+                    &rec.gold,
+                )
+            })
+            .collect();
+
+        println!("FPTRACE {}  ({} draft spans)", rec.rel_path, spans.len());
+        print_class_table(&spans, duration_ms, "        ");
+        traced.push(TracedRecording {
+            spans,
+            gold: rec.gold.clone(),
+            duration_ms,
+        });
+    }
+    if traced.is_empty() {
+        println!("no gold recordings to trace");
+        return;
+    }
+
+    let all_spans: Vec<SpanSupport> = traced.iter().flat_map(|t| t.spans.iter().cloned()).collect();
+    let total_ms: i64 = traced.iter().map(|t| t.duration_ms).sum();
+    println!(
+        "\n=== aggregate over {} recording(s), {} draft spans, {:.2} h ===",
+        traced.len(),
+        all_spans.len(),
+        total_ms as f64 / MS_PER_HOUR
+    );
+    print_class_table(&all_spans, total_ms, "");
+
+    // The obvious candidate rules (issue #92), priced exactly. "no occupancy
+    // firing" is the strictest reading: not one detector sample fired in the span
+    // (an absent track also reads as unsupported).
+    println!("\n=== candidate suppression rules (measured ceilings) ===");
+    type Rule = Box<dyn Fn(&SpanSupport) -> bool>;
+    let rules: [(&str, Rule); 4] = [
+        (
+            "suppress motion-only & audio-unconfirmed",
+            Box::new(|s: &SpanSupport| s.provenance == Provenance::MotionOnly && !s.audio_confirmed),
+        ),
+        (
+            "suppress motion-only & unconfirmed & zero occupancy firing",
+            Box::new(|s: &SpanSupport| {
+                s.provenance == Provenance::MotionOnly
+                    && !s.audio_confirmed
+                    && s.fired_fraction.is_none_or(|f| f == 0.0)
+            }),
+        ),
+        (
+            "suppress every audio-unconfirmed span",
+            Box::new(|s: &SpanSupport| !s.audio_confirmed),
+        ),
+        (
+            "suppress every motion-only span",
+            Box::new(|s: &SpanSupport| s.provenance == Provenance::MotionOnly),
+        ),
+    ];
+    for (name, rule) in &rules {
+        let (fp_removed, fph_remaining, gold_lost) = price_rule(&traced, rule);
+        println!(
+            "{name:<62} →  -{fp_removed} FP  →  {fph_remaining:.1} FP/h remaining | {gold_lost} gold rally(ies) lost"
+        );
+    }
+}
+
+/// Print the six-class FP/TP composition table for one span set. `indent`
+/// prefixes every row (the per-recording block indents, the aggregate does not).
+/// The fired% medians are split FP vs TP — whether false positives fire the
+/// occupancy rule less densely than real rallies is exactly the demotion
+/// question the issue #92 design session weighs.
+fn print_class_table(spans: &[SpanSupport], duration_ms: i64, indent: &str) {
+    println!(
+        "{indent}{:<28} {:>4} {:>9} {:>5}   med fired% FP | TP",
+        "class", "FP", "FP/h", "TP"
+    );
+    for class in SUPPORT_CLASSES {
+        let members: Vec<&SpanSupport> = spans.iter().filter(|s| s.class() == class).collect();
+        if members.is_empty() {
+            continue;
+        }
+        let fp = members.iter().filter(|s| s.is_fp).count();
+        let tp = members.len() - fp;
+        let fired_cell = |want_fp: bool| {
+            let mut fired: Vec<i64> = members
+                .iter()
+                .filter(|s| s.is_fp == want_fp)
+                .filter_map(|s| s.fired_fraction)
+                .map(|f| (f * 100.0).round() as i64)
+                .collect();
+            fired.sort_unstable();
+            match median(&fired) {
+                Some(m) => format!("{m:>3.0}%"),
+                None => " n/a".to_string(),
+            }
+        };
+        println!(
+            "{indent}{:<28} {:>4} {:>9.2} {:>5}   {} | {}",
+            class_label(class),
+            fp,
+            per_hour(fp, duration_ms),
+            tp,
+            fired_cell(true),
+            fired_cell(false)
+        );
+    }
+}
+
 /// One recording's line block: the headline path, then the three numbers with the
 /// counts behind them.
 fn print_recording(rel_path: &str, s: &Score) {
@@ -747,6 +1102,7 @@ struct Options {
     filter: Option<String>,
     sweep: bool,
     trace: bool,
+    fp_trace: bool,
     help: bool,
 }
 
@@ -760,6 +1116,7 @@ impl Options {
             filter: None,
             sweep: false,
             trace: false,
+            fp_trace: false,
             help: false,
         };
         let mut it = args.iter();
@@ -768,6 +1125,7 @@ impl Options {
                 "-h" | "--help" => opts.help = true,
                 "--sweep" => opts.sweep = true,
                 "--trace" => opts.trace = true,
+                "--fp-trace" => opts.fp_trace = true,
                 "--db" => {
                     opts.db = Some(it.next().ok_or("--db needs a path")?.clone());
                 }
@@ -801,6 +1159,7 @@ fn print_usage() {
          --library local|shared which library to score (default: the active one)\n    \
          --sweep                re-score the occupancy parameter grid on cached tracks\n    \
          --trace                diagnose every missed gold rally at default params\n    \
+         --fp-trace             classify every draft span by signal support (issue #92)\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
          Recordings without a hand-corrected timeline are skipped, never scored."
@@ -968,6 +1327,223 @@ mod tests {
         assert_eq!(s.misses, 0);
         assert_eq!(s.false_positives, 2);
         assert_eq!(s.median_boundary_error_secs, None);
+    }
+
+    // ── FP-trace classification (issue #92) ──────────────────────────────────
+
+    /// A one-second block grid with the given motion / occupancy masks, for terse
+    /// provenance fixtures.
+    fn blocks(motion: &[bool], occupancy: &[bool]) -> segment::FusionBlocks {
+        segment::FusionBlocks {
+            block_ms: 1000,
+            motion: motion.to_vec(),
+            occupancy: occupancy.to_vec(),
+        }
+    }
+
+    /// A rally-producing gate verdict span, confirmed or not.
+    fn verdict(start_ms: i64, end_ms: i64, confirmed: bool) -> segment::SpanVerdict {
+        segment::SpanVerdict {
+            start_ms,
+            end_ms,
+            verdict: if confirmed {
+                segment::GateVerdict::Kept
+            } else {
+                segment::GateVerdict::UnconfirmedByAudio
+            },
+        }
+    }
+
+    #[test]
+    fn a_span_over_motion_blocks_alone_is_motion_only() {
+        let b = blocks(&[false, true, true, false], &[false; 4]);
+        let s = classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &[]);
+        assert_eq!(s.provenance, Provenance::MotionOnly);
+        assert_eq!(s.motion_frac, 1.0);
+        assert_eq!(s.occupancy_frac, 0.0);
+    }
+
+    #[test]
+    fn a_span_over_occupancy_blocks_alone_is_occupancy_only() {
+        let b = blocks(&[false; 4], &[false, true, true, false]);
+        let s = classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &[]);
+        assert_eq!(s.provenance, Provenance::OccupancyOnly);
+    }
+
+    #[test]
+    fn a_span_with_both_proposers_is_mixed() {
+        let b = blocks(&[false, true, false, false], &[false, false, true, false]);
+        let s = classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &[]);
+        assert_eq!(s.provenance, Provenance::Mixed);
+        assert_eq!(s.motion_frac, 0.5);
+        assert_eq!(s.occupancy_frac, 0.5);
+    }
+
+    #[test]
+    fn padding_blocks_dilute_the_fractions_but_not_the_class() {
+        // Motion fired only on the middle block; the padded span also covers one
+        // inactive block on each side.
+        let b = blocks(&[false, false, true, false, false], &[false; 5]);
+        let s = classify_span(Interval { start_ms: 1000, end_ms: 4000 }, &b, &[], None, &[]);
+        assert_eq!(s.provenance, Provenance::MotionOnly);
+        assert!((s.motion_frac - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_span_beyond_the_masks_reads_as_the_motion_proposes_fallback() {
+        let b = blocks(&[], &[]);
+        let s = classify_span(Interval { start_ms: 0, end_ms: 2000 }, &b, &[], None, &[]);
+        assert_eq!(s.provenance, Provenance::MotionOnly);
+        assert_eq!(s.motion_frac, 0.0);
+    }
+
+    #[test]
+    fn audio_verdicts_match_the_padded_span_by_overlap() {
+        let b = blocks(&[true; 10], &[false; 10]);
+        // Raw verdict span 2000–5000 sits inside the padded rally 800–6200.
+        let span = Interval { start_ms: 800, end_ms: 6200 };
+        let confirmed = classify_span(span, &b, &[verdict(2000, 5000, true)], None, &[]);
+        assert!(confirmed.audio_confirmed);
+        let unconfirmed = classify_span(span, &b, &[verdict(2000, 5000, false)], None, &[]);
+        assert!(!unconfirmed.audio_confirmed);
+        // A verdict elsewhere in the recording never confirms this span.
+        let elsewhere = classify_span(span, &b, &[verdict(8000, 9000, true)], None, &[]);
+        assert!(!elsewhere.audio_confirmed);
+    }
+
+    #[test]
+    fn a_merged_span_covering_one_confirmed_raw_span_is_confirmed() {
+        let b = blocks(&[true; 12], &[false; 12]);
+        let span = Interval { start_ms: 0, end_ms: 12000 };
+        let vs = [verdict(1000, 4000, false), verdict(7000, 10000, true)];
+        assert!(classify_span(span, &b, &vs, None, &[]).audio_confirmed);
+    }
+
+    #[test]
+    fn non_rally_verdicts_never_confirm_a_span() {
+        let b = blocks(&[true; 4], &[false; 4]);
+        let vs = [segment::SpanVerdict {
+            start_ms: 0,
+            end_ms: 4000,
+            verdict: segment::GateVerdict::MotionNeverFired,
+        }];
+        assert!(!classify_span(Interval { start_ms: 0, end_ms: 4000 }, &b, &vs, None, &[]).audio_confirmed);
+    }
+
+    #[test]
+    fn a_span_overlapping_gold_is_a_tp_and_one_overlapping_none_is_an_fp() {
+        let b = blocks(&[true; 4], &[false; 4]);
+        let gold = ivals(&[(0, 2000)]);
+        assert!(!classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &gold).is_fp);
+        assert!(classify_span(Interval { start_ms: 2500, end_ms: 3500 }, &b, &[], None, &gold).is_fp);
+    }
+
+    #[test]
+    fn fired_fraction_counts_the_samples_inside_the_span() {
+        // 1 fps: samples at 0s, 1s, 2s, 3s. Span 0–2s holds samples 0 and 1.
+        let f = [
+            segment::OccupancySample { live: 2, fired: true },
+            segment::OccupancySample { live: 2, fired: false },
+            segment::OccupancySample { live: 2, fired: true },
+            segment::OccupancySample { live: 2, fired: true },
+        ];
+        assert_eq!(
+            fired_fraction(Interval { start_ms: 0, end_ms: 2000 }, &f, 1.0),
+            Some(0.5)
+        );
+        // A span beyond the track's end holds no samples.
+        assert_eq!(
+            fired_fraction(Interval { start_ms: 9000, end_ms: 12000 }, &f, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn no_firing_samples_in_the_span_reads_as_zero_not_absent() {
+        let f = [
+            segment::OccupancySample { live: 0, fired: false },
+            segment::OccupancySample { live: 0, fired: false },
+        ];
+        assert_eq!(
+            fired_fraction(Interval { start_ms: 0, end_ms: 2000 }, &f, 1.0),
+            Some(0.0)
+        );
+    }
+
+    /// A classified span fixture for rule pricing.
+    fn support(
+        span: (i64, i64),
+        provenance: Provenance,
+        audio_confirmed: bool,
+        is_fp: bool,
+    ) -> SpanSupport {
+        SpanSupport {
+            span: Interval { start_ms: span.0, end_ms: span.1 },
+            provenance,
+            motion_frac: 1.0,
+            occupancy_frac: 0.0,
+            audio_confirmed,
+            fired_fraction: Some(0.0),
+            is_fp,
+        }
+    }
+
+    #[test]
+    fn pricing_a_rule_measures_fp_removed_and_gold_lost_exactly() {
+        // One gold rally covered *only* by an unsupported motion-only span, one FP
+        // in the same class, and one confirmed TP elsewhere.
+        let recs = [TracedRecording {
+            spans: vec![
+                support((0, 1000), Provenance::MotionOnly, false, false), // sole cover of gold #1
+                support((5000, 6000), Provenance::MotionOnly, false, true), // FP
+                support((8000, 9000), Provenance::Mixed, true, false),    // TP, other class
+            ],
+            gold: ivals(&[(0, 1000), (8000, 9000)]),
+            duration_ms: ONE_HOUR_MS,
+        }];
+        let (fp_removed, fph_remaining, gold_lost) = price_rule(&recs, |s| {
+            s.provenance == Provenance::MotionOnly && !s.audio_confirmed
+        });
+        assert_eq!(fp_removed, 1);
+        assert_eq!(fph_remaining, 0.0);
+        assert_eq!(gold_lost, 1, "suppressing the sole covering span loses the gold rally");
+    }
+
+    #[test]
+    fn a_gold_rally_also_covered_by_a_kept_span_is_not_lost() {
+        // The gold rally is covered by both an unsupported span and a confirmed
+        // one — suppressing the former costs nothing.
+        let recs = [TracedRecording {
+            spans: vec![
+                support((0, 1000), Provenance::MotionOnly, false, false),
+                support((500, 1500), Provenance::Mixed, true, false),
+            ],
+            gold: ivals(&[(0, 1500)]),
+            duration_ms: ONE_HOUR_MS,
+        }];
+        let (fp_removed, _, gold_lost) = price_rule(&recs, |s| {
+            s.provenance == Provenance::MotionOnly && !s.audio_confirmed
+        });
+        assert_eq!(fp_removed, 0);
+        assert_eq!(gold_lost, 0);
+    }
+
+    #[test]
+    fn every_span_falls_in_exactly_one_support_class() {
+        let all = [
+            support((0, 1), Provenance::MotionOnly, false, true),
+            support((0, 1), Provenance::MotionOnly, true, false),
+            support((0, 1), Provenance::Mixed, false, true),
+            support((0, 1), Provenance::Mixed, true, false),
+            support((0, 1), Provenance::OccupancyOnly, false, true),
+            support((0, 1), Provenance::OccupancyOnly, true, false),
+        ];
+        for s in &all {
+            assert_eq!(
+                SUPPORT_CLASSES.iter().filter(|&&c| c == s.class()).count(),
+                1
+            );
+        }
     }
 
     #[test]
