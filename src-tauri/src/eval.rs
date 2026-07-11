@@ -220,6 +220,11 @@ struct CorpusRecording {
 /// - `--trace` — diagnose every missed gold rally at the default parameters.
 /// - `--fp-trace` — classify every draft span (false positives and true positives
 ///   alike) by signal support and price the candidate suppression rules (issue #92).
+/// - `--headroom` — price the candidate velocity firing rule and 5 fps detector
+///   sampling against the v5 residual misses (issue #93); `--scratch DIR` sets
+///   where the 5 fps tracks are cached (default: the system temp dir).
+/// - `--edges` — split v5's boundary errors by which signal placed each draft
+///   edge, plus the motion-near-gold-edge trim-viability counts (issue #93).
 /// - `RECORDING` — a path substring; score only recordings whose path contains it
 ///   (default: the whole library).
 pub fn run(args: Vec<String>) -> Result<(), String> {
@@ -268,6 +273,14 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         trace_and_report(&recordings);
     } else if opts.fp_trace {
         fp_trace_and_report(&recordings);
+    } else if opts.headroom {
+        let scratch = opts
+            .scratch
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("voloph-eval-scratch"));
+        headroom_and_report(&recordings, &scratch);
+    } else if opts.edges {
+        edges_and_report(&recordings);
     } else {
         score_and_report(&recordings);
     }
@@ -1076,6 +1089,522 @@ fn print_class_table(spans: &[SpanSupport], duration_ms: i64, indent: &str) {
     }
 }
 
+// ── Headroom measurement (issue #93) ──────────────────────────────────────────
+//
+// The candidate-direction measurement behind the v5 residuals (22 misses, 1.50 s
+// median boundary error): how much a velocity-keyed firing rule and/or a 5 fps
+// detector rate would buy, measured observationally on the gold corpus in the
+// style of the #85 checkpoint. Nothing here alters the draft: the shipped rule,
+// `DETECT_FPS`, and every `Params` default stay untouched; the 5 fps tracks live
+// only in a scratch cache the app never reads.
+
+/// Velocity thresholds priced for the candidate rule, in frame fractions per
+/// second (a per-sample box-center step of `v / fps`). The shipped movement bool
+/// demands a step above `occupancy_static_frac` = 0.02/sample — 0.06/s at 3 fps,
+/// 0.10/s at 5 fps — so the grid brackets it on both sides.
+const HEADROOM_SPEEDS: &[f64] = &[0.05, 0.10, 0.15, 0.25, 0.40, 0.60];
+
+/// The scratch re-extraction rate: the top of ADR 0015's decided 2–5 fps envelope.
+const HEADROOM_FPS: u32 = 5;
+
+/// A gold rally at or under this duration is "short" — the miss tail the #91
+/// trace identified (3–5 s rallies whose firing never separates from chatter).
+const SHORT_RALLY_MS: i64 = 5_000;
+
+/// A candidate per-sample firing rule, priced against the shipped one.
+#[derive(Clone, Copy)]
+enum FiringRule {
+    /// The shipped v5 rule: size structure + the movement bool.
+    Current,
+    /// Size structure + box-center velocity at or above this (fractions/second).
+    Velocity(f64),
+}
+
+impl FiringRule {
+    /// Row label for the headroom tables.
+    fn label(self) -> String {
+        match self {
+            FiringRule::Current => "current (step>0.02/sample)".to_string(),
+            FiringRule::Velocity(v) => format!("velocity >= {v:.2}/s"),
+        }
+    }
+}
+
+/// Every rule the headroom mode prices: the shipped one, then the velocity grid.
+fn headroom_rules() -> Vec<FiringRule> {
+    std::iter::once(FiringRule::Current)
+        .chain(HEADROOM_SPEEDS.iter().map(|&v| FiringRule::Velocity(v)))
+        .collect()
+}
+
+/// Per-sample fired flags for one rule over one track. `Current` reads the
+/// shipped [`segment::occupancy_firing`]; `Velocity` keys the same filtered
+/// samples on step magnitude × fps through the kinematics sibling seam
+/// ([`segment::occupancy_kinematics`]) — never a parallel reimplementation.
+fn rule_flags(occ: &segment::OccupancyTrack, p: &segment::Params, rule: FiringRule) -> Vec<bool> {
+    match rule {
+        FiringRule::Current => segment::occupancy_firing(occ, p)
+            .iter()
+            .map(|s| s.fired)
+            .collect(),
+        FiringRule::Velocity(v) => segment::occupancy_kinematics(occ, p)
+            .iter()
+            .map(|k| k.size_structure && k.max_step.is_some_and(|d| d * occ.fps >= v))
+            .collect(),
+    }
+}
+
+/// Whether sample `i` of a track at `fps` lands inside any gold rally.
+fn sample_in_gold(i: usize, fps: f64, gold: &[Interval]) -> bool {
+    let t_ms = (i as f64 / fps * 1000.0) as i64;
+    gold.iter().any(|g| t_ms >= g.start_ms && t_ms < g.end_ms)
+}
+
+/// Firing density in the window of `half` samples each side of `center`, judged
+/// on the samples the window actually holds (clipped at the track edges) — the
+/// window shape `occupancy_blocks` judges, at sample rather than block centers.
+fn window_density(fired: &[bool], center: usize, half: usize) -> f64 {
+    if fired.is_empty() {
+        return 0.0;
+    }
+    let lo = center.saturating_sub(half);
+    let hi = (center + half + 1).min(fired.len());
+    fired[lo..hi].iter().filter(|&&f| f).count() as f64 / (hi - lo).max(1) as f64
+}
+
+/// Peak windowed density over window centers in the sample range `[lo, hi)`.
+fn peak_density(fired: &[bool], lo: usize, hi: usize, half: usize) -> f64 {
+    (lo..hi.min(fired.len()))
+        .map(|c| window_density(fired, c, half))
+        .fold(0.0, f64::max)
+}
+
+/// Sample-index range `[lo, hi)` an interval covers on a track of `len` samples.
+fn sample_range(iv: Interval, fps: f64, len: usize) -> (usize, usize) {
+    let lo = ((iv.start_ms.max(0) as f64 / 1000.0) * fps) as usize;
+    let hi = ((((iv.end_ms.max(0)) as f64 / 1000.0) * fps) as usize).min(len);
+    (lo.min(hi), hi)
+}
+
+/// Half-window in samples for [`segment::Params::occupancy_window_ms`] at `fps` —
+/// the same width the trace mode probes peak density with.
+fn half_window(p: &segment::Params, fps: f64) -> usize {
+    let w_samples = ((p.occupancy_window_ms as f64 / 1000.0) * fps).round() as usize;
+    (w_samples / 2).max(1)
+}
+
+/// One rule's pooled #85-style measurements over the corpus at one rate.
+#[derive(Default)]
+struct RuleStats {
+    in_gold_fired: usize,
+    in_gold_total: usize,
+    out_fired: usize,
+    out_total: usize,
+    /// Peak windowed density per short (≤ [`SHORT_RALLY_MS`]) gold rally.
+    short_peaks: Vec<f64>,
+    /// Out-of-gold sample-centered windows at or above the default proposal
+    /// density — the FP pressure a lowered bar would admit.
+    out_windows_proposing: usize,
+    out_windows: usize,
+    /// Missed windows (v5 defaults, 3 fps) whose peak density clears the default
+    /// proposal threshold under this rule.
+    missed_proposing: usize,
+    missed_total: usize,
+}
+
+impl RuleStats {
+    /// Pool one recording's flags into the stats. `missed` is the fixed missed-window
+    /// list (from the v5-default 3 fps draft), probed on this track's flags.
+    fn add(
+        &mut self,
+        fired: &[bool],
+        fps: f64,
+        gold: &[Interval],
+        missed: &[Interval],
+        p: &segment::Params,
+    ) {
+        let half = half_window(p, fps);
+        for (i, &f) in fired.iter().enumerate() {
+            if sample_in_gold(i, fps, gold) {
+                self.in_gold_total += 1;
+                self.in_gold_fired += f as usize;
+            } else {
+                self.out_total += 1;
+                self.out_fired += f as usize;
+                self.out_windows += 1;
+                self.out_windows_proposing +=
+                    (window_density(fired, i, half) >= p.occupancy_density) as usize;
+            }
+        }
+        for g in gold {
+            if g.end_ms - g.start_ms <= SHORT_RALLY_MS {
+                let (lo, hi) = sample_range(*g, fps, fired.len());
+                self.short_peaks.push(peak_density(fired, lo, hi, half));
+            }
+        }
+        for m in missed {
+            let (lo, hi) = sample_range(*m, fps, fired.len());
+            self.missed_total += 1;
+            self.missed_proposing +=
+                (peak_density(fired, lo, hi, half) >= p.occupancy_density) as usize;
+        }
+    }
+}
+
+/// One gold recording's tracks for the headroom measurement: the 3 fps occupancy
+/// the app extracts, plus the 5 fps scratch track, plus the missed-gold windows of
+/// the v5-default 3 fps draft (the fixed 22 the report probes).
+struct HeadroomRecording {
+    rel_path: String,
+    samples: Vec<f32>,
+    motion: segment::MotionTrack,
+    occ3: Option<segment::OccupancyTrack>,
+    occ5: Option<segment::OccupancyTrack>,
+    gold: Vec<Interval>,
+    duration_ms: i64,
+    missed: Vec<Interval>,
+}
+
+/// Load a recording's scratch detection track at `fps`, extracting and caching it
+/// under `scratch_dir` on first use. Keyed by relative path + rate; the app's own
+/// tracks and Analyses are never touched (issue #93). Degrades to `None` exactly
+/// as [`extract_occupancy`] does.
+fn scratch_occupancy(
+    scratch_dir: &std::path::Path,
+    rel_path: &str,
+    abs_path: &str,
+    fps: u32,
+) -> Option<segment::OccupancyTrack> {
+    let file = scratch_dir.join(format!("{}@{fps}fps.json", rel_path.replace(['/', '\\'], "_")));
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        match serde_json::from_str::<crate::detect::DetectionTrack>(&text) {
+            Ok(track) => return Some(track.to_occupancy_track()),
+            Err(e) => eprintln!("      (scratch cache unreadable, re-extracting — {e})"),
+        }
+    }
+    let track = crate::detect::detections_at_or_none(abs_path, fps, |why| {
+        eprintln!("      ({fps} fps occupancy unavailable — {why})");
+    })?;
+    if let Ok(json) = serde_json::to_string(&track) {
+        if let Err(e) =
+            std::fs::create_dir_all(scratch_dir).and_then(|()| std::fs::write(&file, json))
+        {
+            eprintln!("      (could not cache scratch track at {} — {e})", file.display());
+        }
+    }
+    Some(track.to_occupancy_track())
+}
+
+/// Score the corpus at the default parameters through the pure seam with each
+/// recording's occupancy track chosen by `occ` — the misses / FP/h / median line
+/// for one rate.
+fn score_at_rate<'a>(
+    recs: &'a [HeadroomRecording],
+    p: &segment::Params,
+    occ: impl Fn(&'a HeadroomRecording) -> Option<&'a segment::OccupancyTrack>,
+) -> (usize, usize, f64, Option<f64>) {
+    let mut misses = 0usize;
+    let mut fps_count = 0usize;
+    let mut total_ms = 0i64;
+    let mut errors: Vec<i64> = Vec::new();
+    for r in recs {
+        let seg = segment::segment_with(&r.samples, media::SEGMENT_SAMPLE_RATE, &r.motion, occ(r), p);
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|x| Interval { start_ms: x.start_ms, end_ms: x.end_ms })
+            .collect();
+        let s = score(&draft, &r.gold, r.duration_ms);
+        misses += s.misses;
+        fps_count += s.false_positives;
+        total_ms += r.duration_ms;
+        errors.extend(s.boundary_errors_ms);
+    }
+    (
+        misses,
+        fps_count,
+        per_hour(fps_count, total_ms),
+        median(&errors).map(|ms| ms / 1000.0),
+    )
+}
+
+/// The headroom report (issue #93): the #85-style rule table at 3 fps and 5 fps,
+/// the v5-defaults score at both rates, and the per-missed-window peak densities.
+fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Path) {
+    let p = segment::Params::default();
+    let mut recs: Vec<HeadroomRecording> = Vec::new();
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            println!("SKIP  {}  (not gold)", rec.rel_path);
+            continue;
+        }
+        let (samples, motion, occ3) = match extract_tracks(&rec.abs_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let occ5 = scratch_occupancy(scratch_dir, &rec.rel_path, &rec.abs_path, HEADROOM_FPS);
+        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
+            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+        );
+        // The fixed missed-window list every rule is probed on: what the shipped
+        // draft misses at the defaults on the app's own 3 fps tracks.
+        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occ3.as_ref(), &p);
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .collect();
+        let missed: Vec<Interval> = rec
+            .gold
+            .iter()
+            .filter(|g| !draft.iter().any(|d| d.overlaps(g)))
+            .copied()
+            .collect();
+        println!("CACHE {}  ({} missed at v5 defaults)", rec.rel_path, missed.len());
+        recs.push(HeadroomRecording {
+            rel_path: rec.rel_path.clone(),
+            samples,
+            motion,
+            occ3,
+            occ5,
+            gold: rec.gold.clone(),
+            duration_ms,
+            missed,
+        });
+    }
+    if recs.is_empty() {
+        println!("no gold recordings to measure");
+        return;
+    }
+
+    // v5-defaults score at each rate — the "did 5 fps alone move the bar" line.
+    println!("\n=== v5-defaults score by detector rate ===");
+    let (m3, f3, fh3, med3) = score_at_rate(&recs, &p, |r| r.occ3.as_ref());
+    println!("3 fps (app tracks)     : miss {m3} | fp {f3} ({fh3:.1}/h) | med {}", fmt_med(med3));
+    let (m5, f5, fh5, med5) = score_at_rate(&recs, &p, |r| r.occ5.as_ref());
+    println!("{HEADROOM_FPS} fps (scratch tracks) : miss {m5} | fp {f5} ({fh5:.1}/h) | med {}", fmt_med(med5));
+
+    // The #85-style rule table, per rate.
+    type OccOf = fn(&HeadroomRecording) -> Option<&segment::OccupancyTrack>;
+    let rates: [(&str, OccOf); 2] = [
+        ("3 fps (app tracks)", |r| r.occ3.as_ref()),
+        ("5 fps (scratch tracks)", |r| r.occ5.as_ref()),
+    ];
+    for (rate_label, occ_of) in rates {
+        println!("\n=== firing-rule headroom @ {rate_label} ===");
+        println!(
+            "{:<28} {:>8} {:>8} {:>14} {:>10} {:>12} {:>10}",
+            "rule", "in-gold%", "out%", "short med-peak", "short>=dens", "out win>=dens", "missed>=dens"
+        );
+        for rule in headroom_rules() {
+            let mut stats = RuleStats::default();
+            for r in &recs {
+                let Some(occ) = occ_of(r) else { continue };
+                let fired = rule_flags(occ, &p, rule);
+                stats.add(&fired, occ.fps, &r.gold, &r.missed, &p);
+            }
+            let pct = |n: usize, d: usize| 100.0 * n as f64 / d.max(1) as f64;
+            let mut peaks: Vec<i64> = stats.short_peaks.iter().map(|&d| (d * 100.0).round() as i64).collect();
+            peaks.sort_unstable();
+            let short_ge = stats.short_peaks.iter().filter(|&&d| d >= p.occupancy_density).count();
+            println!(
+                "{:<28} {:>7.0}% {:>7.1}% {:>14} {:>10} {:>11.1}% {:>10}",
+                rule.label(),
+                pct(stats.in_gold_fired, stats.in_gold_total),
+                pct(stats.out_fired, stats.out_total),
+                median(&peaks).map_or("n/a".to_string(), |m| format!("{:.2}", m / 100.0)),
+                format!("{short_ge}/{}", stats.short_peaks.len()),
+                pct(stats.out_windows_proposing, stats.out_windows),
+                format!("{}/{}", stats.missed_proposing, stats.missed_total),
+            );
+        }
+    }
+
+    // Every missed window individually: peak windowed density per rule and rate —
+    // "would the density judge (>= 0.50) open here" read per residual miss.
+    println!("\n=== missed gold windows: peak windowed density per rule ===");
+    let rules = headroom_rules();
+    let header: Vec<String> = rules.iter().map(|r| match r {
+        FiringRule::Current => "cur".to_string(),
+        FiringRule::Velocity(v) => format!("v{v:.2}"),
+    }).collect();
+    println!("{:<44} {:>6}   3fps: {}   {HEADROOM_FPS}fps: {}", "window", "dur", header.join(" "), header.join(" "));
+    for r in &recs {
+        for m in &r.missed {
+            let mut cells: Vec<String> = Vec::new();
+            for occ in [r.occ3.as_ref(), r.occ5.as_ref()] {
+                for rule in &rules {
+                    cells.push(match occ {
+                        None => " n/a".to_string(),
+                        Some(o) => {
+                            let fired = rule_flags(o, &p, *rule);
+                            let (lo, hi) = sample_range(*m, o.fps, fired.len());
+                            format!("{:.2}", peak_density(&fired, lo, hi, half_window(&p, o.fps)))
+                        }
+                    });
+                }
+            }
+            let (head, tail) = cells.split_at(rules.len());
+            println!(
+                "{:<44} {:>5.1}s   {}         {}",
+                format!("{} {:.1}s–{:.1}s", r.rel_path, m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+                (m.end_ms - m.start_ms) as f64 / 1000.0,
+                head.join(" "),
+                tail.join(" ")
+            );
+        }
+    }
+}
+
+// ── Boundary-edge provenance (issue #93) ──────────────────────────────────────
+//
+// The third diagnostic: split v5's per-boundary errors by which signal placed
+// each draft edge, to confirm or refute that occupancy-edged spans own the
+// 1.50 s median — and, for the occupancy-edged boundaries, whether motion
+// activity exists near the true gold edge at all (the number that decides if
+// motion-trimming is viable). Purely observational.
+
+/// Neighbourhood radii (ms) probed around a gold edge for nearby motion activity.
+const TRIM_RADII_MS: [i64; 3] = [500, 1000, 2000];
+
+/// One corpus's boundary errors split by the proposer that placed each draft
+/// edge, plus every occupancy-edged boundary's gold edge time for the
+/// trim-viability probe.
+#[derive(Default)]
+struct BoundarySplit {
+    motion_edged_errs: Vec<i64>,
+    occupancy_edged_errs: Vec<i64>,
+    /// `(gold_edge_ms, error_ms)` per occupancy-edged boundary.
+    occupancy_gold_edges: Vec<i64>,
+}
+
+/// The first and last candidate-active block (motion OR occupancy) covered by a
+/// padded draft span — the blocks that placed its edges — or `None` when no block
+/// in the span is active (degenerate fixtures only).
+fn edge_blocks(span: Interval, blocks: &segment::FusionBlocks) -> Option<(usize, usize)> {
+    let bm = blocks.block_ms.max(1);
+    let lo = (span.start_ms.max(0) / bm) as usize;
+    let hi = (span.end_ms.max(0) as u64).div_ceil(bm as u64) as usize;
+    let hi = hi.min(blocks.motion.len()).min(blocks.occupancy.len());
+    let lo = lo.min(hi);
+    let active = |b: usize| blocks.motion[b] || blocks.occupancy[b];
+    let first = (lo..hi).find(|&b| active(b))?;
+    let last = (lo..hi).rev().find(|&b| active(b))?;
+    Some((first, last))
+}
+
+/// Attribute each matched gold rally's two boundary errors to the signal that
+/// placed the corresponding draft edge. Motion active on the edge block means
+/// motion placed it (motion edges spans wherever it fires; the union only adds
+/// occupancy blocks beyond motion's) — otherwise the edge is occupancy's, at
+/// block grain, and its gold edge feeds the trim-viability probe. Pure.
+fn split_boundary_errors(
+    draft: &[Interval],
+    gold: &[Interval],
+    blocks: &segment::FusionBlocks,
+    split: &mut BoundarySplit,
+) {
+    for g in gold {
+        let Some(d) = best_match(g, draft) else { continue };
+        let Some((first, last)) = edge_blocks(*d, blocks) else { continue };
+        for (edge_block, gold_edge, err) in [
+            (first, g.start_ms, (g.start_ms - d.start_ms).abs()),
+            (last, g.end_ms, (g.end_ms - d.end_ms).abs()),
+        ] {
+            if blocks.motion[edge_block] {
+                split.motion_edged_errs.push(err);
+            } else {
+                split.occupancy_edged_errs.push(err);
+                split.occupancy_gold_edges.push(gold_edge);
+            }
+        }
+    }
+}
+
+/// Whether any motion-active block's center lies within `radius_ms` of `t_ms` —
+/// "is there a motion boundary to trim this occupancy edge to".
+fn motion_near(blocks: &segment::FusionBlocks, t_ms: i64, radius_ms: i64) -> bool {
+    let bm = blocks.block_ms.max(1);
+    blocks
+        .motion
+        .iter()
+        .enumerate()
+        .any(|(b, &m)| m && ((b as i64 * bm + bm / 2) - t_ms).abs() <= radius_ms)
+}
+
+/// The edge-provenance report (issue #93): per-boundary errors split by the
+/// signal that placed each draft edge, plus the motion-near-gold-edge viability
+/// counts for the occupancy-edged boundaries.
+fn edges_and_report(recordings: &[CorpusRecording]) {
+    let p = segment::Params::default();
+    let mut split = BoundarySplit::default();
+    let mut viability = [0usize; TRIM_RADII_MS.len()];
+    let mut all_errors: Vec<i64> = Vec::new();
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            continue;
+        }
+        let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occupancy.as_ref(), &p);
+        let blocks = segment::fusion_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occupancy.as_ref(), &p);
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .collect();
+        let before = split.occupancy_gold_edges.len();
+        split_boundary_errors(&draft, &rec.gold, &blocks, &mut split);
+        for &edge in &split.occupancy_gold_edges[before..] {
+            for (i, &radius) in TRIM_RADII_MS.iter().enumerate() {
+                viability[i] += motion_near(&blocks, edge, radius) as usize;
+            }
+        }
+        all_errors.extend(score(&draft, &rec.gold, rec.duration_ms.unwrap_or(0)).boundary_errors_ms);
+        println!("EDGES {}", rec.rel_path);
+    }
+    let n_motion = split.motion_edged_errs.len();
+    let n_occ = split.occupancy_edged_errs.len();
+    if n_motion + n_occ == 0 {
+        println!("no matched boundaries to split");
+        return;
+    }
+    println!("\n=== boundary errors by edge provenance (v5 defaults) ===");
+    println!(
+        "all boundaries        : {:>4}  median {}",
+        all_errors.len(),
+        fmt_med(median(&all_errors).map(|ms| ms / 1000.0))
+    );
+    println!(
+        "motion-edged          : {:>4}  median {}",
+        n_motion,
+        fmt_med(median(&split.motion_edged_errs).map(|ms| ms / 1000.0))
+    );
+    println!(
+        "occupancy-edged       : {:>4}  median {}",
+        n_occ,
+        fmt_med(median(&split.occupancy_edged_errs).map(|ms| ms / 1000.0))
+    );
+    println!("\n=== motion activity near the gold edge (occupancy-edged boundaries) ===");
+    for (i, &radius) in TRIM_RADII_MS.iter().enumerate() {
+        println!(
+            "within ±{:>4} ms       : {:>4} / {}  ({:.0}%)",
+            radius,
+            viability[i],
+            n_occ,
+            100.0 * viability[i] as f64 / n_occ.max(1) as f64
+        );
+    }
+}
+
 /// One recording's line block: the headline path, then the three numbers with the
 /// counts behind them.
 fn print_recording(rel_path: &str, s: &Score) {
@@ -1103,6 +1632,9 @@ struct Options {
     sweep: bool,
     trace: bool,
     fp_trace: bool,
+    headroom: bool,
+    edges: bool,
+    scratch: Option<String>,
     help: bool,
 }
 
@@ -1117,6 +1649,9 @@ impl Options {
             sweep: false,
             trace: false,
             fp_trace: false,
+            headroom: false,
+            edges: false,
+            scratch: None,
             help: false,
         };
         let mut it = args.iter();
@@ -1126,6 +1661,11 @@ impl Options {
                 "--sweep" => opts.sweep = true,
                 "--trace" => opts.trace = true,
                 "--fp-trace" => opts.fp_trace = true,
+                "--headroom" => opts.headroom = true,
+                "--edges" => opts.edges = true,
+                "--scratch" => {
+                    opts.scratch = Some(it.next().ok_or("--scratch needs a directory")?.clone());
+                }
                 "--db" => {
                     opts.db = Some(it.next().ok_or("--db needs a path")?.clone());
                 }
@@ -1160,6 +1700,9 @@ fn print_usage() {
          --sweep                re-score the occupancy parameter grid on cached tracks\n    \
          --trace                diagnose every missed gold rally at default params\n    \
          --fp-trace             classify every draft span by signal support (issue #92)\n    \
+         --headroom             price the velocity firing rule and 5 fps sampling (issue #93)\n    \
+         --edges                split boundary errors by edge provenance (issue #93)\n    \
+         --scratch DIR          cache dir for --headroom's 5 fps tracks (default: temp)\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
          Recordings without a hand-corrected timeline are skipped, never scored."
@@ -1544,6 +2087,153 @@ mod tests {
                 1
             );
         }
+    }
+
+    // ── Headroom measurement (issue #93) ──────────────────────────────────────
+
+    #[test]
+    fn window_density_judges_only_the_samples_the_window_holds() {
+        let fired = [true, true, false, false, true];
+        // Center 1, half 1 → samples 0..=2: two of three fire.
+        assert!((window_density(&fired, 1, 1) - 2.0 / 3.0).abs() < 1e-9);
+        // Center 0 clips at the left edge → samples 0..=1: both fire.
+        assert!((window_density(&fired, 0, 1) - 1.0).abs() < 1e-9);
+        // Center 4 clips at the right edge → samples 3..=4: one of two.
+        assert!((window_density(&fired, 4, 1) - 0.5).abs() < 1e-9);
+        assert_eq!(window_density(&[], 0, 1), 0.0);
+    }
+
+    #[test]
+    fn peak_density_is_the_best_window_in_the_range() {
+        let fired = [false, true, true, true, false, false, false, false];
+        // half 1: the window centered on 2 holds three firing samples.
+        assert!((peak_density(&fired, 0, 8, 1) - 1.0).abs() < 1e-9);
+        // Restricted to the quiet tail, nothing fires.
+        assert_eq!(peak_density(&fired, 5, 8, 1), 0.0);
+        // An empty range has no peak.
+        assert_eq!(peak_density(&fired, 3, 3, 1), 0.0);
+    }
+
+    #[test]
+    fn sample_ranges_and_gold_membership_follow_the_track_clock() {
+        // 2 fps: samples at 0, 500, 1000, 1500 ms.
+        let gold = ivals(&[(500, 1500)]);
+        assert!(!sample_in_gold(0, 2.0, &gold));
+        assert!(sample_in_gold(1, 2.0, &gold));
+        assert!(sample_in_gold(2, 2.0, &gold));
+        assert!(!sample_in_gold(3, 2.0, &gold), "gold end is exclusive");
+        assert_eq!(sample_range(Interval { start_ms: 500, end_ms: 1500 }, 2.0, 4), (1, 3));
+        // A range beyond the track clamps to its length.
+        assert_eq!(sample_range(Interval { start_ms: 0, end_ms: 99_000 }, 2.0, 4), (0, 4));
+    }
+
+    /// Two players with size structure whose boxes each step `step` in x per
+    /// sample — the controllable fixture for velocity-rule flags. The boxes sit
+    /// far apart so each one's nearest match is its own previous position.
+    fn stepping_track(fps: f64, secs: f64, step: f64) -> segment::OccupancyTrack {
+        let n = (secs * fps) as usize;
+        let samples = (0..n)
+            .map(|i| {
+                let j = (i % 2) as f64 * step;
+                let far = segment::DetBox { x: 0.15 + j, y: 0.25, w: 0.14, h: 0.14 }; // area ~0.02
+                let near = segment::DetBox { x: 0.75 - j, y: 0.65, w: 0.32, h: 0.32 }; // area ~0.10
+                vec![far, near]
+            })
+            .collect();
+        segment::OccupancyTrack { fps, samples }
+    }
+
+    #[test]
+    fn velocity_flags_fire_at_and_above_the_step_rate() {
+        // Steps of 0.06/sample at 3 fps = 0.18/s. The velocity rule must fire at
+        // a 0.15/s threshold and stay closed at 0.25/s; the shipped rule fires
+        // (0.06 > 0.02) — and all three agree the first sample never fires.
+        let occ = stepping_track(3.0, 20.0, 0.06);
+        let p = segment::Params::default();
+        let slow = rule_flags(&occ, &p, FiringRule::Velocity(0.15));
+        let fast = rule_flags(&occ, &p, FiringRule::Velocity(0.25));
+        let current = rule_flags(&occ, &p, FiringRule::Current);
+        assert!(!slow[0] && !fast[0] && !current[0], "no previous sample yet");
+        assert!(slow[1..].iter().all(|&f| f), "0.18/s clears a 0.15/s bar");
+        assert!(fast[1..].iter().all(|&f| !f), "0.18/s misses a 0.25/s bar");
+        assert!(current[1..].iter().all(|&f| f), "the shipped movement bool fires");
+    }
+
+    #[test]
+    fn rule_stats_pool_rates_and_probe_missed_windows() {
+        // 1 fps, 10 samples; gold covers 0–4 s (samples 0..4), the rest is out.
+        // All in-gold samples fire, no out-of-gold sample does.
+        let fired = [true, true, true, true, false, false, false, false, false, false];
+        let gold = ivals(&[(0, 4000)]);
+        let missed = ivals(&[(1000, 3000)]);
+        let mut p = segment::Params::default();
+        p.occupancy_window_ms = 2000; // half-window 1 sample at 1 fps
+        let mut stats = RuleStats::default();
+        stats.add(&fired, 1.0, &gold, &missed, &p);
+        assert_eq!((stats.in_gold_fired, stats.in_gold_total), (4, 4));
+        assert_eq!((stats.out_fired, stats.out_total), (0, 6));
+        // The 4 s gold rally is short (≤ 5 s) and saturates its window.
+        assert_eq!(stats.short_peaks.len(), 1);
+        assert!((stats.short_peaks[0] - 1.0).abs() < 1e-9);
+        // The missed window fires densely enough to propose at the default bar.
+        assert_eq!((stats.missed_proposing, stats.missed_total), (1, 1));
+        // Out-of-gold windows near the rally edge see some firing, but none
+        // reaches the 0.5 default: sample 4's window holds samples 3..=5 (1/3).
+        assert_eq!(stats.out_windows_proposing, 0);
+        assert_eq!(stats.out_windows, 6);
+    }
+
+    // ── Boundary-edge provenance (issue #93) ──────────────────────────────────
+
+    #[test]
+    fn edge_blocks_are_the_first_and_last_active_blocks_in_the_span() {
+        let b = blocks(
+            &[false, true, false, false, false, false],
+            &[false, false, false, true, true, false],
+        );
+        // The padded span covers blocks 0..6; the active ones are 1 and 3–4.
+        let span = Interval { start_ms: 0, end_ms: 6000 };
+        assert_eq!(edge_blocks(span, &b), Some((1, 4)));
+        // A span over quiet blocks only has no edge-placing block.
+        assert_eq!(edge_blocks(Interval { start_ms: 5000, end_ms: 6000 }, &b), None);
+    }
+
+    #[test]
+    fn boundary_errors_split_by_the_edge_placing_signal() {
+        // One gold rally, one draft: motion placed the start edge (block 1),
+        // occupancy the end edge (block 4). Start error 500 ms, end error 1500 ms.
+        let b = blocks(
+            &[false, true, true, false, false, false],
+            &[false, false, false, true, true, false],
+        );
+        let draft = ivals(&[(500, 5500)]);
+        let gold = ivals(&[(1000, 4000)]);
+        let mut split = BoundarySplit::default();
+        split_boundary_errors(&draft, &gold, &b, &mut split);
+        assert_eq!(split.motion_edged_errs, vec![500]);
+        assert_eq!(split.occupancy_edged_errs, vec![1500]);
+        assert_eq!(split.occupancy_gold_edges, vec![4000]);
+    }
+
+    #[test]
+    fn an_unmatched_gold_rally_contributes_no_boundaries() {
+        let b = blocks(&[true; 4], &[false; 4]);
+        let draft = ivals(&[(0, 1000)]);
+        let gold = ivals(&[(2000, 3000)]); // no overlap → a miss, not a boundary
+        let mut split = BoundarySplit::default();
+        split_boundary_errors(&draft, &gold, &b, &mut split);
+        assert!(split.motion_edged_errs.is_empty());
+        assert!(split.occupancy_edged_errs.is_empty());
+    }
+
+    #[test]
+    fn motion_near_probes_block_centers_within_the_radius() {
+        // Motion only on block 2 (center 2500 ms).
+        let b = blocks(&[false, false, true, false], &[false; 4]);
+        assert!(motion_near(&b, 2500, 0));
+        assert!(motion_near(&b, 3400, 1000));
+        assert!(!motion_near(&b, 4000, 1000));
+        assert!(motion_near(&b, 4000, 2000));
     }
 
     #[test]

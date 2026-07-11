@@ -708,6 +708,69 @@ pub struct OccupancySample {
 /// per-sample stage of [`occupancy_blocks`]; the block stage judges windowed
 /// density over the `fired` flags.
 pub fn occupancy_firing(occ: &OccupancyTrack, p: &Params) -> Vec<OccupancySample> {
+    // Firing: two cap-surviving boxes with near/far size structure, plus real
+    // movement since the previous sample.
+    let mut out = Vec::with_capacity(occ.samples.len());
+    let mut prev_centers: Vec<(f64, f64)> = Vec::new();
+    for s in filtered_samples(occ, p) {
+        let fired = s.size_structure && centers_moved(&prev_centers, &s.centers, p.occupancy_static_frac);
+        out.push(OccupancySample { live: s.live, fired });
+        prev_centers = s.centers;
+    }
+    out
+}
+
+/// One detector sample through the occupancy filters, widened for candidate
+/// firing-rule measurement (issue #93): the unchanged size-structure test plus the
+/// per-sample **kinematics** — the largest center step any box made since the
+/// previous sample — so a velocity-keyed rule can be priced at any threshold from
+/// one pass over the track. Observational only; the shipped rule stays
+/// [`occupancy_firing`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OccupancyKinematics {
+    /// Boxes surviving the furniture and area-cap filters at this sample.
+    pub live: usize,
+    /// The unchanged two-player size-structure test ([`Params::occupancy_ratio`]).
+    pub size_structure: bool,
+    /// Largest nearest-match center step any current box made since the previous
+    /// sample, in frame fractions (exactly the distance [`centers_moved`] judges,
+    /// so `max_step > occupancy_static_frac` reproduces the shipped movement
+    /// bool); `None` when either sample holds no surviving box. Multiply by the
+    /// track's fps for a velocity in frame fractions per second.
+    pub max_step: Option<f64>,
+}
+
+/// The kinematics sibling of [`occupancy_firing`] (issue #93): the same filter
+/// stages, but carrying the movement *magnitude* out instead of collapsing it to
+/// the shipped bool, so candidate velocity rules are measured through the real
+/// pipeline rather than a parallel reimplementation.
+pub fn occupancy_kinematics(occ: &OccupancyTrack, p: &Params) -> Vec<OccupancyKinematics> {
+    let mut out = Vec::with_capacity(occ.samples.len());
+    let mut prev_centers: Vec<(f64, f64)> = Vec::new();
+    for s in filtered_samples(occ, p) {
+        out.push(OccupancyKinematics {
+            live: s.live,
+            size_structure: s.size_structure,
+            max_step: max_center_step(&prev_centers, &s.centers),
+        });
+        prev_centers = s.centers;
+    }
+    out
+}
+
+/// One sample's boxes reduced to what the firing rules read, after the furniture
+/// and area-cap filters: the surviving count, the size-structure verdict, and the
+/// surviving box centers. The shared filter stage of [`occupancy_firing`] and
+/// [`occupancy_kinematics`].
+struct FilteredSample {
+    centers: Vec<(f64, f64)>,
+    live: usize,
+    size_structure: bool,
+}
+
+/// Run the staticness and plausibility filters (stages 1–3 of ADR 0016) over the
+/// track, one [`FilteredSample`] per detector sample.
+fn filtered_samples(occ: &OccupancyTrack, p: &Params) -> Vec<FilteredSample> {
     // 1. Staticness: find furniture positions. Cluster every box center by spatial
     //    proximity across the whole recording; a persistent cluster whose members
     //    never wander more than `static_frac` (in either axis) is furniture — a
@@ -736,31 +799,38 @@ pub fn occupancy_firing(occ: &OccupancyTrack, p: &Params) -> Vec<OccupancySample
         return occ
             .samples
             .iter()
-            .map(|_| OccupancySample { live: 0, fired: false })
+            .map(|_| FilteredSample {
+                centers: Vec::new(),
+                live: 0,
+                size_structure: false,
+            })
             .collect();
     }
     areas.sort_unstable_by(f64::total_cmp);
     let median_area = areas[areas.len() / 2];
     let area_cap = p.occupancy_area_cap_k * median_area;
 
-    // 3. Per-sample firing: two cap-surviving boxes with near/far size structure,
-    //    plus real movement since the previous sample.
-    let mut out = Vec::with_capacity(occ.samples.len());
-    let mut prev_centers: Vec<(f64, f64)> = Vec::new();
-    for s in &occ.samples {
-        let live: Vec<&DetBox> = s
-            .iter()
-            .filter(|b| !is_furniture(b) && b.area() <= area_cap)
-            .collect();
-        let centers: Vec<(f64, f64)> = live.iter().map(|b| (b.x + b.w / 2.0, b.cy())).collect();
-        let min_area = live.iter().map(|b| b.area()).fold(f64::INFINITY, f64::min);
-        let max_area = live.iter().map(|b| b.area()).fold(0.0, f64::max);
-        let two_player = live.len() >= 2 && min_area > 0.0 && max_area / min_area >= p.occupancy_ratio;
-        let fired = two_player && centers_moved(&prev_centers, &centers, p.occupancy_static_frac);
-        out.push(OccupancySample { live: live.len(), fired });
-        prev_centers = centers;
-    }
-    out
+    // 3. Per-sample survivors and the size-structure test: two cap-surviving boxes
+    //    whose area ratio shows near/far depth.
+    occ.samples
+        .iter()
+        .map(|s| {
+            let live: Vec<&DetBox> = s
+                .iter()
+                .filter(|b| !is_furniture(b) && b.area() <= area_cap)
+                .collect();
+            let centers: Vec<(f64, f64)> = live.iter().map(|b| (b.x + b.w / 2.0, b.cy())).collect();
+            let min_area = live.iter().map(|b| b.area()).fold(f64::INFINITY, f64::min);
+            let max_area = live.iter().map(|b| b.area()).fold(0.0, f64::max);
+            let size_structure =
+                live.len() >= 2 && min_area > 0.0 && max_area / min_area >= p.occupancy_ratio;
+            FilteredSample {
+                live: live.len(),
+                centers,
+                size_structure,
+            }
+        })
+        .collect()
 }
 
 /// The centroids of every **furniture** cluster: box positions that persist across
@@ -843,6 +913,23 @@ fn centers_moved(prev: &[(f64, f64)], cur: &[(f64, f64)], frac: f64) -> bool {
             .fold(f64::INFINITY, f64::min);
         nearest > frac
     })
+}
+
+/// The largest nearest-match center step from `prev` to `cur` — the magnitude
+/// [`centers_moved`] thresholds — or `None` when either sample holds no box (an
+/// appearing/disappearing player is not on its own a movement, matching
+/// [`centers_moved`]'s early return).
+fn max_center_step(prev: &[(f64, f64)], cur: &[(f64, f64)]) -> Option<f64> {
+    if prev.is_empty() || cur.is_empty() {
+        return None;
+    }
+    cur.iter()
+        .map(|&(cx, cy)| {
+            prev.iter()
+                .map(|&(px, py)| ((cx - px).powi(2) + (cy - py).powi(2)).sqrt())
+                .fold(f64::INFINITY, f64::min)
+        })
+        .fold(None, |m: Option<f64>, d| Some(m.map_or(d, |m| m.max(d))))
 }
 
 /// Group a per-block boolean mask into maximal `[start, end)` runs of `true`.
@@ -1450,6 +1537,61 @@ mod tests {
         );
         assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
         assert!(rallies[0].end_ms >= 20_000, "end {rallies:?}");
+    }
+
+    // --- Occupancy kinematics (issue #93) -------------------------------------
+    //
+    // The observational sibling of `occupancy_firing`: same filters, movement
+    // carried out as a magnitude instead of the shipped bool, so candidate
+    // velocity rules can be priced without touching the draft.
+
+    #[test]
+    fn kinematics_agree_with_the_shipped_firing_rule() {
+        // On any fixture, the shipped rule must be exactly recoverable from the
+        // kinematics: fired ⇔ size structure present ∧ max step above the
+        // movement floor. Run it over a rally with detector flicker so live
+        // counts, structure, and movement all vary.
+        let p = Params::default();
+        let occ = synth_occupancy(24.0, |i, t| {
+            let mut boxes = active_rally_sample(i, t, 4.0, 20.0);
+            if i % 3 == 0 && boxes.len() == 2 {
+                boxes.pop();
+            }
+            boxes
+        });
+        let fired = occupancy_firing(&occ, &p);
+        let kin = occupancy_kinematics(&occ, &p);
+        assert_eq!(fired.len(), kin.len());
+        for (f, k) in fired.iter().zip(&kin) {
+            assert_eq!(f.live, k.live);
+            let recovered =
+                k.size_structure && k.max_step.is_some_and(|d| d > p.occupancy_static_frac);
+            assert_eq!(f.fired, recovered, "shipped {f:?} vs kinematics {k:?}");
+        }
+        assert!(kin.iter().any(|k| k.size_structure), "fixture must exercise structure");
+    }
+
+    #[test]
+    fn kinematics_report_the_step_magnitude() {
+        // A lone box stepping exactly 0.1 in x each sample: max_step must report
+        // that magnitude (no second box to confuse the nearest-match).
+        let occ = synth_occupancy(20.0, |i, _t| vec![dbox(0.2 + (i % 2) as f64 * 0.1, 0.5, 0.02)]);
+        let kin = occupancy_kinematics(&occ, &Params::default());
+        assert_eq!(kin[0].max_step, None, "first sample has no previous centers");
+        for k in &kin[1..] {
+            let step = k.max_step.expect("box present in consecutive samples");
+            assert!((step - 0.1).abs() < 1e-9, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn kinematics_of_empty_samples_have_no_step() {
+        let occ = synth_occupancy(10.0, |_i, _t| vec![]);
+        for k in occupancy_kinematics(&occ, &Params::default()) {
+            assert_eq!(k.live, 0);
+            assert!(!k.size_structure);
+            assert_eq!(k.max_step, None);
+        }
     }
 
     #[test]

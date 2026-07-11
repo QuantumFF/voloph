@@ -77,7 +77,7 @@ const NMS_IOU_THRESHOLD: f32 = 0.45;
 /// coordinates: every field is a fraction in `[0,1]` of the source frame's width
 /// (x, w) or height (y, h), so it is independent of the model input size and the
 /// recording's resolution. `score` is the detector's confidence (`obj * class`).
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Box {
     /// Left edge, fraction of source width.
     pub x: f32,
@@ -95,7 +95,7 @@ pub struct Box {
 /// frame, in time order. `fps` is [`DETECT_FPS`]; sample `i` lands at `i / fps`
 /// seconds. This is the occupancy raw material fusion (issue #84) will consume; today
 /// it is only computed, dumped, and logged.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DetectionTrack {
     pub fps: f64,
     /// One entry per sampled frame; the inner vec is that frame's person boxes (empty
@@ -450,6 +450,20 @@ fn probe_dimensions(path: &str) -> Option<(u32, u32)> {
 pub fn extract_detections(
     path: &str,
     detector: &mut Detector,
+    on_progress: impl FnMut(i64),
+) -> Result<DetectionTrack, String> {
+    extract_detections_at(path, detector, DETECT_FPS, on_progress)
+}
+
+/// [`extract_detections`] at an explicit sample rate instead of [`DETECT_FPS`] —
+/// the same ffmpeg-stream/letterbox/inference path, only the `fps` filter differs.
+/// The app always samples at [`DETECT_FPS`]; other rates within ADR 0015's decided
+/// 2–5 fps envelope exist for the eval harness's headroom measurements (issue #93),
+/// which extract to a scratch cache and never touch the app's tracks.
+pub fn extract_detections_at(
+    path: &str,
+    detector: &mut Detector,
+    fps: u32,
     mut on_progress: impl FnMut(i64),
 ) -> Result<DetectionTrack, String> {
     let (src_w, src_h) = probe_dimensions(path).unwrap_or((MODEL_SIZE, MODEL_SIZE));
@@ -458,7 +472,7 @@ pub fn extract_detections(
     // Let ffmpeg do the aspect-preserving downscale + centered pad to the model's
     // square input, so we hand the detector exactly what YOLOX's `preproc` produces.
     let vf = format!(
-        "fps={DETECT_FPS},scale={MODEL_SIZE}:{MODEL_SIZE}:force_original_aspect_ratio=decrease,\
+        "fps={fps},scale={MODEL_SIZE}:{MODEL_SIZE}:force_original_aspect_ratio=decrease,\
          pad={MODEL_SIZE}:{MODEL_SIZE}:(ow-iw)/2:(oh-ih)/2:color={PAD_HEX}"
     );
     let mut child = Command::new(sidecar_path("ffmpeg"))
@@ -486,7 +500,7 @@ pub fn extract_detections(
                 .collect();
             samples.push(boxes);
             frames += 1;
-            on_progress(frames as i64 * 1000 / i64::from(DETECT_FPS));
+            on_progress(frames as i64 * 1000 / i64::from(fps));
         }
     }
 
@@ -508,7 +522,7 @@ pub fn extract_detections(
     }
 
     Ok(DetectionTrack {
-        fps: f64::from(DETECT_FPS),
+        fps: f64::from(fps),
         samples,
     })
 }
@@ -520,6 +534,12 @@ pub fn extract_detections(
 /// detector that cannot load or run costs precision, never a rally. Each failure is
 /// reported once through `on_fail` in the caller's own log sink.
 pub fn detections_or_none(path: &str, on_fail: impl Fn(&str)) -> Option<DetectionTrack> {
+    detections_at_or_none(path, DETECT_FPS, on_fail)
+}
+
+/// [`detections_or_none`] at an explicit sample rate — the same load-run-degrade
+/// policy, for the eval harness's scratch extractions (issue #93).
+pub fn detections_at_or_none(path: &str, fps: u32, on_fail: impl Fn(&str)) -> Option<DetectionTrack> {
     let model_path = match vendored_model_path() {
         Ok(p) => p,
         Err(e) => {
@@ -534,7 +554,7 @@ pub fn detections_or_none(path: &str, on_fail: impl Fn(&str)) -> Option<Detectio
             return None;
         }
     };
-    match extract_detections(path, &mut detector, |_| {}) {
+    match extract_detections_at(path, &mut detector, fps, |_| {}) {
         Ok(track) => Some(track),
         Err(e) => {
             on_fail(&format!("extraction failed: {e}"));
