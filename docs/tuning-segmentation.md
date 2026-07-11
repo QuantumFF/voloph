@@ -43,7 +43,8 @@ them; you only change the numbers.
 
 **Occupancy and motion both *propose* rally spans; motion *places their edges*;
 audio only *steers confidence*** (ADR 0015). Occupancy (when a detector runs)
-proposes a span where two players are rallying in opposite halves; motion proposes
+proposes a span where two players are rallying with near/far size structure
+(ADR 0016); motion proposes
 a span wherever the court moves. The two are unioned — either can add a span,
 neither can delete one — and motion's rising/falling envelope sets the block-level
 edges. Audio then decides only how sure we are a kept span is real play (issue #79):
@@ -86,42 +87,58 @@ motion-derived confidence; one below it is kept but capped at
 a knock-up apart from a real rally (both have hits) — that is a review-time call,
 which is exactly why audio now only nudges confidence and never deletes.
 
-### Occupancy — the proposer (ADR 0015 Stage 2, issue #84)
+### Occupancy — the proposer (ADR 0016, issue #91)
 
 Once a person detector runs (issue #83), **occupancy proposes candidate play
-spans**: one *near* player (large box, low in frame) and one *far* player (small
-box, high in frame), kinetically active, in opposite halves. Motion still places
-the edges of the proposed spans at block resolution, and audio still only modulates
-their confidence — occupancy adds *where a rally is*, it does not touch edges or
-confidence. The near/far split is inferred per recording from box-size statistics
-(box area is a depth proxy under the static-camera assumption); no court-line
-geometry is used.
+spans**. A detector sample *fires* when it shows two plausible people with
+**near/far size structure** — two boxes whose area ratio reaches
+`occupancy_ratio`; box area is the depth proxy, and depth is **never** read from
+frame height (on real footage both players sit in the same vertical band, #85) —
+and real inter-sample movement. A block is proposed when the *firing density* in
+a sliding window centered on it reaches `occupancy_density`. Motion still places
+the edges of its own spans, and audio still only modulates confidence.
 
 **Occupancy and motion are unioned, never intersected.** A block is a candidate
 rally block when motion fired there *or* occupancy proposed it. So occupancy can
 only *add* spans motion missed; it can never delete a rally motion found. Under the
 zero-miss bar (ADR 0015) no single signal drops a rally on its own — which is also
 why a **failed or absent detector is safe**: with no occupancy track the fusion is
-exactly the pre-#84 motion-proposes path (see "Degradation" below).
+exactly the motion-proposes path (see "Degradation" below).
 
 | Symptom | Knob (default) | Direction |
 | --- | --- | --- |
-| A net-side bystander (spectator, coach) turns downtime into play | `occupancy_static_frac` (0.02) | ↑ raise — a box whose center stays within this fraction of the frame (both axes) over the recording is dropped as furniture; raise to drop more near-still boxes |
-| A real, lightly-moving player gets dropped as "furniture" | `occupancy_static_frac` | ↓ lower toward 0 to trust almost every detected box |
-| Milling about (collecting shuttles, towelling) proposed as play | `occupancy_active_frac` (0.3) | ↑ raise — demands more of the span's samples show a player's box center moving at least `occupancy_static_frac` between samples |
-| A real but low-movement rally not proposed by occupancy | `occupancy_active_frac` | ↓ lower (motion still independently proposes, so this never deletes) |
-| A deep retreat (near player leaves frame) ends the rally early | `occupancy_opposite_frac` (0.5) | ↓ lower — the fraction of a span's samples that must show *both* players in opposite halves; below 1.0 so a stretch with only one player visible does not sink the proposal |
-| Two players milling together at the net proposed as a rally | `occupancy_opposite_frac` | ↑ raise toward 1.0 to demand both players in opposite halves almost always |
+| A net-side bystander (spectator, coach) turns downtime into play | `occupancy_static_frac` (0.02) | ↑ raise — a box whose center stays within this fraction of the frame (both axes) over the recording is dropped as furniture; also the per-sample movement floor of the firing rule |
+| A real, lightly-moving player gets dropped as "furniture" (or slow rallies never fire) | `occupancy_static_frac` | ↓ lower toward 0 to trust almost every detected box |
+| Two people milling at the same depth (no near/far structure) proposed as play | `occupancy_ratio` (1.5) | ↑ raise — demands a starker large-box/small-box area ratio (in-rally median on the gold corpus is 4.4×) |
+| Real rallies not proposed because the boxes are too similar in size | `occupancy_ratio` | ↓ lower toward 1.0 (which disables the size test entirely) |
+| A near-camera passer-by (huge box) turns downtime into play | `occupancy_area_cap_k` (8.0) | ↓ lower — a box bigger than this multiple of the recording's *median* box area is discarded as implausible |
+| A legitimately huge near-player box gets discarded | `occupancy_area_cap_k` | ↑ raise |
+| Occupancy spans bleed into the downtime around rallies (edges drift, neighbours glue) | `occupancy_density` (0.5) | ↑ raise — the firing density a block's window must reach; between-rally chatter fires ~32% of samples on the gold corpus, so keep this well above ~0.35 |
+| Short rallies motion missed are still missed by occupancy | `occupancy_density` | ↓ lower — **warning**: below ~0.4 the corpus collapses toward glued mega-spans (median edge error blows past 5 s); the sweep found no point that rescues them cleanly |
+| Edges of occupancy-only spans feel smeared | `occupancy_window_ms` (3000) | ↓ lower (sharper edges, less gap rejection); at 3 fps keep it ≥ ~1500 so a window holds enough samples for density to mean anything |
+| Brief gap chatter proposed as play | `occupancy_window_ms` | ↑ raise (more smoothing) |
 
-Two occupancy rules are fixed constants, not knobs, since they are geometric facts
-rather than tuning dials: **`LINK_RADIUS` (0.2)** is how far apart two detections
-may be and still be treated as the same player across frames (used only by the
-staticness clustering — a player's between-sample step is far larger than a
-fixture's jitter); **`MIN_HALF_SEPARATION` (0.2)** is the minimum vertical gap (frame
-fractions) between the near and far player's centers for them to count as "opposite
-halves" rather than converged in the same half. Both live in
+One occupancy rule is a fixed constant, not a knob: **`LINK_RADIUS` (0.2)** is how
+far apart two detections may be and still be treated as the same player across
+frames (used only by the staticness clustering — a player's between-sample step is
+far larger than a fixture's jitter). It lives in
 [`src-tauri/src/segment.rs`](../src-tauri/src/segment.rs) beside the code that uses
-them.
+it.
+
+To tune these against the gold corpus, run the harness sweep — it caches each
+recording's extracted tracks once and re-scores the pure `segment_with` seam over
+the whole occupancy grid:
+
+```bash
+cargo run --release --bin eval-harness -- --sweep 21-06-2026
+```
+
+Known hard edge (issue #91's sweep): missed rallies and edge quality trade
+monotonically. In-rally firing (~40–70% of samples) sits close to between-rally
+firing (~32%), so pushing density/window down to rescue the residual missed
+rallies (short, 3–5 s) glues neighbouring rallies into mega-spans long before it
+gets them all. The chosen defaults take misses 49 → 22 at 58 FP/h and a 1.5 s
+median edge; going below ~10 misses on the current corpus costs a ≥ 4 s median.
 
 > **Degradation — a failed detector never loses a rally.** The detector can fail to
 > load or run (missing ONNX model, `ort` init failure, ffmpeg error). When it does,

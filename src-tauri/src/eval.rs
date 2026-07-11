@@ -211,9 +211,12 @@ struct CorpusRecording {
 
 /// Run the eval harness. `args` is the process arguments **after** the program name.
 ///
-/// Usage: `eval-harness [--db PATH] [--library local|shared] [RECORDING]`
+/// Usage: `eval-harness [--db PATH] [--library local|shared] [--sweep] [RECORDING]`
 /// - `--db PATH` — the metadata DB to read (default: the app's own DB for this OS).
 /// - `--library KIND` — which library's recordings to score (default: the active one).
+/// - `--sweep` — instead of one scored run, extract each gold recording's signal
+///   tracks once and re-score the pure [`segment::segment_with`] seam across a grid
+///   of occupancy parameters (ADR 0016), printing one line per configuration.
 /// - `RECORDING` — a path substring; score only recordings whose path contains it
 ///   (default: the whole library).
 pub fn run(args: Vec<String>) -> Result<(), String> {
@@ -256,7 +259,13 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         segment::SEGMENTER_VERSION,
         library
     );
-    score_and_report(&recordings);
+    if opts.sweep {
+        sweep_and_report(&recordings);
+    } else if opts.trace {
+        trace_and_report(&recordings);
+    } else {
+        score_and_report(&recordings);
+    }
     Ok(())
 }
 
@@ -418,6 +427,300 @@ fn extract_occupancy(abs_path: &str) -> Option<segment::OccupancyTrack> {
     .map(|track| track.to_occupancy_track())
 }
 
+// ── Parameter sweep ───────────────────────────────────────────────────────────
+//
+// The tuning loop of ADR 0016: extraction (ffmpeg + detector) is the expensive
+// part and depends on no parameter, so each gold recording's tracks are pulled
+// once and the pure `segment_with` seam is re-scored across the whole occupancy
+// grid from cache. Same shell/core split as the single run: all judgement stays
+// in `score`.
+
+/// One gold recording's extracted signal tracks, cached so the sweep re-runs only
+/// the pure seam per configuration.
+struct CachedTracks {
+    rel_path: String,
+    samples: Vec<f32>,
+    motion: segment::MotionTrack,
+    occupancy: Option<segment::OccupancyTrack>,
+    gold: Vec<Interval>,
+    duration_ms: i64,
+}
+
+/// The occupancy grid swept (issue #91): every combination of the four ADR 0016
+/// knobs plus `occupancy_static_frac` (the movement floor doubles as the firing
+/// rule's speed demand, so it shapes the in-rally vs gap density separation),
+/// bracketing each default.
+const SWEEP_RATIO: &[f64] = &[1.0, 1.5, 2.0, 2.5];
+const SWEEP_AREA_CAP_K: &[f64] = &[4.0, 8.0, 16.0];
+const SWEEP_WINDOW_MS: &[i64] = &[1500, 2000, 3000, 4000];
+const SWEEP_DENSITY: &[f64] = &[0.3, 0.4, 0.5, 0.6];
+const SWEEP_STATIC_FRAC: &[f64] = &[0.02, 0.05];
+
+/// Score one parameter set against every cached recording, aggregated.
+fn score_config(tracks: &[CachedTracks], p: &segment::Params) -> (usize, usize, f64, Option<f64>, usize) {
+    let mut misses = 0usize;
+    let mut false_positives = 0usize;
+    let mut total_ms = 0i64;
+    let mut draft_count = 0usize;
+    let mut boundary_errors: Vec<i64> = Vec::new();
+    for t in tracks {
+        let seg = segment::segment_with(
+            &t.samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &t.motion,
+            t.occupancy.as_ref(),
+            p,
+        );
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .collect();
+        let s = score(&draft, &t.gold, t.duration_ms);
+        misses += s.misses;
+        false_positives += s.false_positives;
+        total_ms += t.duration_ms;
+        draft_count += s.draft_count;
+        boundary_errors.extend(s.boundary_errors_ms);
+    }
+    let fp_per_hour = per_hour(false_positives, total_ms);
+    let med = median(&boundary_errors).map(|ms| ms / 1000.0);
+    (misses, false_positives, fp_per_hour, med, draft_count)
+}
+
+/// Extract every gold recording's tracks once, then print one aggregate line per
+/// grid configuration plus the occupancy-disabled baseline. Sorted best-first
+/// (fewest misses, then FP/h) so the frontier reads off the top.
+fn sweep_and_report(recordings: &[CorpusRecording]) {
+    let mut tracks: Vec<CachedTracks> = Vec::new();
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            println!("SKIP  {}  (not gold)", rec.rel_path);
+            continue;
+        }
+        let samples = match media::extract_pcm(&rec.abs_path) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let energy = match media::extract_motion(&rec.abs_path, |_| {}) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let duration_ms = rec
+            .duration_ms
+            .filter(|&d| d > 0)
+            .unwrap_or((samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64);
+        println!("CACHE {}", rec.rel_path);
+        tracks.push(CachedTracks {
+            rel_path: rec.rel_path.clone(),
+            samples,
+            motion: segment::MotionTrack {
+                fps: f64::from(media::MOTION_FPS),
+                energy,
+            },
+            occupancy: extract_occupancy(&rec.abs_path),
+            gold: rec.gold.clone(),
+            duration_ms,
+        });
+    }
+    if tracks.is_empty() {
+        println!("no gold recordings to sweep");
+        return;
+    }
+    let gold_total: usize = tracks.iter().map(|t| t.gold.len()).sum();
+    println!(
+        "\nsweeping {} configuration(s) over {} recording(s), {} gold rallies",
+        SWEEP_STATIC_FRAC.len()
+            * SWEEP_RATIO.len()
+            * SWEEP_AREA_CAP_K.len()
+            * SWEEP_WINDOW_MS.len()
+            * SWEEP_DENSITY.len(),
+        tracks.len(),
+        gold_total
+    );
+
+    // The occupancy-disabled baseline: what motion alone proposes. A config's
+    // draft-count delta against this is the "occupancy contributed spans" signal.
+    let baseline_tracks: Vec<CachedTracks> = tracks
+        .iter()
+        .map(|t| CachedTracks {
+            rel_path: t.rel_path.clone(),
+            samples: t.samples.clone(),
+            motion: segment::MotionTrack {
+                fps: t.motion.fps,
+                energy: t.motion.energy.clone(),
+            },
+            occupancy: None,
+            gold: t.gold.clone(),
+            duration_ms: t.duration_ms,
+        })
+        .collect();
+    let p0 = segment::Params::default();
+    let (b_miss, b_fp, b_fph, b_med, b_draft) = score_config(&baseline_tracks, &p0);
+    println!(
+        "baseline (occupancy off): miss {b_miss} | fp {b_fp} ({b_fph:.1}/h) | med {} | draft {b_draft}\n",
+        fmt_med(b_med)
+    );
+
+    let mut rows: Vec<(usize, f64, String)> = Vec::new();
+    for &static_frac in SWEEP_STATIC_FRAC {
+        for &ratio in SWEEP_RATIO {
+            for &cap_k in SWEEP_AREA_CAP_K {
+                for &window_ms in SWEEP_WINDOW_MS {
+                    for &density in SWEEP_DENSITY {
+                        let p = segment::Params {
+                            occupancy_static_frac: static_frac,
+                            occupancy_ratio: ratio,
+                            occupancy_area_cap_k: cap_k,
+                            occupancy_window_ms: window_ms,
+                            occupancy_density: density,
+                            ..segment::Params::default()
+                        };
+                        let (miss, fp, fph, med, draft) = score_config(&tracks, &p);
+                        rows.push((
+                            miss,
+                            fph,
+                            format!(
+                                "static {static_frac:.3} | ratio {ratio:>3.1} | cap {cap_k:>4.1} | win {window_ms:>4} | dens {density:.2}  →  miss {miss:>2} | fp {fp:>3} ({fph:>5.1}/h) | med {} | draft {draft} ({:+})",
+                                fmt_med(med),
+                                draft as i64 - b_draft as i64
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    for (_, _, line) in &rows {
+        println!("{line}");
+    }
+}
+
+/// A median-boundary-error option as a fixed-width cell.
+fn fmt_med(med: Option<f64>) -> String {
+    match med {
+        Some(s) => format!("{s:.2}s"),
+        None => "  n/a".to_string(),
+    }
+}
+
+// ── Miss trace ────────────────────────────────────────────────────────────────
+//
+// The #85-style diagnosis, mechanized (issue #91's acceptance demands every
+// residual miss individually traced): for each gold rally the draft misses at the
+// default parameters, report what the occupancy pipeline saw inside its window —
+// how often anyone / two people survived the filters, how often the firing rule
+// fired, and the peak windowed density — and name the stage that lost it.
+
+/// Trace every missed gold rally at the default parameters. Reuses the same
+/// per-recording extraction as a scored run.
+fn trace_and_report(recordings: &[CorpusRecording]) {
+    let p = segment::Params::default();
+    let mut total_missed = 0usize;
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            continue;
+        }
+        let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let seg = segment::segment_with(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occupancy.as_ref(),
+            &p,
+        );
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .collect();
+        let firing = occupancy.as_ref().map(|o| (segment::occupancy_firing(o, &p), o.fps));
+        println!("TRACE {}", rec.rel_path);
+        for g in &rec.gold {
+            if draft.iter().any(|d| d.overlaps(g)) {
+                continue;
+            }
+            total_missed += 1;
+            match &firing {
+                None => println!(
+                    "        miss {:>7.1}s–{:>7.1}s  (no occupancy track — detector did not run)",
+                    g.start_ms as f64 / 1000.0,
+                    g.end_ms as f64 / 1000.0
+                ),
+                Some((f, fps)) => {
+                    let lo = ((g.start_ms as f64 / 1000.0) * fps) as usize;
+                    let hi = (((g.end_ms as f64 / 1000.0) * fps) as usize).min(f.len());
+                    let window = &f[lo.min(f.len())..hi];
+                    let n = window.len().max(1);
+                    let any = window.iter().filter(|s| s.live >= 1).count();
+                    let two = window.iter().filter(|s| s.live >= 2).count();
+                    let fired = window.iter().filter(|s| s.fired).count();
+                    // Peak windowed density inside the rally, at the same window
+                    // width the block judge uses.
+                    let w_samples = ((p.occupancy_window_ms as f64 / 1000.0) * fps).round() as usize;
+                    let half = (w_samples / 2).max(1);
+                    let peak = (lo..hi)
+                        .map(|c| {
+                            let a = c.saturating_sub(half);
+                            let b = (c + half + 1).min(f.len());
+                            f[a..b].iter().filter(|s| s.fired).count() as f64 / (b - a).max(1) as f64
+                        })
+                        .fold(0.0, f64::max);
+                    let verdict = if two * 2 < n {
+                        "detector/filters: two players rarely survive"
+                    } else if (fired as f64) < 0.2 * n as f64 {
+                        "firing rule: structure present, fires too rarely"
+                    } else if peak < p.occupancy_density {
+                        "density: fires, but never densely enough"
+                    } else {
+                        "coverage: dense firing, span lost downstream (min-rally/bridge)"
+                    };
+                    println!(
+                        "        miss {:>7.1}s–{:>7.1}s  any {:>3.0}% | two {:>3.0}% | fired {:>3.0}% | peak dens {:.2}  →  {verdict}",
+                        g.start_ms as f64 / 1000.0,
+                        g.end_ms as f64 / 1000.0,
+                        100.0 * any as f64 / n as f64,
+                        100.0 * two as f64 / n as f64,
+                        100.0 * fired as f64 / n as f64,
+                        peak
+                    );
+                }
+            }
+        }
+    }
+    println!("\n{total_missed} missed gold rally(ies) traced at default parameters");
+}
+
+/// Extract the three signal tracks for one recording — the shared shell step of a
+/// scored run, a sweep cache, and a trace.
+fn extract_tracks(
+    abs_path: &str,
+) -> Result<(Vec<f32>, segment::MotionTrack, Option<segment::OccupancyTrack>), String> {
+    let samples = media::extract_pcm(abs_path)?;
+    let energy = media::extract_motion(abs_path, |_| {})?;
+    Ok((
+        samples,
+        segment::MotionTrack {
+            fps: f64::from(media::MOTION_FPS),
+            energy,
+        },
+        extract_occupancy(abs_path),
+    ))
+}
+
 /// One recording's line block: the headline path, then the three numbers with the
 /// counts behind them.
 fn print_recording(rel_path: &str, s: &Score) {
@@ -442,6 +745,8 @@ struct Options {
     db: Option<String>,
     library: Option<String>,
     filter: Option<String>,
+    sweep: bool,
+    trace: bool,
     help: bool,
 }
 
@@ -453,12 +758,16 @@ impl Options {
             db: None,
             library: None,
             filter: None,
+            sweep: false,
+            trace: false,
             help: false,
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "-h" | "--help" => opts.help = true,
+                "--sweep" => opts.sweep = true,
+                "--trace" => opts.trace = true,
                 "--db" => {
                     opts.db = Some(it.next().ok_or("--db needs a path")?.clone());
                 }
@@ -486,10 +795,12 @@ impl Options {
 fn print_usage() {
     println!(
         "eval-harness — referee the segmenter against hand-corrected timelines (ADR 0015)\n\n\
-         USAGE:\n    eval-harness [--db PATH] [--library local|shared] [RECORDING]\n\n\
+         USAGE:\n    eval-harness [--db PATH] [--library local|shared] [--sweep] [RECORDING]\n\n\
          OPTIONS:\n    \
          --db PATH              metadata DB to read (default: the app's own DB)\n    \
          --library local|shared which library to score (default: the active one)\n    \
+         --sweep                re-score the occupancy parameter grid on cached tracks\n    \
+         --trace                diagnose every missed gold rally at default params\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
          Recordings without a hand-corrected timeline are skipped, never scored."

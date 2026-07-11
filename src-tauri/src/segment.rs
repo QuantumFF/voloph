@@ -34,11 +34,14 @@
 /// future, meaningfully better segmenter can spot stale Analyses. Ignored today;
 /// bump on a change that materially alters the draft timeline it produces.
 ///
-/// v4 (ADR 0015 Stage 2, issue #84): occupancy joins the fusion — the detection
-/// track now *proposes* candidate play spans, materially altering the draft on any
-/// recording where a person detector runs. The staleness machinery (#80) silently
-/// re-drafts untouched recordings on this bump.
-pub const SEGMENTER_VERSION: u32 = 4;
+/// v5 (ADR 0016, issue #91): the occupancy proposal is rebuilt — two-player by
+/// **size structure** (box-area ratio) instead of vertical separation, an
+/// outlier-robust area cap instead of the min/max near/far split, and per-block
+/// **windowed firing density** instead of judging whole occupied runs. v4's
+/// occupancy proposed zero spans on all real footage measured (#85), so this
+/// materially alters the draft anywhere a person detector runs. The staleness
+/// machinery (#80) silently re-drafts untouched recordings on this bump.
+pub const SEGMENTER_VERSION: u32 = 5;
 
 /// A detected rally interval over a recording, in milliseconds from its start,
 /// carrying a per-region confidence in `[0, 1]`. Low-confidence rallies surface
@@ -143,9 +146,10 @@ impl DetBox {
         self.w * self.h
     }
 
-    /// Vertical center in `[0,1]` (0 = top of frame). The near player (large box)
-    /// sits lower in frame than the far player, so this splits the halves without
-    /// any court-line geometry.
+    /// Vertical center in `[0,1]` (0 = top of frame). Used only by the staticness
+    /// clustering to identify furniture positions — *not* as a depth signal: on real
+    /// footage the camera sits low enough that both players share the same cy band
+    /// (issue #91), so depth is read from box area alone.
     fn cy(&self) -> f64 {
         self.y + self.h / 2.0
     }
@@ -154,11 +158,12 @@ impl DetBox {
 /// The per-recording **occupancy track**: the person boxes at each sampled frame,
 /// in time order. The pure mirror of [`crate::detect::DetectionTrack`] (ADR 0015
 /// Stage 2, issue #84). `fps` is the detection sample rate; sample `i` lands at
-/// `i / fps` seconds. Occupancy *proposes* candidate play spans — one near + one
-/// far player, kinetically active, in opposite halves — that motion then edges and
-/// audio then modulates. An absent or empty track is legal and means "detector did
-/// not run": fusion falls back to motion-proposes (pre-#84 behavior), never losing
-/// a rally to a missing signal (the zero-miss bar, ADR 0015).
+/// `i / fps` seconds. Occupancy *proposes* candidate play spans — two plausible
+/// players whose box sizes show near/far depth structure and who are actually
+/// moving (ADR 0016) — that motion then edges and audio then modulates. An absent
+/// or empty track is legal and means "detector did not run": fusion falls back to
+/// motion-proposes (pre-#84 behavior), never losing a rally to a missing signal
+/// (the zero-miss bar, ADR 0015).
 #[derive(Debug, Clone)]
 pub struct OccupancyTrack {
     pub fps: f64,
@@ -209,32 +214,44 @@ pub struct Params {
     /// review, never a silent deletion (issue #79).
     pub unconfirmed_confidence: f64,
 
-    // --- occupancy (ADR 0015 Stage 2, issue #84: occupancy proposes) ---
+    // --- occupancy (ADR 0016, issue #91: size-structure firing + windowed density) ---
     /// Fraction of the frame diagonal a person box's center may drift over the whole
     /// recording and still count as **static** — furniture, not a player. A net-side
     /// bystander stands nearly still for minutes; a real player criss-crosses their
-    /// half. A box track whose center range stays under this is dropped before the
-    /// near/far split so a spectator never proposes play (ADR 0015: bystanders are
-    /// dropped by staticness, not geometry). Raise it to drop more near-still boxes;
-    /// lower it toward 0 to trust almost everything the detector emits.
+    /// half. A box track whose center range stays under this is dropped before any
+    /// pairing so a spectator never proposes play (ADR 0015: bystanders are dropped
+    /// by staticness, not geometry). Doubles as the per-sample **movement** floor of
+    /// the firing rule: a sample only fires when some surviving box center moved at
+    /// least this far since the previous sample. Raise it to drop more near-still
+    /// boxes; lower it toward 0 to trust almost everything the detector emits.
     pub occupancy_static_frac: f64,
-    /// How kinetically active a proposed span's people must be for occupancy to call
-    /// it "rally plausible": the fraction of the span's occupied samples in which a
-    /// tracked player's box center moved at least [`Params::occupancy_static_frac`]
-    /// between consecutive samples. Below it the people are present but milling
-    /// (collecting shuttles, towelling), so occupancy proposes no span there — the
-    /// mechanism that attacks the expensive false positives (ADR 0015). Motion still
-    /// independently proposes, so this never *deletes* a rally, only withholds an
-    /// occupancy proposal.
-    pub occupancy_active_frac: f64,
-    /// The fraction of a candidate span's samples that must show **opposite-half
-    /// occupancy** (one near/lower box and one far/upper box, split per-recording by
-    /// box-size clustering) for occupancy to propose a rally there. Below 1.0 so a
-    /// deep retreat that briefly leaves only one player visible does not sink the
-    /// proposal — only-one-visible must never read as rally-over (ADR 0015). Raise
-    /// toward 1.0 to demand both players almost always present; lower to tolerate
-    /// more single-player stretches.
-    pub occupancy_opposite_frac: f64,
+    /// The minimum large-box/small-box **area ratio** for a sample to show two-player
+    /// depth structure. Under the static camera, box area is the depth proxy (ADR
+    /// 0016): a near player's box dwarfs the far player's (in-rally median ~4.4× on
+    /// the gold corpus, #85), while two people milling at the same depth — or one
+    /// person double-detected — sit near 1×. Raise to demand starker near/far
+    /// structure; lower toward 1 to accept any two visible people.
+    pub occupancy_ratio: f64,
+    /// A box whose area exceeds this multiple of the recording's **median**
+    /// surviving-box area is implausibly large to be a player on court — a passer-by
+    /// walking near the camera (area 0.21–0.50 vs a player median ~0.02, #85) — and
+    /// is discarded before pairing. The median is outlier-robust where the old
+    /// min/max midpoint split was destroyed by exactly one such box. Lower to police
+    /// the cap harder; raise if a legitimately huge near-player box gets eaten.
+    pub occupancy_area_cap_k: f64,
+    /// Width (ms) of the sliding window over the detector's sample stream in which
+    /// per-sample firing is counted into a **density** at each block center. At 2–5
+    /// fps a single ~500 ms block holds only 1–2 samples — far too few to tell
+    /// in-rally firing (~60–80% of samples) from between-rally chatter (~32%, #85) —
+    /// so density is judged at this multi-second scale instead. Wider smooths more
+    /// (better gap rejection, softer edges); narrower sharpens edges but lets gap
+    /// noise through.
+    pub occupancy_window_ms: i64,
+    /// The firing density at a block's window center at or above which the block is
+    /// occupancy-proposed. Sits between the measured in-rally (~60–80%) and
+    /// out-of-gold (~32%) firing densities (#85). Raise to propose more selectively;
+    /// lower toward the gap density to propose more (and eventually glue gaps).
+    pub occupancy_density: f64,
 
     // --- structure ---
     /// Length of the analysis block, in milliseconds. The grain at which motion
@@ -261,8 +278,10 @@ impl Default for Params {
             confirm_onsets_per_sec: 0.2,
             unconfirmed_confidence: 0.3,
             occupancy_static_frac: 0.02,
-            occupancy_active_frac: 0.3,
-            occupancy_opposite_frac: 0.5,
+            occupancy_ratio: 1.5,
+            occupancy_area_cap_k: 8.0,
+            occupancy_window_ms: 3000,
+            occupancy_density: 0.5,
             block_ms: 500,
             bridge_gap_ms: 2900,
             min_rally_ms: 1500,
@@ -380,9 +399,10 @@ pub fn segment_with(
         })
         .collect();
 
-    // 5b. Occupancy *proposes* candidate play spans (ADR 0015 Stage 2, issue #84):
-    //     one near + one far player (per-recording box-size split), kinetically
-    //     active, in opposite halves; a net-side bystander is dropped by staticness;
+    // 5b. Occupancy *proposes* candidate play spans (ADR 0016, issue #91): samples
+    //     showing two plausible players with near/far size structure and real
+    //     movement fire, and a block is proposed when the firing density around it
+    //     is high enough. A net-side bystander is dropped by staticness;
     //     only-one-player-visible never ends a proposal. An absent/empty track
     //     yields no proposals and the fusion is exactly the pre-#84 motion-proposes
     //     path — a failed detector never loses a rally (the zero-miss bar).
@@ -528,34 +548,39 @@ fn bridge_runs(runs: Vec<(usize, usize)>, bridge_blocks: usize) -> Vec<(usize, u
 }
 
 /// Map an [`OccupancyTrack`] onto the block grid, returning per-block "rally
-/// plausible" flags — the occupancy *proposal* (ADR 0015 Stage 2, issue #84).
+/// plausible" flags — the occupancy *proposal* (ADR 0016, issue #91).
 ///
 /// The pipeline, all pure and deterministic:
 /// 1. **Staticness.** Discard boxes belonging to a furniture-like position: a
 ///    net-side bystander stands nearly still for the whole recording, so any box
 ///    whose spatial cell shows a center-drift range below
-///    [`Params::occupancy_static_frac`] over the recording is dropped before the
-///    split (ADR 0015: bystanders die by staticness, not geometry).
-/// 2. **Near/far split.** Under the static camera, box *area* is a depth proxy;
-///    the split is the midpoint between the recording's smallest and largest
-///    surviving box areas (a per-recording clustering with no court geometry). A
-///    below-midpoint box is "far" (small, sits high); above is "near" (large, sits
-///    low).
-/// 3. **Per-sample plausibility.** A sample is "two-player" when it holds a near
-///    box *and* a far box in opposite halves (near lower in frame than far). A
-///    sample with only one visible player is *not* counted against the span —
-///    only-one-visible must never read as rally-over (ADR 0015).
-/// 4. **Kinetic activity.** Across a run of occupied samples, the players must
-///    actually move: the fraction of samples in which a surviving box center shifts
-///    at least [`Params::occupancy_static_frac`] from the previous sample must reach
-///    [`Params::occupancy_active_frac`]. Milling about (collecting shuttles) fails
-///    this and proposes nothing.
-/// 5. **Span → blocks.** A maximal run of occupied samples that is both kinetically
-///    active and opposite-half-occupied on at least [`Params::occupancy_opposite_frac`]
-///    of its samples marks its blocks plausible.
+///    [`Params::occupancy_static_frac`] over the recording is dropped before any
+///    pairing (ADR 0015: bystanders die by staticness, not geometry).
+/// 2. **Plausibility cap.** A box whose area exceeds
+///    [`Params::occupancy_area_cap_k`] × the recording's *median* surviving-box
+///    area is too large to be a player on court — a passer-by near the camera —
+///    and is discarded. The median is robust where v4's min/max midpoint split
+///    was destroyed by exactly one such outlier (#85).
+/// 3. **Per-sample firing.** A sample *fires* when it holds two cap-surviving
+///    boxes whose area ratio reaches [`Params::occupancy_ratio`] — near/far depth
+///    structure read from size alone, never from frame height (the camera is too
+///    low for depth to separate players vertically, #85) — *and* some surviving
+///    box center moved at least [`Params::occupancy_static_frac`] since the
+///    previous sample (players rallying, not standing).
+/// 4. **Windowed density → blocks.** A block is proposed when the fraction of
+///    firing samples inside a [`Params::occupancy_window_ms`] window centered on
+///    it reaches [`Params::occupancy_density`]. In-rally firing (~60–80% of
+///    samples) and between-rally chatter (~32%) only separate above single-sample
+///    scale, so density — not any per-sample or per-run verdict — is the judge.
+///    A sample with one visible player simply doesn't fire; the density threshold
+///    below 1 plus the downstream bridge absorb it, so only-one-visible never
+///    reads as rally-over (ADR 0015).
 ///
-/// Returns an all-`false` vector when `occupancy` is `None`, empty, or never finds a
-/// two-player configuration — the caller then falls back to motion-proposes.
+/// The downstream run/bridge/min-rally/pad machinery is untouched: these flags
+/// union with motion's active mask and the existing span-forming pass runs over
+/// the fused mask. Returns an all-`false` vector when `occupancy` is `None`,
+/// empty, or nothing fires densely enough — the caller then falls back to
+/// motion-proposes.
 fn occupancy_blocks(
     occupancy: Option<&OccupancyTrack>,
     num_blocks: usize,
@@ -567,12 +592,59 @@ fn occupancy_blocks(
         Some(o) if !o.samples.is_empty() && o.fps > 0.0 => o,
         _ => return plausible,
     };
+    let samples = occupancy_firing(occ, p);
+    let n = samples.len();
+    let fired: Vec<bool> = samples.iter().map(|s| s.fired).collect();
 
+    // Windowed firing density at each block's center, via a prefix sum over the
+    // fired flags. A window clipped by the track's edges is judged on the samples
+    // it actually holds; a window holding no samples (block beyond the track's
+    // end) never proposes.
+    let mut fired_prefix = vec![0usize; n + 1];
+    for i in 0..n {
+        fired_prefix[i + 1] = fired_prefix[i] + fired[i] as usize;
+    }
+    let dt_ms = 1000.0 / occ.fps;
+    let half_window = p.occupancy_window_ms as f64 / 2.0;
+    for (b, flag) in plausible.iter_mut().enumerate() {
+        let center_ms = (b as f64 + 0.5) * block_ms as f64;
+        // Sample i lands at i * dt_ms; take every sample inside the window.
+        let lo = (((center_ms - half_window) / dt_ms).ceil().max(0.0)) as usize;
+        let hi = ((center_ms + half_window) / dt_ms).floor() as usize;
+        let hi = hi.min(n.saturating_sub(1));
+        if lo > hi || n == 0 {
+            continue;
+        }
+        let in_window = hi - lo + 1;
+        let firing = fired_prefix[hi + 1] - fired_prefix[lo];
+        *flag = firing as f64 / in_window as f64 >= p.occupancy_density;
+    }
+    plausible
+}
+
+/// One detector sample's view through the occupancy filters — the per-sample half
+/// of [`occupancy_blocks`], exposed so the eval harness can trace a missed rally to
+/// the exact stage that lost it (detector saw too few people vs the firing rule
+/// vs the density judge). Observational only; never feeds back into the draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OccupancySample {
+    /// Boxes surviving the furniture and area-cap filters at this sample.
+    pub live: usize,
+    /// Whether the sample fired: two live boxes with near/far size structure
+    /// ([`Params::occupancy_ratio`]) plus real movement since the previous sample.
+    pub fired: bool,
+}
+
+/// Run the furniture filter, the area cap, and the per-sample firing rule (ADR
+/// 0016) over the track, one [`OccupancySample`] per detector sample. The pure
+/// per-sample stage of [`occupancy_blocks`]; the block stage judges windowed
+/// density over the `fired` flags.
+pub fn occupancy_firing(occ: &OccupancyTrack, p: &Params) -> Vec<OccupancySample> {
     // 1. Staticness: find furniture positions. Cluster every box center by spatial
     //    proximity across the whole recording; a persistent cluster whose members
     //    never wander more than `static_frac` (in either axis) is furniture — a
     //    net-side bystander, not a criss-crossing player. A box near such a centroid
-    //    is dropped from every sample before the split. Proximity clustering (rather
+    //    is dropped from every sample before pairing. Proximity clustering (rather
     //    than a fixed grid) keeps a lightly-jittering box in one cluster, so a real
     //    player's small frame-to-frame wiggle is not mistaken for a still fixture.
     let static_positions = static_furniture_positions(occ, p.occupancy_static_frac);
@@ -583,8 +655,9 @@ fn occupancy_blocks(
             .any(|&(sx, sy)| (cx - sx).abs() <= p.occupancy_static_frac && (cy - sy).abs() <= p.occupancy_static_frac)
     };
 
-    // 2. Near/far split by area, over the surviving (non-furniture) boxes.
-    let areas: Vec<f64> = occ
+    // 2. Plausibility cap from the median surviving-box area — one near-camera
+    //    passer-by cannot move a median the way it moved v4's min/max midpoint.
+    let mut areas: Vec<f64> = occ
         .samples
         .iter()
         .flat_map(|s| s.iter())
@@ -592,83 +665,34 @@ fn occupancy_blocks(
         .map(|b| b.area())
         .collect();
     if areas.is_empty() {
-        return plausible;
+        return occ
+            .samples
+            .iter()
+            .map(|_| OccupancySample { live: 0, fired: false })
+            .collect();
     }
-    let min_area = areas.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_area = areas.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let split = (min_area + max_area) / 2.0;
+    areas.sort_unstable_by(f64::total_cmp);
+    let median_area = areas[areas.len() / 2];
+    let area_cap = p.occupancy_area_cap_k * median_area;
 
-    // 3. Per-sample flags: two-player (near+far, opposite halves) and the surviving
-    //    box centers, so kinetic movement can be measured sample-to-sample.
-    let dt_ms = 1000.0 / occ.fps;
-    let n = occ.samples.len();
-    let mut two_player = vec![false; n];
-    let mut occupied: Vec<bool> = Vec::with_capacity(n);
-    let mut centers: Vec<Vec<(f64, f64)>> = Vec::with_capacity(n);
+    // 3. Per-sample firing: two cap-surviving boxes with near/far size structure,
+    //    plus real movement since the previous sample.
+    let mut out = Vec::with_capacity(occ.samples.len());
+    let mut prev_centers: Vec<(f64, f64)> = Vec::new();
     for s in &occ.samples {
-        let live: Vec<&DetBox> = s.iter().filter(|b| !is_furniture(b)).collect();
-        occupied.push(!live.is_empty());
-        centers.push(
-            live.iter()
-                .map(|b| (b.x + b.w / 2.0, b.cy()))
-                .collect(),
-        );
-        // Near = large box (area ≥ split) sitting lower; far = small box higher.
-        let near = live.iter().find(|b| b.area() >= split);
-        let far = live.iter().find(|b| b.area() < split);
-        let idx = centers.len() - 1;
-        if let (Some(near), Some(far)) = (near, far) {
-            // Opposite halves: the near player sits *substantially* lower in frame
-            // than the far one — separated across the court midline, not merely a
-            // hair apart. `MIN_HALF_SEPARATION` (fraction of frame height) is the gap
-            // below which the two are treated as converged / in the same half, so a
-            // pair milling together at the net never reads as opposite-half play.
-            const MIN_HALF_SEPARATION: f64 = 0.2;
-            two_player[idx] = near.cy() - far.cy() >= MIN_HALF_SEPARATION;
-        }
+        let live: Vec<&DetBox> = s
+            .iter()
+            .filter(|b| !is_furniture(b) && b.area() <= area_cap)
+            .collect();
+        let centers: Vec<(f64, f64)> = live.iter().map(|b| (b.x + b.w / 2.0, b.cy())).collect();
+        let min_area = live.iter().map(|b| b.area()).fold(f64::INFINITY, f64::min);
+        let max_area = live.iter().map(|b| b.area()).fold(0.0, f64::max);
+        let two_player = live.len() >= 2 && min_area > 0.0 && max_area / min_area >= p.occupancy_ratio;
+        let fired = two_player && centers_moved(&prev_centers, &centers, p.occupancy_static_frac);
+        out.push(OccupancySample { live: live.len(), fired });
+        prev_centers = centers;
     }
-
-    // 4/5. Walk runs of occupied samples; propose the run's blocks when it is both
-    //      kinetically active and opposite-half-occupied often enough.
-    let mut i = 0;
-    while i < n {
-        if !occupied[i] {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < n && occupied[i] {
-            i += 1;
-        }
-        let end = i; // [start, end) run of occupied samples
-        let span = end - start;
-        if span == 0 {
-            continue;
-        }
-        // Kinetic: fraction of samples where some center moved ≥ static_frac from
-        // the previous sample.
-        let mut moved = 0usize;
-        for k in (start + 1)..end {
-            if centers_moved(&centers[k - 1], &centers[k], p.occupancy_static_frac) {
-                moved += 1;
-            }
-        }
-        let active_frac = if span > 1 {
-            moved as f64 / (span - 1) as f64
-        } else {
-            0.0
-        };
-        let opp_frac = two_player[start..end].iter().filter(|&&t| t).count() as f64 / span as f64;
-        if active_frac >= p.occupancy_active_frac && opp_frac >= p.occupancy_opposite_frac {
-            // Mark the blocks this sample run spans as plausible.
-            let t0 = start as f64 * dt_ms;
-            let t1 = (end as f64) * dt_ms;
-            let b0 = ((t0 / block_ms as f64) as usize).min(num_blocks);
-            let b1 = ((t1 / block_ms as f64).ceil() as usize).min(num_blocks);
-            plausible[b0..b1].iter_mut().for_each(|p| *p = true);
-        }
-    }
-    plausible
+    out
 }
 
 /// The centroids of every **furniture** cluster: box positions that persist across
@@ -1086,12 +1110,17 @@ mod tests {
         assert!(rally.end_ms >= span.end_ms, "{seg:?}");
     }
 
-    // --- Occupancy proposes (ADR 0015 Stage 2, issue #84) --------------------
+    // --- Occupancy proposes (ADR 0016, issue #91) -----------------------------
     //
     // The third synthetic track. Occupancy *proposes* candidate play spans that
     // motion then edges and audio then modulates; a failed detector (absent track)
     // falls back to motion-proposes and never loses a rally (the zero-miss bar).
     // Each test fabricates a detection track, same pattern as `synth_motion`.
+    //
+    // The fixtures encode **size structure** (ADR 0016): depth separates players
+    // by box *area* (near = large, far = small), never by frame height — on real
+    // footage every box sits in the same cy band (#85), so no fixture may lean on
+    // vertical separation to be recognized.
 
     const DET_FPS: f64 = 3.0;
 
@@ -1123,26 +1152,28 @@ mod tests {
         }
     }
 
-    /// A far player (small box, high in frame) and a near player (large box, low in
-    /// frame), both jittering each sample so the span reads kinetically active — the
-    /// canonical "rally plausible" configuration inside `[s, e)`.
+    /// A far player (small box) and a near player (large box, 5× the area — the
+    /// size structure of ADR 0016), both jittering each sample so every in-span
+    /// sample fires — the canonical "rally plausible" configuration inside `[s, e)`.
+    /// Both sit in the same cy band, as on the real footage.
     fn active_rally_sample(i: usize, t: f64, s: f64, e: f64) -> Vec<DetBox> {
         if t < s || t >= e {
             return vec![];
         }
         let jitter = if i % 2 == 0 { 0.06 } else { -0.06 };
         vec![
-            dbox(0.5 + jitter, 0.25, 0.02), // far: small, high
-            dbox(0.5 - jitter, 0.75, 0.10), // near: large, low
+            dbox(0.5 + jitter, 0.60, 0.02), // far: small
+            dbox(0.5 - jitter, 0.65, 0.10), // near: large, same cy band
         ]
     }
 
     #[test]
-    fn two_active_players_in_opposite_halves_propose_a_rally() {
+    fn two_active_players_with_size_structure_propose_a_rally() {
         // Motion is silent (no whole-court frame-differencing), audio has hits, and
-        // occupancy sees two kinetically-active players in opposite halves. Occupancy
-        // must *propose* the span even though motion never fired — the mechanism that
-        // finds a rally motion is too subtle for.
+        // occupancy sees two kinetically-active boxes whose areas differ by the
+        // near/far ratio. Occupancy must *propose* the span even though motion never
+        // fired — the mechanism that finds a rally motion is too subtle for. Note the
+        // boxes share the same vertical band: size alone carries the depth signal.
         let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
         let motion = synth_motion(20.0, &[]); // motion never fires
         let occ = synth_occupancy(20.0, |i, t| active_rally_sample(i, t, 4.0, 16.0));
@@ -1155,11 +1186,11 @@ mod tests {
     }
 
     #[test]
-    fn converging_players_off_half_yield_a_gap() {
-        // Both players present and moving, but they drift into the *same* half
-        // (converging at the net / wandering off their half) — never opposite halves.
-        // Occupancy must not propose play; with motion also silent, the result is a
-        // gap (no rally).
+    fn a_pair_without_size_structure_never_fires() {
+        // Two people present and moving, but their boxes are the same size — no
+        // near/far depth structure (both at the net, or a doubles pair at equal
+        // depth). The firing rule demands an area ratio; with motion also silent,
+        // the result is a gap (no rally).
         let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
         let motion = synth_motion(20.0, &[]);
         let occ = synth_occupancy(20.0, |i, t| {
@@ -1167,18 +1198,112 @@ mod tests {
                 return vec![];
             }
             let jitter = if i % 2 == 0 { 0.06 } else { -0.06 };
-            // Both boxes sit in the lower half (cy ~0.7) — same half, so no
-            // opposite-half configuration ever forms.
             vec![
-                dbox(0.4 + jitter, 0.70, 0.02),
-                dbox(0.6 - jitter, 0.72, 0.10),
+                dbox(0.4 + jitter, 0.60, 0.02),
+                dbox(0.6 - jitter, 0.62, 0.02), // same area: ratio 1 < occupancy_ratio
             ]
         });
         let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
         assert!(
             rallies.is_empty(),
-            "same-half players must not propose a rally: {rallies:?}"
+            "equal-size boxes must not propose a rally: {rallies:?}"
         );
+    }
+
+    #[test]
+    fn a_near_camera_passer_by_never_proposes_play() {
+        // Downtime: one player mills about (moving, normal-size box) while someone
+        // walks past close to the camera — a huge box, far above the area cap
+        // (occupancy_area_cap_k × median area). The cap must discard the passer-by
+        // before pairing, so the giant-vs-player "ratio" never fires. This is the
+        // outlier that destroyed v4's min/max split (#85).
+        let audio = synth_audio(20.0, &[], 1.0);
+        let motion = synth_motion(20.0, &[]);
+        let occ = synth_occupancy(20.0, |i, t| {
+            let jitter = if i % 2 == 0 { 0.06 } else { -0.06 };
+            // The lone player is on court all recording: median area = 0.01.
+            let mut boxes = vec![dbox(0.5 + jitter, 0.60, 0.01)];
+            // The passer-by crosses mid-recording: area 0.4 = 40× the median.
+            if (6.0..14.0).contains(&t) {
+                boxes.push(dbox(0.2 + (t - 6.0) * 0.08, 0.80, 0.4));
+            }
+            boxes
+        });
+        let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
+        assert!(
+            rallies.is_empty(),
+            "a near-camera passer-by must not read as a rally: {rallies:?}"
+        );
+    }
+
+    #[test]
+    fn milling_players_without_movement_never_fire() {
+        // Two boxes with rally-like size structure, but drifting slower per sample
+        // than the movement floor (players standing between points, towelling). The
+        // slow drift keeps them off the furniture list (their total range is large)
+        // yet no sample shows real inter-sample movement, so nothing fires.
+        let audio = synth_audio(20.0, &[], 1.0);
+        let motion = synth_motion(20.0, &[]);
+        let occ = synth_occupancy(20.0, |i, _t| {
+            let drift = i as f64 * 0.005; // per-sample step ≪ occupancy_static_frac
+            vec![
+                dbox(0.3 + drift, 0.60, 0.02),
+                dbox(0.7 - drift, 0.65, 0.10),
+            ]
+        });
+        let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
+        assert!(
+            rallies.is_empty(),
+            "present-but-milling players must not propose a rally: {rallies:?}"
+        );
+    }
+
+    #[test]
+    fn sparse_firing_at_gap_density_proposes_nothing() {
+        // The rally-plausible configuration appears in only a third of samples —
+        // the between-rally chatter level measured on real footage (#85). The
+        // windowed density judge must stay closed, otherwise the bridge would glue
+        // such gaps into giant false spans.
+        let audio = synth_audio(20.0, &[], 1.0);
+        let motion = synth_motion(20.0, &[]);
+        let occ = synth_occupancy(20.0, |i, t| {
+            if i % 3 == 0 {
+                active_rally_sample(i, t, 0.0, 20.0)
+            } else {
+                // Otherwise only the far player is visible (no firing pair).
+                vec![dbox(0.5, 0.60, 0.02)]
+            }
+        });
+        let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
+        assert!(
+            rallies.is_empty(),
+            "gap-level firing density must not propose a rally: {rallies:?}"
+        );
+    }
+
+    #[test]
+    fn detector_flicker_on_one_player_does_not_shatter_the_rally() {
+        // In-rally, the detector drops the near player in a third of samples (a
+        // real nano-detector failure mode). Firing density stays well above the
+        // threshold, so the rally is proposed as one unbroken span — density < 1
+        // is exactly the tolerance that absorbs one-visible samples.
+        let audio = synth_audio(24.0, &[(4.0, 20.0)], 0.6);
+        let motion = synth_motion(24.0, &[]);
+        let occ = synth_occupancy(24.0, |i, t| {
+            let mut boxes = active_rally_sample(i, t, 4.0, 20.0);
+            if i % 3 == 0 && boxes.len() == 2 {
+                boxes.pop(); // near player missed this sample
+            }
+            boxes
+        });
+        let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
+        assert_eq!(
+            rallies.len(),
+            1,
+            "detector flicker must not shatter the rally: {rallies:?}"
+        );
+        assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
+        assert!(rallies[0].end_ms >= 20_000, "end {rallies:?}");
     }
 
     #[test]
@@ -1203,9 +1328,11 @@ mod tests {
     #[test]
     fn near_player_disappearing_mid_span_keeps_the_rally() {
         // A real rally where the near player retreats deep and leaves frame for a
-        // stretch mid-span (the camera cuts off the baseline). Only the far player is
-        // visible during that stretch. Only-one-visible must NEVER end the span —
-        // the rally continues across the disappearance as one span.
+        // couple of seconds mid-span (the camera cuts off the baseline). Only the
+        // far player is visible during that stretch, so no sample fires there —
+        // but the downstream bridge (`bridge_gap_ms`) spans the firing hole, and
+        // the rally survives as one span. Only-one-visible must NEVER end the span
+        // (ADR 0015); disappearances longer than the bridge are its tuning knob.
         let audio = synth_audio(24.0, &[(4.0, 20.0)], 0.6);
         let motion = synth_motion(24.0, &[]);
         let occ = synth_occupancy(24.0, |i, t| {
@@ -1213,12 +1340,12 @@ mod tests {
                 return vec![];
             }
             let jitter = if i % 2 == 0 { 0.06 } else { -0.06 };
-            let far = dbox(0.5 + jitter, 0.25, 0.02);
-            // Near player leaves frame for the middle third of the rally.
-            if (10.0..14.0).contains(&t) {
+            let far = dbox(0.5 + jitter, 0.60, 0.02);
+            // Near player leaves frame for a 2 s stretch mid-rally.
+            if (10.0..12.0).contains(&t) {
                 vec![far] // only the far player visible
             } else {
-                vec![far, dbox(0.5 - jitter, 0.75, 0.10)]
+                vec![far, dbox(0.5 - jitter, 0.65, 0.10)]
             }
         });
         let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
