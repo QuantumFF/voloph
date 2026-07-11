@@ -66,8 +66,10 @@ const PERSON_CLASS: usize = 0;
 /// Keep an anchor only when `obj * cls_person` clears this. Deliberately low — the
 /// zero-miss bar (ADR 0015) wants occupancy to *propose* generously; a spurious box
 /// costs a downstream false positive, a dropped player risks a missed rally. NMS below
-/// removes duplicate boxes on the same person that this admits.
-const SCORE_THRESHOLD: f32 = 0.35;
+/// removes duplicate boxes on the same person that this admits. Public so the eval
+/// harness can name the shipped floor when it extracts scratch tracks below it
+/// (issue #93); every app path extracts at exactly this floor.
+pub const SCORE_THRESHOLD: f32 = 0.35;
 
 /// Two boxes overlapping more than this (IoU) are treated as the same detection by
 /// [`nms`]; the lower-scoring one is dropped.
@@ -170,10 +172,11 @@ impl Detector {
     }
 
     /// Run the detector on one already-letterboxed `MODEL_SIZE x MODEL_SIZE` BGR frame
-    /// (raw bytes, `H*W*3`), returning the decoded person boxes in **model-input**
-    /// pixel coordinates before letterbox back-mapping. The caller maps them into
-    /// source-normalized space via [`Letterbox::to_source_norm`].
-    fn infer(&mut self, bgr: &[u8]) -> Result<Vec<PixelBox>, String> {
+    /// (raw bytes, `H*W*3`), returning the decoded person boxes at or above
+    /// `score_floor` in **model-input** pixel coordinates before letterbox
+    /// back-mapping. The caller maps them into source-normalized space via
+    /// [`Letterbox::to_source_norm`].
+    fn infer(&mut self, bgr: &[u8], score_floor: f32) -> Result<Vec<PixelBox>, String> {
         let side = MODEL_SIZE as usize;
         debug_assert_eq!(bgr.len(), side * side * 3);
         // HWC bytes → CHW f32, no normalization (YOLOX consumes raw 0–255). Channel
@@ -205,7 +208,7 @@ impl Detector {
         }
         let n = dims[1] as usize;
         let cols = dims[2] as usize;
-        Ok(decode(data, n, cols))
+        Ok(decode(data, n, cols, score_floor))
     }
 }
 
@@ -245,11 +248,16 @@ fn gpu_execution_providers() -> Vec<ExecutionProviderDispatch> {
 /// Decode YOLOX's raw `N x cols` output into scored person boxes in model-input pixel
 /// space. Pure: it replays the grid/stride math (`xy = (raw + grid) * stride`,
 /// `wh = exp(raw) * stride`) that `demo_postprocess` applies, keeps only anchors whose
-/// `obj * cls_person` clears [`SCORE_THRESHOLD`], and converts center-form to corners.
-/// The anchors are laid out head-major in the order of [`STRIDES`], each head a
-/// `(MODEL_SIZE/stride)^2` grid in row-major (y outer, x inner) order — the same order
-/// `demo_postprocess` concatenates them.
-fn decode(data: &[f32], n: usize, cols: usize) -> Vec<PixelBox> {
+/// `obj * cls_person` clears `score_floor` ([`SCORE_THRESHOLD`] on every app path),
+/// and converts center-form to corners. The anchors are laid out head-major in the
+/// order of [`STRIDES`], each head a `(MODEL_SIZE/stride)^2` grid in row-major
+/// (y outer, x inner) order — the same order `demo_postprocess` concatenates them.
+///
+/// Lowering the floor only ever *appends* lower-scored boxes: [`nms`] visits boxes in
+/// descending score order, so a sub-floor box can never suppress one the shipped
+/// floor keeps — the `>= SCORE_THRESHOLD` subset of a low-floor decode is exactly the
+/// default decode (the banding invariant issue #93's presence measurement rests on).
+fn decode(data: &[f32], n: usize, cols: usize, score_floor: f32) -> Vec<PixelBox> {
     let mut out = Vec::new();
     let mut anchor = 0usize;
     for &stride in &STRIDES {
@@ -265,7 +273,7 @@ fn decode(data: &[f32], n: usize, cols: usize) -> Vec<PixelBox> {
                 let obj = raw[4];
                 let cls = raw[5 + PERSON_CLASS];
                 let score = obj * cls;
-                if score < SCORE_THRESHOLD {
+                if score < score_floor {
                     continue;
                 }
                 let cx = (raw[0] + gx as f32) * stride as f32;
@@ -452,18 +460,21 @@ pub fn extract_detections(
     detector: &mut Detector,
     on_progress: impl FnMut(i64),
 ) -> Result<DetectionTrack, String> {
-    extract_detections_at(path, detector, DETECT_FPS, on_progress)
+    extract_detections_at(path, detector, DETECT_FPS, SCORE_THRESHOLD, on_progress)
 }
 
-/// [`extract_detections`] at an explicit sample rate instead of [`DETECT_FPS`] —
-/// the same ffmpeg-stream/letterbox/inference path, only the `fps` filter differs.
-/// The app always samples at [`DETECT_FPS`]; other rates within ADR 0015's decided
-/// 2–5 fps envelope exist for the eval harness's headroom measurements (issue #93),
-/// which extract to a scratch cache and never touch the app's tracks.
+/// [`extract_detections`] at an explicit sample rate and score floor instead of
+/// [`DETECT_FPS`] / [`SCORE_THRESHOLD`] — the same ffmpeg-stream/letterbox/inference
+/// path, only the `fps` filter and the decode floor differ. The app always samples
+/// at [`DETECT_FPS`] with the shipped floor; other rates within ADR 0015's decided
+/// 2–5 fps envelope and lower floors exist for the eval harness's headroom and
+/// presence measurements (issue #93), which extract to a scratch cache and never
+/// touch the app's tracks.
 pub fn extract_detections_at(
     path: &str,
     detector: &mut Detector,
     fps: u32,
+    score_floor: f32,
     mut on_progress: impl FnMut(i64),
 ) -> Result<DetectionTrack, String> {
     let (src_w, src_h) = probe_dimensions(path).unwrap_or((MODEL_SIZE, MODEL_SIZE));
@@ -493,7 +504,7 @@ pub fn extract_detections_at(
         let mut frame = vec![0u8; frame_size];
         let mut frames = 0u64;
         while stdout.read_exact(&mut frame).is_ok() {
-            let pixel_boxes = detector.infer(&frame)?;
+            let pixel_boxes = detector.infer(&frame, score_floor)?;
             let boxes = pixel_boxes
                 .iter()
                 .filter_map(|b| letterbox.to_source_norm(b))
@@ -534,12 +545,17 @@ pub fn extract_detections_at(
 /// detector that cannot load or run costs precision, never a rally. Each failure is
 /// reported once through `on_fail` in the caller's own log sink.
 pub fn detections_or_none(path: &str, on_fail: impl Fn(&str)) -> Option<DetectionTrack> {
-    detections_at_or_none(path, DETECT_FPS, on_fail)
+    detections_at_or_none(path, DETECT_FPS, SCORE_THRESHOLD, on_fail)
 }
 
-/// [`detections_or_none`] at an explicit sample rate — the same load-run-degrade
-/// policy, for the eval harness's scratch extractions (issue #93).
-pub fn detections_at_or_none(path: &str, fps: u32, on_fail: impl Fn(&str)) -> Option<DetectionTrack> {
+/// [`detections_or_none`] at an explicit sample rate and score floor — the same
+/// load-run-degrade policy, for the eval harness's scratch extractions (issue #93).
+pub fn detections_at_or_none(
+    path: &str,
+    fps: u32,
+    score_floor: f32,
+    on_fail: impl Fn(&str),
+) -> Option<DetectionTrack> {
     let model_path = match vendored_model_path() {
         Ok(p) => p,
         Err(e) => {
@@ -554,7 +570,7 @@ pub fn detections_at_or_none(path: &str, fps: u32, on_fail: impl Fn(&str)) -> Op
             return None;
         }
     };
-    match extract_detections_at(path, &mut detector, fps, |_| {}) {
+    match extract_detections_at(path, &mut detector, fps, score_floor, |_| {}) {
         Ok(track) => Some(track),
         Err(e) => {
             on_fail(&format!("extraction failed: {e}"));
@@ -825,7 +841,7 @@ mod tests {
         data[3] = 0.0; // raw h
         data[4] = 1.0; // obj
         data[5 + PERSON_CLASS] = 1.0; // person cls
-        let boxes = decode(&data, n, cols);
+        let boxes = decode(&data, n, cols, SCORE_THRESHOLD);
         assert_eq!(boxes.len(), 1, "only one anchor clears the threshold");
         let b = boxes[0];
         // center (4,4), size 8 → corners (0,0)-(8,8).
@@ -847,7 +863,65 @@ mod tests {
         let mut data = vec![0f32; n * cols];
         data[4] = 0.4; // obj
         data[5] = 0.4; // person → score 0.16 < 0.35
-        assert!(decode(&data, n, cols).is_empty());
+        assert!(decode(&data, n, cols, SCORE_THRESHOLD).is_empty());
+    }
+
+    /// A lowered floor admits the sub-threshold anchor the shipped floor drops —
+    /// the scratch-extraction path of issue #93's presence measurement.
+    #[test]
+    fn decode_admits_sub_threshold_anchors_at_a_lower_floor() {
+        let grid8 = (MODEL_SIZE / 8) as usize;
+        let grid16 = (MODEL_SIZE / 16) as usize;
+        let grid32 = (MODEL_SIZE / 32) as usize;
+        let n = grid8 * grid8 + grid16 * grid16 + grid32 * grid32;
+        let cols = 85;
+        let mut data = vec![0f32; n * cols];
+        data[4] = 0.4; // obj
+        data[5] = 0.4; // person → score 0.16: below 0.35, above 0.10
+        let boxes = decode(&data, n, cols, 0.10);
+        assert_eq!(boxes.len(), 1);
+        assert!((boxes[0].score - 0.16).abs() < 1e-6);
+    }
+
+    /// The `>= SCORE_THRESHOLD` subset of a low-floor decode is exactly the default
+    /// decode: sub-floor boxes are appended by NMS's descending-score order, never
+    /// suppressing a shipped box — the banding invariant the presence measurement
+    /// (issue #93) rests on when it derives every floor from one 0.10 extraction.
+    #[test]
+    fn low_floor_decode_bands_down_to_the_default_decode() {
+        let grid8 = (MODEL_SIZE / 8) as usize;
+        let grid16 = (MODEL_SIZE / 16) as usize;
+        let grid32 = (MODEL_SIZE / 32) as usize;
+        let n = grid8 * grid8 + grid16 * grid16 + grid32 * grid32;
+        let cols = 85;
+        let mut data = vec![0f32; n * cols];
+        // Anchor 0 (stride-8 cell (0,0)): confident box.
+        data[0] = 0.5;
+        data[1] = 0.5;
+        data[4] = 1.0;
+        data[5] = 0.9; // score 0.9
+        // Anchor 1 (stride-8 cell (1,0)): sub-threshold box decoding to exactly
+        // anchor 0's box (raw cx −0.5 cancels the grid offset) — NMS bait that the
+        // confident box must suppress, not the other way around.
+        data[cols] = -0.5;
+        data[cols + 1] = 0.5;
+        data[cols + 4] = 0.8;
+        data[cols + 5] = 0.25; // score 0.2
+        // A far-away sub-threshold box that survives NMS at the low floor.
+        let far = 30 * cols;
+        data[far] = 0.5;
+        data[far + 1] = 0.5;
+        data[far + 4] = 0.8;
+        data[far + 5] = 0.25;
+        let default = decode(&data, n, cols, SCORE_THRESHOLD);
+        let low = decode(&data, n, cols, 0.10);
+        assert!(low.len() > default.len(), "the low floor admits more boxes");
+        let banded: Vec<PixelBox> = low
+            .iter()
+            .filter(|b| b.score >= SCORE_THRESHOLD)
+            .copied()
+            .collect();
+        assert_eq!(banded, default);
     }
 
     /// A non-person class scoring high never survives — only class 0 is kept.
@@ -861,7 +935,7 @@ mod tests {
         let mut data = vec![0f32; n * cols];
         data[4] = 1.0; // obj
         data[5 + 1] = 1.0; // class 1 (bicycle), not person
-        assert!(decode(&data, n, cols).is_empty());
+        assert!(decode(&data, n, cols, SCORE_THRESHOLD).is_empty());
     }
 
     /// NMS collapses two heavily overlapping boxes to the higher-scoring one and keeps

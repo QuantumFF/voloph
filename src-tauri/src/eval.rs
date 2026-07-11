@@ -225,6 +225,9 @@ struct CorpusRecording {
 ///   where the 5 fps tracks are cached (default: the system temp dir).
 /// - `--edges` — split v5's boundary errors by which signal placed each draft
 ///   edge, plus the motion-near-gold-edge trim-viability counts (issue #93).
+/// - `--presence` — quantify presence headroom in the residual missed windows
+///   from sub-threshold detections and continuity bridging (issue #93 round 2);
+///   shares `--scratch` with `--headroom`.
 /// - `RECORDING` — a path substring; score only recordings whose path contains it
 ///   (default: the whole library).
 pub fn run(args: Vec<String>) -> Result<(), String> {
@@ -273,12 +276,16 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         trace_and_report(&recordings);
     } else if opts.fp_trace {
         fp_trace_and_report(&recordings);
-    } else if opts.headroom {
+    } else if opts.headroom || opts.presence {
         let scratch = opts
             .scratch
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("voloph-eval-scratch"));
-        headroom_and_report(&recordings, &scratch);
+        if opts.headroom {
+            headroom_and_report(&recordings, &scratch);
+        } else {
+            presence_and_report(&recordings, &scratch);
+        }
     } else if opts.edges {
         edges_and_report(&recordings);
     } else {
@@ -1265,24 +1272,33 @@ struct HeadroomRecording {
     missed: Vec<Interval>,
 }
 
-/// Load a recording's scratch detection track at `fps`, extracting and caching it
-/// under `scratch_dir` on first use. Keyed by relative path + rate; the app's own
-/// tracks and Analyses are never touched (issue #93). Degrades to `None` exactly
-/// as [`extract_occupancy`] does.
-fn scratch_occupancy(
+/// Load a recording's scratch detection track at `fps` and `score_floor`,
+/// extracting and caching it under `scratch_dir` on first use. Keyed by relative
+/// path + rate (+ floor when lowered, so the shipped-floor files headroom already
+/// cached stay valid); the app's own tracks and Analyses are never touched
+/// (issue #93). Degrades to `None` exactly as [`extract_occupancy`] does. Returns
+/// the score-carrying [`crate::detect::DetectionTrack`] — the presence measurement
+/// bands it by floor before crossing into the pure seam.
+fn scratch_track(
     scratch_dir: &std::path::Path,
     rel_path: &str,
     abs_path: &str,
     fps: u32,
-) -> Option<segment::OccupancyTrack> {
-    let file = scratch_dir.join(format!("{}@{fps}fps.json", rel_path.replace(['/', '\\'], "_")));
+    score_floor: f32,
+) -> Option<crate::detect::DetectionTrack> {
+    let stem = rel_path.replace(['/', '\\'], "_");
+    let file = if score_floor == crate::detect::SCORE_THRESHOLD {
+        scratch_dir.join(format!("{stem}@{fps}fps.json"))
+    } else {
+        scratch_dir.join(format!("{stem}@{fps}fps@f{score_floor:.2}.json"))
+    };
     if let Ok(text) = std::fs::read_to_string(&file) {
         match serde_json::from_str::<crate::detect::DetectionTrack>(&text) {
-            Ok(track) => return Some(track.to_occupancy_track()),
+            Ok(track) => return Some(track),
             Err(e) => eprintln!("      (scratch cache unreadable, re-extracting — {e})"),
         }
     }
-    let track = crate::detect::detections_at_or_none(abs_path, fps, |why| {
+    let track = crate::detect::detections_at_or_none(abs_path, fps, score_floor, |why| {
         eprintln!("      ({fps} fps occupancy unavailable — {why})");
     })?;
     if let Ok(json) = serde_json::to_string(&track) {
@@ -1292,7 +1308,7 @@ fn scratch_occupancy(
             eprintln!("      (could not cache scratch track at {} — {e})", file.display());
         }
     }
-    Some(track.to_occupancy_track())
+    Some(track)
 }
 
 /// Score the corpus at the default parameters through the pure seam with each
@@ -1345,7 +1361,14 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
                 continue;
             }
         };
-        let occ5 = scratch_occupancy(scratch_dir, &rec.rel_path, &rec.abs_path, HEADROOM_FPS);
+        let occ5 = scratch_track(
+            scratch_dir,
+            &rec.rel_path,
+            &rec.abs_path,
+            HEADROOM_FPS,
+            crate::detect::SCORE_THRESHOLD,
+        )
+        .map(|t| t.to_occupancy_track());
         let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
             (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
         );
@@ -1605,6 +1628,420 @@ fn edges_and_report(recordings: &[CorpusRecording]) {
     }
 }
 
+// ── Presence measurement (issue #93, round 2) ─────────────────────────────────
+//
+// The presence-headroom measurement behind the miss tail: the headroom round
+// showed the 22 residual missed windows are presence-starved — two structured,
+// moving boxes don't appear often enough at any per-sample rule or rate — and
+// presence has two untested sources. **Sub-threshold detections**: the shipped
+// extraction keeps only boxes scoring ≥ 0.35 and the cached track type drops the
+// score, so whether the detector emits usable lower-confidence boxes in those
+// windows is invisible today. **Continuity**: a box seen at one sample vanishing
+// from the next says nothing about the player leaving — per-sample independence
+// throws presence away between samples. Both are simulated observationally on
+// scratch tracks (score floor 0.10, both rates) and measured through the real
+// filter pipeline (`segment::occupancy_kinematics` / `occupancy_firing`) — never
+// a parallel reimplementation, and never feeding back into the draft.
+
+/// The lowered score floor scratch tracks are extracted at. Every reported floor
+/// is a *filter* over this one extraction — sound because a lower decode floor
+/// only appends boxes (see `detect::decode`'s banding invariant).
+const PRESENCE_FLOOR: f32 = 0.10;
+
+/// Cumulative admission floors the presence tables report: the shipped floor,
+/// then adding the 0.20–0.35 band, then also the 0.10–0.20 band.
+const PRESENCE_FLOORS: [f32; 3] = [crate::detect::SCORE_THRESHOLD, 0.20, PRESENCE_FLOOR];
+
+/// Bridge depths priced for continuity-bridged presence, in samples (0 = the
+/// per-sample status quo). At 3 fps, k = 3 persists a vanished box for one second.
+const PRESENCE_KS: [usize; 4] = [0, 1, 2, 3];
+
+/// A carried box is *re-detected* (its persistence chain ends) when a real box of
+/// the current sample overlaps it by at least this IoU — the standard association
+/// bar of overlap trackers, generous enough that a player's between-sample step
+/// at 3–5 fps keeps matching their own box.
+const BRIDGE_MATCH_IOU: f64 = 0.3;
+
+/// Intersection-over-union of two normalized boxes; `0.0` when disjoint.
+fn det_iou(a: &segment::DetBox, b: &segment::DetBox) -> f64 {
+    let ix = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
+    let iy = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
+    let inter = ix.max(0.0) * iy.max(0.0);
+    let union = a.w * a.h + b.w * b.h - inter;
+    if union > 0.0 {
+        inter / union
+    } else {
+        0.0
+    }
+}
+
+/// Band a score-carrying detection track down to the boxes clearing `floor`,
+/// crossing into the pure seam's [`segment::OccupancyTrack`]. At the shipped
+/// floor this reproduces the app's own track exactly (the decode banding
+/// invariant); lower floors admit the sub-threshold bands (issue #93).
+fn occupancy_at_floor(track: &crate::detect::DetectionTrack, floor: f32) -> segment::OccupancyTrack {
+    segment::OccupancyTrack {
+        fps: track.fps,
+        samples: track
+            .samples
+            .iter()
+            .map(|frame| {
+                frame
+                    .iter()
+                    .filter(|b| b.score >= floor)
+                    .map(|b| segment::DetBox {
+                        x: f64::from(b.x),
+                        y: f64::from(b.y),
+                        w: f64::from(b.w),
+                        h: f64::from(b.h),
+                    })
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+/// Simulate temporal continuity over a track: every box persists (unchanged
+/// geometry) into up to `k` following samples, dying early when a real detection
+/// re-finds it ([`BRIDGE_MATCH_IOU`]). `k = 0` returns the track as-is. The
+/// augmented track then flows through the real filter pipeline, so a persisted
+/// box is still subject to staticness and the area cap; a persisted box never
+/// moves, so the firing rule's movement demand keeps resting on real detections.
+fn bridge_track(occ: &segment::OccupancyTrack, k: usize) -> segment::OccupancyTrack {
+    // (box, samples since it was really seen); age 0 = seen this sample.
+    let mut carried: Vec<(segment::DetBox, usize)> = Vec::new();
+    let samples = occ
+        .samples
+        .iter()
+        .map(|real| {
+            let mut augmented = real.clone();
+            let mut next: Vec<(segment::DetBox, usize)> = Vec::new();
+            for &(b, age) in &carried {
+                if age + 1 > k || real.iter().any(|r| det_iou(r, &b) >= BRIDGE_MATCH_IOU) {
+                    continue; // chain exhausted, or the player was re-detected
+                }
+                augmented.push(b);
+                next.push((b, age + 1));
+            }
+            for &r in real {
+                next.push((r, 0));
+            }
+            carried = next;
+            augmented
+        })
+        .collect();
+    segment::OccupancyTrack {
+        fps: occ.fps,
+        samples,
+    }
+}
+
+/// Fraction of the samples in `[lo, hi)` whose flag is set — per-missed-window
+/// presence. `0.0` for an empty range (window beyond the track).
+fn flag_fraction(flags: &[bool], lo: usize, hi: usize) -> f64 {
+    let hi = hi.min(flags.len());
+    let lo = lo.min(hi);
+    if lo == hi {
+        return 0.0;
+    }
+    flags[lo..hi].iter().filter(|&&f| f).count() as f64 / (hi - lo) as f64
+}
+
+/// One gold recording's material for the presence measurement: the fixed missed
+/// windows of the v5-default draft on the app's own tracks, the app-path 3 fps
+/// occupancy (for the banding consistency line), and the score-carrying low-floor
+/// scratch tracks at both rates.
+struct PresenceRecording {
+    rel_path: String,
+    gold: Vec<Interval>,
+    missed: Vec<Interval>,
+    occ3: Option<segment::OccupancyTrack>,
+    low3: Option<crate::detect::DetectionTrack>,
+    low5: Option<crate::detect::DetectionTrack>,
+}
+
+/// One simulated variant's pooled measurements: presence (the two-structured-boxes
+/// flag) and the shipped firing rule, both on the same modified track, plus the
+/// per-missed-window numbers in corpus order.
+struct VariantStats {
+    presence: RuleStats,
+    fired: RuleStats,
+    /// Per missed window: fraction of its samples with two-structured-boxes presence.
+    window_presence: Vec<f64>,
+    /// Per missed window: peak windowed density of the shipped rule's firing.
+    window_fired_peak: Vec<f64>,
+}
+
+/// Measure one (floor, k) variant across the corpus at one rate. `low_of` picks
+/// the rate's low-floor track. Presence and firing are read through the real
+/// pipeline seams on the banded, bridged track.
+fn measure_variant(
+    recs: &[PresenceRecording],
+    low_of: impl Fn(&PresenceRecording) -> Option<&crate::detect::DetectionTrack>,
+    floor: f32,
+    k: usize,
+    p: &segment::Params,
+) -> VariantStats {
+    let mut vs = VariantStats {
+        presence: RuleStats::default(),
+        fired: RuleStats::default(),
+        window_presence: Vec::new(),
+        window_fired_peak: Vec::new(),
+    };
+    for rec in recs {
+        let Some(low) = low_of(rec) else {
+            // Keep the per-window vectors aligned with the corpus order.
+            vs.window_presence.extend(rec.missed.iter().map(|_| 0.0));
+            vs.window_fired_peak.extend(rec.missed.iter().map(|_| 0.0));
+            continue;
+        };
+        let track = bridge_track(&occupancy_at_floor(low, floor), k);
+        let presence: Vec<bool> = segment::occupancy_kinematics(&track, p)
+            .iter()
+            .map(|s| s.size_structure)
+            .collect();
+        let fired: Vec<bool> = segment::occupancy_firing(&track, p)
+            .iter()
+            .map(|s| s.fired)
+            .collect();
+        vs.presence.add(&presence, track.fps, &rec.gold, &rec.missed, p);
+        vs.fired.add(&fired, track.fps, &rec.gold, &rec.missed, p);
+        let half = half_window(p, track.fps);
+        for m in &rec.missed {
+            let (lo, hi) = sample_range(*m, track.fps, presence.len());
+            vs.window_presence.push(flag_fraction(&presence, lo, hi));
+            vs.window_fired_peak.push(peak_density(&fired, lo, hi, half));
+        }
+    }
+    vs
+}
+
+/// Row label for an admission floor.
+fn floor_label(floor: f32) -> String {
+    if floor == crate::detect::SCORE_THRESHOLD {
+        format!(">={floor:.2} (shipped)")
+    } else {
+        format!(">={floor:.2}")
+    }
+}
+
+/// The presence-headroom report (issue #93, round 2): per-score-band presence,
+/// continuity-bridged presence, and the both-sides separation table, at both
+/// rates, all on scratch tracks banded from one low-floor extraction per rate.
+fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Path) {
+    let p = segment::Params::default();
+    let mut recs: Vec<PresenceRecording> = Vec::new();
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            println!("SKIP  {}  (not gold)", rec.rel_path);
+            continue;
+        }
+        let (samples, motion, occ3) = match extract_tracks(&rec.abs_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        // The fixed missed-window list (v5 defaults on the app's own tracks).
+        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occ3.as_ref(), &p);
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .collect();
+        let missed: Vec<Interval> = rec
+            .gold
+            .iter()
+            .filter(|g| !draft.iter().any(|d| d.overlaps(g)))
+            .copied()
+            .collect();
+        let low3 = scratch_track(scratch_dir, &rec.rel_path, &rec.abs_path, crate::detect::DETECT_FPS, PRESENCE_FLOOR);
+        let low5 = scratch_track(scratch_dir, &rec.rel_path, &rec.abs_path, HEADROOM_FPS, PRESENCE_FLOOR);
+        println!("CACHE {}  ({} missed at v5 defaults)", rec.rel_path, missed.len());
+        recs.push(PresenceRecording {
+            rel_path: rec.rel_path.clone(),
+            gold: rec.gold.clone(),
+            missed,
+            occ3,
+            low3,
+            low5,
+        });
+    }
+    if recs.is_empty() {
+        println!("no gold recordings to measure");
+        return;
+    }
+
+    // Banding consistency: the shipped-floor band of the low-floor 3 fps scratch
+    // track must reproduce the app-path track (same decode, same NMS survivors).
+    let count_structure = |occ: &segment::OccupancyTrack| {
+        segment::occupancy_kinematics(occ, &p)
+            .iter()
+            .filter(|s| s.size_structure)
+            .count()
+    };
+    let (mut app_structure, mut banded_structure) = (0usize, 0usize);
+    for r in &recs {
+        if let (Some(occ3), Some(low3)) = (&r.occ3, &r.low3) {
+            app_structure += count_structure(occ3);
+            banded_structure += count_structure(&occupancy_at_floor(low3, crate::detect::SCORE_THRESHOLD));
+        }
+    }
+    println!(
+        "\nbanding consistency: structured samples on app 3 fps tracks {app_structure} vs scratch@shipped-floor {banded_structure}{}",
+        if app_structure == banded_structure { "  (identical)" } else { "  (MISMATCH)" }
+    );
+
+    type LowOf = fn(&PresenceRecording) -> Option<&crate::detect::DetectionTrack>;
+    let rates: [(&str, LowOf); 2] = [
+        ("3 fps", |r| r.low3.as_ref()),
+        ("5 fps", |r| r.low5.as_ref()),
+    ];
+
+    // Measure every (rate, floor, k) variant once; the tables below are views.
+    let mut variants: Vec<Vec<Vec<VariantStats>>> = Vec::new(); // [rate][floor][k]
+    for (_, low_of) in rates {
+        let mut by_floor = Vec::new();
+        for &floor in &PRESENCE_FLOORS {
+            let mut by_k = Vec::new();
+            for &k in &PRESENCE_KS {
+                by_k.push(measure_variant(&recs, low_of, floor, k, &p));
+            }
+            by_floor.push(by_k);
+        }
+        variants.push(by_floor);
+    }
+
+    let pct = |n: usize, d: usize| 100.0 * n as f64 / d.max(1) as f64;
+    let stat_row = |s: &RuleStats| {
+        format!(
+            "{:>8.1}% {:>7.1}% {:>13} {:>13.1}%",
+            pct(s.in_gold_fired, s.in_gold_total),
+            pct(s.out_fired, s.out_total),
+            format!("{}/{}", s.missed_proposing, s.missed_total),
+            pct(s.out_windows_proposing, s.out_windows),
+        )
+    };
+
+    // 1. Sub-threshold presence by admission floor (k = 0).
+    println!("\n=== two-structured-boxes presence by admission floor (plausibility-filtered) ===");
+    for (ri, (rate_label, _)) in rates.iter().enumerate() {
+        println!(
+            "@ {rate_label}: {:<18} {:>9} {:>8} {:>13} {:>14}",
+            "floor", "in-gold%", "out%", "missed>=dens", "out win>=dens"
+        );
+        for (fi, &floor) in PRESENCE_FLOORS.iter().enumerate() {
+            let vs = &variants[ri][fi][0];
+            println!("         {:<18} {}", floor_label(floor), stat_row(&vs.presence));
+        }
+    }
+
+    // 2. Continuity-bridged presence at the shipped floor.
+    println!("\n=== continuity-bridged presence (shipped floor, k = persisted samples) ===");
+    for (ri, (rate_label, _)) in rates.iter().enumerate() {
+        println!(
+            "@ {rate_label}: {:<18} {:>9} {:>8} {:>13} {:>14}",
+            "bridge", "in-gold%", "out%", "missed>=dens", "out win>=dens"
+        );
+        for (ki, &k) in PRESENCE_KS.iter().enumerate() {
+            let vs = &variants[ri][0][ki];
+            println!("         {:<18} {}", format!("k = {k}"), stat_row(&vs.presence));
+        }
+    }
+
+    // 3. Separation: the shipped firing rule on every modified track — what the
+    //    windowed-density judge would actually see, both sides of the trade.
+    println!("\n=== separation: shipped firing rule on banded + bridged tracks ===");
+    println!(
+        "{:<8} {:<18} {:<6} {:>9} {:>8} {:>13} {:>14}",
+        "rate", "floor", "k", "in-gold%", "out%", "missed>=dens", "out win>=dens"
+    );
+    for (ri, (rate_label, _)) in rates.iter().enumerate() {
+        for (fi, &floor) in PRESENCE_FLOORS.iter().enumerate() {
+            for (ki, &k) in PRESENCE_KS.iter().enumerate() {
+                let vs = &variants[ri][fi][ki];
+                println!(
+                    "{:<8} {:<18} {:<6} {}",
+                    rate_label,
+                    floor_label(floor),
+                    k,
+                    stat_row(&vs.fired)
+                );
+            }
+        }
+    }
+
+    // 4. Every missed window individually. Presence fraction by floor (k = 0),
+    //    presence fraction by bridge depth (shipped floor), and the shipped rule's
+    //    peak windowed density on the strongest single and combined variants.
+    let windows: Vec<(String, Interval)> = recs
+        .iter()
+        .flat_map(|r| r.missed.iter().map(|m| (r.rel_path.clone(), *m)))
+        .collect();
+    let cell = |v: f64| format!("{v:.2}");
+    println!("\n=== per-missed-window presence fraction by floor (k = 0) ===");
+    println!(
+        "{:<44} {:>6}   3fps: {:>5} {:>5} {:>5}   5fps: {:>5} {:>5} {:>5}",
+        "window", "dur", ".35", ".20", ".10", ".35", ".20", ".10"
+    );
+    for (wi, (rel, m)) in windows.iter().enumerate() {
+        let mut cells: Vec<String> = Vec::new();
+        for by_floor in &variants {
+            for by_k in by_floor {
+                cells.push(cell(by_k[0].window_presence[wi]));
+            }
+        }
+        println!(
+            "{:<44} {:>5.1}s   {:>11} {:>5} {:>5}   {:>11} {:>5} {:>5}",
+            format!("{rel} {:.1}s–{:.1}s", m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+            (m.end_ms - m.start_ms) as f64 / 1000.0,
+            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5],
+        );
+    }
+    println!("\n=== per-missed-window presence fraction by bridge depth (shipped floor) ===");
+    println!(
+        "{:<44} {:>6}   3fps: {:>5} {:>5} {:>5} {:>5}   5fps: {:>5} {:>5} {:>5} {:>5}",
+        "window", "dur", "k0", "k1", "k2", "k3", "k0", "k1", "k2", "k3"
+    );
+    for (wi, (rel, m)) in windows.iter().enumerate() {
+        let mut cells: Vec<String> = Vec::new();
+        for by_floor in &variants {
+            for vs in &by_floor[0] {
+                cells.push(cell(vs.window_presence[wi]));
+            }
+        }
+        println!(
+            "{:<44} {:>5.1}s   {:>11} {:>5} {:>5} {:>5}   {:>11} {:>5} {:>5} {:>5}",
+            format!("{rel} {:.1}s–{:.1}s", m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+            (m.end_ms - m.start_ms) as f64 / 1000.0,
+            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7],
+        );
+    }
+    println!("\n=== per-missed-window peak fired density: baseline vs mechanisms vs combined ===");
+    println!(
+        "{:<44} {:>6}   3fps: {:>5} {:>5} {:>5} {:>5}   5fps: {:>5} {:>5} {:>5} {:>5}",
+        "window", "dur", "base", "f.10", "k2", "f+k2", "base", "f.10", "k2", "f+k2"
+    );
+    // (floor index, k index) per printed column: baseline, floor-only, bridge-only,
+    // combined — the k = 2 depth as the representative bridge.
+    let picks: [(usize, usize); 4] = [(0, 0), (2, 0), (0, 2), (2, 2)];
+    for (wi, (rel, m)) in windows.iter().enumerate() {
+        let mut cells: Vec<String> = Vec::new();
+        for by_floor in &variants {
+            for &(fi, ki) in &picks {
+                cells.push(cell(by_floor[fi][ki].window_fired_peak[wi]));
+            }
+        }
+        println!(
+            "{:<44} {:>5.1}s   {:>11} {:>5} {:>5} {:>5}   {:>11} {:>5} {:>5} {:>5}",
+            format!("{rel} {:.1}s–{:.1}s", m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+            (m.end_ms - m.start_ms) as f64 / 1000.0,
+            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7],
+        );
+    }
+}
+
 /// One recording's line block: the headline path, then the three numbers with the
 /// counts behind them.
 fn print_recording(rel_path: &str, s: &Score) {
@@ -1634,6 +2071,7 @@ struct Options {
     fp_trace: bool,
     headroom: bool,
     edges: bool,
+    presence: bool,
     scratch: Option<String>,
     help: bool,
 }
@@ -1651,6 +2089,7 @@ impl Options {
             fp_trace: false,
             headroom: false,
             edges: false,
+            presence: false,
             scratch: None,
             help: false,
         };
@@ -1663,6 +2102,7 @@ impl Options {
                 "--fp-trace" => opts.fp_trace = true,
                 "--headroom" => opts.headroom = true,
                 "--edges" => opts.edges = true,
+                "--presence" => opts.presence = true,
                 "--scratch" => {
                     opts.scratch = Some(it.next().ok_or("--scratch needs a directory")?.clone());
                 }
@@ -1702,7 +2142,8 @@ fn print_usage() {
          --fp-trace             classify every draft span by signal support (issue #92)\n    \
          --headroom             price the velocity firing rule and 5 fps sampling (issue #93)\n    \
          --edges                split boundary errors by edge provenance (issue #93)\n    \
-         --scratch DIR          cache dir for --headroom's 5 fps tracks (default: temp)\n    \
+         --presence             presence headroom: sub-threshold + bridged (issue #93)\n    \
+         --scratch DIR          cache dir for scratch detection tracks (default: temp)\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
          Recordings without a hand-corrected timeline are skipped, never scored."
@@ -2234,6 +2675,137 @@ mod tests {
         assert!(motion_near(&b, 3400, 1000));
         assert!(!motion_near(&b, 4000, 1000));
         assert!(motion_near(&b, 4000, 2000));
+    }
+
+    // ── Presence measurement (issue #93, round 2) ─────────────────────────────
+
+    /// A normalized box for presence fixtures.
+    fn dbox(x: f64, y: f64, side: f64) -> segment::DetBox {
+        segment::DetBox { x, y, w: side, h: side }
+    }
+
+    /// A scored detector box for banding fixtures.
+    fn sbox(x: f32, side: f32, score: f32) -> crate::detect::Box {
+        crate::detect::Box { x, y: 0.25, w: side, h: side, score }
+    }
+
+    #[test]
+    fn det_iou_bounds() {
+        let a = dbox(0.1, 0.1, 0.2);
+        let far = dbox(0.7, 0.7, 0.2);
+        assert!((det_iou(&a, &a) - 1.0).abs() < 1e-9);
+        assert_eq!(det_iou(&a, &far), 0.0);
+    }
+
+    #[test]
+    fn banding_admits_boxes_by_cumulative_floor_and_keeps_geometry() {
+        let track = crate::detect::DetectionTrack {
+            fps: 3.0,
+            samples: vec![vec![
+                sbox(0.125, 0.25, 0.5),
+                sbox(0.5, 0.25, 0.25),
+                sbox(0.75, 0.25, 0.125),
+            ]],
+        };
+        let shipped = occupancy_at_floor(&track, crate::detect::SCORE_THRESHOLD);
+        let mid = occupancy_at_floor(&track, 0.20);
+        let low = occupancy_at_floor(&track, 0.10);
+        assert_eq!(shipped.samples[0].len(), 1);
+        assert_eq!(mid.samples[0].len(), 2);
+        assert_eq!(low.samples[0].len(), 3);
+        // Geometry crosses the seam unchanged (exactly representable values).
+        assert_eq!(shipped.samples[0][0], dbox(0.125, 0.25, 0.25));
+        assert_eq!(shipped.fps, 3.0);
+    }
+
+    #[test]
+    fn bridge_depth_zero_returns_the_track_unchanged() {
+        let occ = segment::OccupancyTrack {
+            fps: 3.0,
+            samples: vec![vec![dbox(0.1, 0.1, 0.2)], vec![], vec![dbox(0.5, 0.5, 0.2)]],
+        };
+        assert_eq!(bridge_track(&occ, 0).samples, occ.samples);
+    }
+
+    #[test]
+    fn a_vanished_box_persists_for_up_to_k_samples() {
+        let a = dbox(0.1, 0.1, 0.2);
+        let occ = segment::OccupancyTrack {
+            fps: 3.0,
+            samples: vec![vec![a], vec![], vec![], vec![]],
+        };
+        let bridged = bridge_track(&occ, 2);
+        assert_eq!(bridged.samples[1], vec![a], "persists one sample after vanishing");
+        assert_eq!(bridged.samples[2], vec![a], "persists a second sample");
+        assert!(bridged.samples[3].is_empty(), "the chain ends after k samples");
+    }
+
+    #[test]
+    fn a_redetected_box_ends_its_chain_instead_of_duplicating() {
+        let a = dbox(0.10, 0.10, 0.20);
+        // Shifted a quarter-side: IoU well above the association bar.
+        let a_moved = dbox(0.15, 0.10, 0.20);
+        let occ = segment::OccupancyTrack {
+            fps: 3.0,
+            samples: vec![vec![a], vec![a_moved]],
+        };
+        let bridged = bridge_track(&occ, 3);
+        assert_eq!(bridged.samples[1], vec![a_moved], "no ghost of the re-detected box");
+    }
+
+    #[test]
+    fn a_disjoint_new_box_does_not_end_another_boxs_chain() {
+        let a = dbox(0.1, 0.1, 0.2);
+        let b = dbox(0.7, 0.7, 0.2);
+        let occ = segment::OccupancyTrack {
+            fps: 3.0,
+            samples: vec![vec![a], vec![b]],
+        };
+        let bridged = bridge_track(&occ, 1);
+        assert_eq!(bridged.samples[1], vec![b, a], "the real box plus the carried one");
+    }
+
+    /// End-to-end through the real pipeline: two players the detector only ever
+    /// sees one-at-a-time (alternating samples) show no two-structured-boxes
+    /// presence unbridged, and full presence once each box may persist one sample.
+    #[test]
+    fn bridging_recovers_structure_the_alternating_detector_loses() {
+        // Both players drift 0.03 per appearance so the furniture filter (span
+        // <= static_frac 0.02) never eats them. Far box area 0.01, near 0.04 —
+        // ratio 4 clears the 1.5 structure bar while the near box stays under the
+        // area cap even when carried far boxes pull the median area down to 0.01.
+        let n = 12;
+        let samples: Vec<Vec<segment::DetBox>> = (0..n)
+            .map(|i| {
+                let drift = 0.03 * (i / 2) as f64;
+                if i % 2 == 0 {
+                    vec![dbox(0.10 + drift, 0.20, 0.1)]
+                } else {
+                    vec![dbox(0.60 + drift, 0.60, 0.2)]
+                }
+            })
+            .collect();
+        let occ = segment::OccupancyTrack { fps: 3.0, samples };
+        let p = segment::Params::default();
+        let unbridged: Vec<bool> = segment::occupancy_kinematics(&occ, &p)
+            .iter()
+            .map(|s| s.size_structure)
+            .collect();
+        assert!(unbridged.iter().all(|&s| !s), "one visible box never structures");
+        let bridged: Vec<bool> = segment::occupancy_kinematics(&bridge_track(&occ, 1), &p)
+            .iter()
+            .map(|s| s.size_structure)
+            .collect();
+        assert!(!bridged[0], "nothing to carry into the first sample");
+        assert!(bridged[1..].iter().all(|&s| s), "every later sample pairs real + carried");
+    }
+
+    #[test]
+    fn flag_fraction_counts_within_the_clipped_range() {
+        let flags = [true, false, true, true];
+        assert!((flag_fraction(&flags, 0, 2) - 0.5).abs() < 1e-9);
+        assert!((flag_fraction(&flags, 2, 99) - 1.0).abs() < 1e-9, "clips at the track end");
+        assert_eq!(flag_fraction(&flags, 4, 4), 0.0, "an empty range has no presence");
     }
 
     #[test]
