@@ -323,47 +323,9 @@ pub fn segment_with(
         };
     }
 
-    // 1. Per-frame audio energy (mean square), non-overlapping frames.
-    let frame_ms = p.frame as f64 / sr * 1000.0;
-    let energy: Vec<f64> = samples
-        .chunks(p.frame)
-        .map(|chunk| {
-            let sum: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
-            sum / chunk.len() as f64
-        })
-        .collect();
-
-    let clip_mean = mean(&energy).max(f64::MIN_POSITIVE);
-    let floor = p.onset_floor_ratio * clip_mean;
-    let baseline_frames = ((p.baseline_ms as f64) / frame_ms).round().max(1.0) as usize;
-
-    // 2. Onset per frame: a sharp energy rise above the adaptive baseline and the
-    //    absolute floor. The baseline is the mean of the preceding frames, so it
-    //    tracks the local level rather than the global one.
-    let mut onset = vec![false; energy.len()];
-    let mut window_sum = 0.0;
-    for i in 0..energy.len() {
-        let baseline = if i == 0 {
-            clip_mean
-        } else {
-            window_sum / i.min(baseline_frames) as f64
-        };
-        if energy[i] >= floor && energy[i] >= p.onset_ratio * baseline {
-            onset[i] = true;
-        }
-        window_sum += energy[i];
-        if i >= baseline_frames {
-            window_sum -= energy[i - baseline_frames];
-        }
-    }
-
-    // 3. Block grid (from the audio frames). Per block, count onsets.
-    let grid = block_grid(energy.len(), sample_rate, p);
+    // 1–3. Per-frame audio energy → per-frame onsets → per-block onset counts.
+    let (block_onsets, grid) = onset_block_counts(samples, sample_rate, p);
     let (block_secs, block_ms) = (grid.block_secs, grid.block_ms);
-    let block_onsets: Vec<usize> = onset
-        .chunks(grid.frames_per_block)
-        .map(|chunk| chunk.iter().filter(|&&o| o).count())
-        .collect();
     let num_blocks = block_onsets.len();
 
     // 4–5. Map the motion track onto the same block grid and threshold it: a block
@@ -523,6 +485,91 @@ fn block_grid(num_frames: usize, sample_rate: u32, p: &Params) -> BlockGrid {
         block_secs,
         block_ms,
         num_blocks: num_frames.div_ceil(frames_per_block),
+    }
+}
+
+/// The onset half of the audio path, shared by [`segment_with`] and the
+/// observational [`onset_blocks`] seam: per-frame audio energy (mean square,
+/// non-overlapping frames), per-frame onset flags (a sharp rise above the
+/// adaptive baseline and the absolute floor), then per-block onset counts on the
+/// [`BlockGrid`]. Returns the counts with the grid they index.
+fn onset_block_counts(samples: &[f32], sample_rate: u32, p: &Params) -> (Vec<usize>, BlockGrid) {
+    let sr = sample_rate as f64;
+
+    // 1. Per-frame audio energy (mean square), non-overlapping frames.
+    let frame_ms = p.frame as f64 / sr * 1000.0;
+    let energy: Vec<f64> = samples
+        .chunks(p.frame)
+        .map(|chunk| {
+            let sum: f64 = chunk.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            sum / chunk.len() as f64
+        })
+        .collect();
+
+    let clip_mean = mean(&energy).max(f64::MIN_POSITIVE);
+    let floor = p.onset_floor_ratio * clip_mean;
+    let baseline_frames = ((p.baseline_ms as f64) / frame_ms).round().max(1.0) as usize;
+
+    // 2. Onset per frame: a sharp energy rise above the adaptive baseline and the
+    //    absolute floor. The baseline is the mean of the preceding frames, so it
+    //    tracks the local level rather than the global one.
+    let mut onset = vec![false; energy.len()];
+    let mut window_sum = 0.0;
+    for i in 0..energy.len() {
+        let baseline = if i == 0 {
+            clip_mean
+        } else {
+            window_sum / i.min(baseline_frames) as f64
+        };
+        if energy[i] >= floor && energy[i] >= p.onset_ratio * baseline {
+            onset[i] = true;
+        }
+        window_sum += energy[i];
+        if i >= baseline_frames {
+            window_sum -= energy[i - baseline_frames];
+        }
+    }
+
+    // 3. Block grid (from the audio frames). Per block, count onsets.
+    let grid = block_grid(energy.len(), sample_rate, p);
+    let block_onsets: Vec<usize> = onset
+        .chunks(grid.frames_per_block)
+        .map(|chunk| chunk.iter().filter(|&&o| o).count())
+        .collect();
+    (block_onsets, grid)
+}
+
+/// The per-block shuttle-hit **onset counts** behind the confidence modulator —
+/// what [`segment_with`] sums over a span to confirm play — on the same block
+/// grid every other per-block mask indexes. [`segment_with`] only ever exposes
+/// the collapsed per-span verdict, so the eval harness's span-separation
+/// measurement (issue #93 round 3) re-reads the mask through this seam rather
+/// than reimplementing the onset detector. Observational only — never feeds back
+/// into the draft.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnsetBlocks {
+    /// Length of one block in ms — the grid the counts index.
+    pub block_ms: i64,
+    /// Onsets detected in each block.
+    pub onsets: Vec<usize>,
+}
+
+/// Compute the per-block onset counts for the same inputs [`segment_with`] takes,
+/// through the identical energy/onset/grid path ([`onset_block_counts`]), so the
+/// counts here are exactly the ones the confidence modulator summed. Pure and
+/// observational (issue #93 round 3). Mirrors [`segment_with`]'s too-short guard:
+/// audio shorter than two frames yields no blocks.
+pub fn onset_blocks(samples: &[f32], sample_rate: u32, p: &Params) -> OnsetBlocks {
+    if samples.len() < p.frame * 2 {
+        return OnsetBlocks {
+            block_ms: p.block_ms.max(1),
+            onsets: Vec::new(),
+        };
+    }
+    let (onsets, grid) = onset_block_counts(samples, sample_rate, p);
+    OnsetBlocks {
+        block_ms: grid.block_ms.max(1),
+        onsets,
     }
 }
 
@@ -1592,6 +1639,47 @@ mod tests {
             assert!(!k.size_structure);
             assert_eq!(k.max_step, None);
         }
+    }
+
+    // --- Onset-mask seam (issue #93 round 3) ----------------------------------
+    //
+    // The observational sibling of the audio path: per-block onset counts on the
+    // segmenter's own grid, so span-level audio features are read from the mask
+    // `segment_with` actually summed, never a parallel onset detector.
+
+    #[test]
+    fn onset_blocks_count_hits_where_they_land() {
+        // Hits only inside [12,18): onsets must land in those blocks and the
+        // silent front half must stay zero.
+        let audio = synth_audio(20.0, &[(12.0, 18.0)], 0.3);
+        let ob = onset_blocks(&audio, SR, &Params::default());
+        let block_at = |ms: i64| (ms / ob.block_ms) as usize;
+        let front: usize = ob.onsets[..block_at(11_000)].iter().sum();
+        let back: usize = ob.onsets[block_at(12_000)..block_at(18_000).min(ob.onsets.len())]
+            .iter()
+            .sum();
+        assert_eq!(front, 0, "silence must not onset: {ob:?}");
+        assert!(back > 0, "hits must land in their blocks: {ob:?}");
+    }
+
+    #[test]
+    fn onset_blocks_share_the_segmenter_grid() {
+        // The mask must index the exact grid the other per-block masks use, so a
+        // span's blocks address both without conversion.
+        let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
+        let motion = synth_motion(20.0, &[]);
+        let p = Params::default();
+        let ob = onset_blocks(&audio, SR, &p);
+        let fb = fusion_blocks(&audio, SR, &motion, None, &p);
+        assert_eq!(ob.block_ms, fb.block_ms);
+        assert_eq!(ob.onsets.len(), fb.motion.len());
+    }
+
+    #[test]
+    fn too_short_audio_yields_no_onset_blocks() {
+        // Mirrors segment_with's guard: under two frames there is no signal.
+        let ob = onset_blocks(&[0.0; 100], SR, &Params::default());
+        assert!(ob.onsets.is_empty());
     }
 
     #[test]

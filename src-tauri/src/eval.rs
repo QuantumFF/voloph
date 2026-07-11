@@ -228,6 +228,9 @@ struct CorpusRecording {
 /// - `--presence` — quantify presence headroom in the residual missed windows
 ///   from sub-threshold detections and continuity bridging (issue #93 round 2);
 ///   shares `--scratch` with `--headroom`.
+/// - `--spans` — span-score separation: integrated continuity+movement(+audio)
+///   features over gold rallies, duration-matched out-of-gold windows, and v5's
+///   FP spans, swept through the declared score grid (issue #93 round 3).
 /// - `RECORDING` — a path substring; score only recordings whose path contains it
 ///   (default: the whole library).
 pub fn run(args: Vec<String>) -> Result<(), String> {
@@ -288,6 +291,8 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         }
     } else if opts.edges {
         edges_and_report(&recordings);
+    } else if opts.spans {
+        spans_and_report(&recordings);
     } else {
         score_and_report(&recordings);
     }
@@ -2042,6 +2047,616 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     }
 }
 
+// ── Span-score separation (issue #93, round 3) ────────────────────────────────
+//
+// The span-level measurement behind the miss tail: rounds 1–2 refuted every
+// per-sample admission mechanism (velocity re-keying, rate, sub-threshold boxes,
+// sample persistence) — each hits the same monotone trade before the ≤ 5 bar —
+// and left one direction standing: the rally/chatter difference living in
+// *temporal structure* over a span rather than in any per-sample predicate. This
+// mode measures that premise without building the design: integrated
+// continuity+movement(+audio) features are read over three *known* populations
+// (all gold rally extents, duration-matched out-of-gold windows, v5's FP spans)
+// and hand-constructed, interpretable score functions are swept over a declared
+// grid, reporting both sides of every operating point against the declared
+// green/red/gray kill criterion. No candidate generator, no draft change —
+// features flow through the real seams (`occupancy_kinematics` /
+// `occupancy_firing` on bridged tracks, the segmenter's own onset mask) and
+// nothing feeds back.
+
+/// Bridge depths span features are read at: 0 = the per-sample status quo, then
+/// the shallow depths round 2 measured as the asymmetric regime (~3:1 in-gold at
+/// k ≤ 2). Deeper bridging already decayed there and is not re-priced.
+const SPAN_KS: [usize; 3] = [0, 1, 2];
+
+/// Index of the representative bridge depth (k = 2) in [`SPAN_KS`] — the
+/// best-behaved depth from round 2, which the score functions key on.
+const SPAN_K2: usize = 2;
+
+/// Declared threshold grid for the presence-keyed score functions (bridged
+/// structured-presence fraction over the span).
+const SPAN_PRESENCE_GRID: &[f64] = &[0.50, 0.60, 0.70, 0.80, 0.90];
+
+/// Declared threshold grid for the fired-fraction score functions (shipped rule
+/// on the k = 2 bridged track — co-presence *with movement*, integrated).
+const SPAN_FIRED_GRID: &[f64] = &[0.20, 0.30, 0.40, 0.50, 0.60];
+
+/// Declared grid for the sustained-run score function, in seconds of continuous
+/// firing at k = 2.
+const SPAN_SUSTAINED_GRID: &[f64] = &[0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
+
+/// Dropout cap for the gap-capped presence function: the longest unstructured
+/// run a span may contain, in seconds. In-rally dropouts measured short in round
+/// 2 (bridgeable at k ≤ 2 ≈ 0.7 s at 3 fps); 2 s is comfortably above them and
+/// well under a between-rally absence.
+const SPAN_MAX_GAP_S: f64 = 2.0;
+
+/// Vision floor inside the audio-rescue clause: audio may only *add* admission
+/// to a span vision already half-supports (ADR 0015 / round 3 brief: rescue-only,
+/// never sinking or conjuring), so the rescue arm still demands this much bridged
+/// structured presence.
+const SPAN_RESCUE_PRESENCE: f64 = 0.50;
+
+/// One recording's precomputed per-sample and per-block signal views, read once
+/// through the real seams so every span feature is a slice over them.
+struct SpanTrackViews {
+    fps: f64,
+    /// Structured-presence flags per bridge depth ([`SPAN_KS`] order), via
+    /// [`segment::occupancy_kinematics`] on the bridged track.
+    structure: Vec<Vec<bool>>,
+    /// Shipped-rule fired flags per bridge depth, via
+    /// [`segment::occupancy_firing`] on the bridged track.
+    fired: Vec<Vec<bool>>,
+    /// Per-sample nearest-match center speed (frame fractions/second) on the
+    /// unbridged track; `0.0` where no step is measurable.
+    speed: Vec<f64>,
+}
+
+/// Read every view of one occupancy track the span features need.
+fn span_track_views(occ: &segment::OccupancyTrack, p: &segment::Params) -> SpanTrackViews {
+    let mut structure = Vec::with_capacity(SPAN_KS.len());
+    let mut fired = Vec::with_capacity(SPAN_KS.len());
+    for &k in &SPAN_KS {
+        let bridged = bridge_track(occ, k);
+        structure.push(
+            segment::occupancy_kinematics(&bridged, p)
+                .iter()
+                .map(|s| s.size_structure)
+                .collect(),
+        );
+        fired.push(
+            segment::occupancy_firing(&bridged, p)
+                .iter()
+                .map(|s| s.fired)
+                .collect(),
+        );
+    }
+    let speed = segment::occupancy_kinematics(occ, p)
+        .iter()
+        .map(|s| s.max_step.unwrap_or(0.0) * occ.fps)
+        .collect();
+    SpanTrackViews {
+        fps: occ.fps,
+        structure,
+        fired,
+        speed,
+    }
+}
+
+/// Integrated features of one span (issue #93 round 3) — everything the
+/// hand-constructed score functions read.
+#[derive(Debug, Clone, PartialEq)]
+struct SpanFeatures {
+    /// Structured-presence fraction at each bridge depth ([`SPAN_KS`] order).
+    presence: Vec<f64>,
+    /// Shipped-rule fired fraction at each bridge depth.
+    fired: Vec<f64>,
+    /// Longest / mean unstructured run inside the span at k = 0, in seconds — the
+    /// dropout-run structure. A span holding no detector samples reads as one
+    /// full-length gap.
+    max_gap_s: f64,
+    mean_gap_s: f64,
+    /// Nearest-match center speed summed over the span's samples, normalized per
+    /// sample — the movement integral, in frame fractions/second.
+    mean_speed: f64,
+    /// Longest continuous fired run at k = 2, in seconds — sustained co-presence
+    /// with movement.
+    sustained_s: f64,
+    /// Shuttle-hit onsets in the blocks the span overlaps, from the segmenter's
+    /// own onset mask, and normalized per second.
+    onset_count: usize,
+    onset_per_s: f64,
+}
+
+/// Lengths of the maximal `false` runs within `[lo, hi)` of `flags` — the
+/// dropout runs of a presence track.
+fn false_runs(flags: &[bool], lo: usize, hi: usize) -> Vec<usize> {
+    let hi = hi.min(flags.len());
+    let lo = lo.min(hi);
+    let mut runs = Vec::new();
+    let mut cur = 0usize;
+    for &f in &flags[lo..hi] {
+        if f {
+            if cur > 0 {
+                runs.push(cur);
+                cur = 0;
+            }
+        } else {
+            cur += 1;
+        }
+    }
+    if cur > 0 {
+        runs.push(cur);
+    }
+    runs
+}
+
+/// Length of the longest `true` run within `[lo, hi)` of `flags`.
+fn longest_true_run(flags: &[bool], lo: usize, hi: usize) -> usize {
+    let hi = hi.min(flags.len());
+    let lo = lo.min(hi);
+    let (mut best, mut cur) = (0usize, 0usize);
+    for &f in &flags[lo..hi] {
+        cur = if f { cur + 1 } else { 0 };
+        best = best.max(cur);
+    }
+    best
+}
+
+/// Onsets in the blocks a span overlaps — the same block addressing
+/// [`classify_span`] uses, over the segmenter's own onset mask.
+fn onsets_in_span(span: Interval, ob: &segment::OnsetBlocks) -> usize {
+    let bm = ob.block_ms.max(1);
+    let lo = (span.start_ms.max(0) / bm) as usize;
+    let hi = (span.end_ms.max(0) as u64).div_ceil(bm as u64) as usize;
+    let hi = hi.min(ob.onsets.len());
+    let lo = lo.min(hi);
+    ob.onsets[lo..hi].iter().sum()
+}
+
+/// Read one span's integrated features off the precomputed views. Pure — slice
+/// arithmetic over the flag tracks and the onset mask, so it is unit-testable
+/// with synthetic views. `views` is `None` when the detector did not run: vision
+/// features read as empty (zero presence, one full-length gap), audio still
+/// counts.
+fn span_features(
+    span: Interval,
+    views: Option<&SpanTrackViews>,
+    onsets: &segment::OnsetBlocks,
+) -> SpanFeatures {
+    let span_secs = (span.end_ms - span.start_ms).max(0) as f64 / 1000.0;
+    let onset_count = onsets_in_span(span, onsets);
+    let onset_per_s = if span_secs > 0.0 {
+        onset_count as f64 / span_secs
+    } else {
+        0.0
+    };
+    let Some(v) = views else {
+        return SpanFeatures {
+            presence: vec![0.0; SPAN_KS.len()],
+            fired: vec![0.0; SPAN_KS.len()],
+            max_gap_s: span_secs,
+            mean_gap_s: span_secs,
+            mean_speed: 0.0,
+            sustained_s: 0.0,
+            onset_count,
+            onset_per_s,
+        };
+    };
+    let (lo, hi) = sample_range(span, v.fps, v.structure[0].len());
+    let presence: Vec<f64> = v.structure.iter().map(|s| flag_fraction(s, lo, hi)).collect();
+    let fired: Vec<f64> = v.fired.iter().map(|f| flag_fraction(f, lo, hi)).collect();
+    let (max_gap_s, mean_gap_s) = if lo == hi {
+        (span_secs, span_secs)
+    } else {
+        let gaps = false_runs(&v.structure[0], lo, hi);
+        let max = gaps.iter().copied().max().unwrap_or(0) as f64 / v.fps;
+        let mean = if gaps.is_empty() {
+            0.0
+        } else {
+            gaps.iter().sum::<usize>() as f64 / gaps.len() as f64 / v.fps
+        };
+        (max, mean)
+    };
+    let mean_speed = if lo == hi {
+        0.0
+    } else {
+        v.speed[lo..hi.min(v.speed.len())].iter().sum::<f64>() / (hi - lo) as f64
+    };
+    SpanFeatures {
+        presence,
+        fired,
+        max_gap_s,
+        mean_gap_s,
+        mean_speed,
+        sustained_s: longest_true_run(&v.fired[SPAN_K2], lo, hi) as f64 / v.fps,
+        onset_count,
+        onset_per_s,
+    }
+}
+
+/// Out-of-gold windows duration-matched to one recording's gold rallies (the
+/// stated matching method): gold rallies are walked in start order; each
+/// contributes one window of its own duration, placed at the first fit across
+/// the recording's out-of-gold gaps starting from a round-robin gap cursor
+/// (each gap fills front-to-back, the search wraps across all gaps once). So the
+/// duration distribution is matched exactly, windows never overlap gold or each
+/// other, and placement is deterministic. Returns the windows and how many
+/// rallies fit nowhere (skipped, reported — never silently dropped).
+fn matched_out_windows(gold: &[Interval], duration_ms: i64) -> (Vec<Interval>, usize) {
+    let mut sorted: Vec<Interval> = gold.to_vec();
+    sorted.sort_by_key(|g| g.start_ms);
+    let mut gaps: Vec<(i64, i64)> = Vec::new();
+    let mut t = 0i64;
+    for g in &sorted {
+        if g.start_ms > t {
+            gaps.push((t, g.start_ms));
+        }
+        t = t.max(g.end_ms);
+    }
+    if duration_ms > t {
+        gaps.push((t, duration_ms));
+    }
+    // Next free position per gap; a placed window advances its gap's cursor.
+    let mut free: Vec<i64> = gaps.iter().map(|&(s, _)| s).collect();
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut start_gap = 0usize;
+    for g in &sorted {
+        let d = g.end_ms - g.start_ms;
+        let mut placed = false;
+        for step in 0..gaps.len() {
+            let i = (start_gap + step) % gaps.len();
+            if free[i] + d <= gaps[i].1 {
+                out.push(Interval {
+                    start_ms: free[i],
+                    end_ms: free[i] + d,
+                });
+                free[i] += d;
+                start_gap = (i + 1) % gaps.len();
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            skipped += 1;
+        }
+    }
+    (out, skipped)
+}
+
+/// One measured span in a population: its features, whether v5's own density
+/// judge would clear it (the same-population reference line), and — gold only —
+/// whether it is one of the fixed v5 misses.
+struct SpanRow {
+    span: Interval,
+    rec: usize,
+    feats: SpanFeatures,
+    v5_clears: bool,
+    missed22: bool,
+}
+
+/// One hand-constructed score function at one threshold point of its declared
+/// grid: an interpretable admit predicate over the span features.
+struct ScorePoint {
+    label: String,
+    admits: Box<dyn Fn(&SpanFeatures) -> bool>,
+}
+
+/// The declared score-function grid (issue #93 round 3). Every function is a
+/// stated, interpretable formula — the integrity rule: only these can justify a
+/// green verdict, since the corpus doubles as tuning data (ADR 0015).
+fn span_score_points(p: &segment::Params) -> Vec<ScorePoint> {
+    let mut pts: Vec<ScorePoint> = Vec::new();
+    for &t in SPAN_PRESENCE_GRID {
+        pts.push(ScorePoint {
+            label: format!("presence@k2 >= {t:.2}"),
+            admits: Box::new(move |f: &SpanFeatures| f.presence[SPAN_K2] >= t),
+        });
+    }
+    for &t in SPAN_FIRED_GRID {
+        pts.push(ScorePoint {
+            label: format!("fired@k2 >= {t:.2}"),
+            admits: Box::new(move |f: &SpanFeatures| f.fired[SPAN_K2] >= t),
+        });
+    }
+    for &s in SPAN_SUSTAINED_GRID {
+        pts.push(ScorePoint {
+            label: format!("sustained@k2 >= {s:.1}s"),
+            admits: Box::new(move |f: &SpanFeatures| f.sustained_s >= s),
+        });
+    }
+    for &t in SPAN_PRESENCE_GRID {
+        pts.push(ScorePoint {
+            label: format!("presence@k2 >= {t:.2} & max-gap <= {SPAN_MAX_GAP_S:.0}s"),
+            admits: Box::new(move |f: &SpanFeatures| {
+                f.presence[SPAN_K2] >= t && f.max_gap_s <= SPAN_MAX_GAP_S
+            }),
+        });
+    }
+    // Audio rescue (rescue-only): onset density at the v5 confirm bar may admit a
+    // span the fired threshold alone rejects, but only over the vision floor —
+    // audio never sinks a span vision admits, and never conjures one alone.
+    let confirm = p.confirm_onsets_per_sec;
+    for &t in SPAN_FIRED_GRID {
+        pts.push(ScorePoint {
+            label: format!(
+                "fired@k2 >= {t:.2} | (presence@k2 >= {SPAN_RESCUE_PRESENCE:.2} & onsets/s >= {confirm:.1})"
+            ),
+            admits: Box::new(move |f: &SpanFeatures| {
+                f.fired[SPAN_K2] >= t
+                    || (f.presence[SPAN_K2] >= SPAN_RESCUE_PRESENCE && f.onset_per_s >= confirm)
+            }),
+        });
+    }
+    pts
+}
+
+/// Median of a feature over a population, as a table cell.
+fn med_cell(values: impl Iterator<Item = f64>) -> String {
+    let mut ms: Vec<i64> = values.map(|v| (v * 1000.0).round() as i64).collect();
+    ms.sort_unstable();
+    match median(&ms) {
+        Some(m) => format!("{:.2}", m / 1000.0),
+        None => "n/a".to_string(),
+    }
+}
+
+/// One population's feature-table block: every span's row, then the medians.
+fn print_span_population(title: &str, rows: &[SpanRow], recs: &[String]) {
+    println!("\n=== span features: {title} ({} spans) ===", rows.len());
+    if rows.is_empty() {
+        return;
+    }
+    println!(
+        "{:<44} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
+        "span", "dur", "prs k0", "k1", "k2", "fired k2", "max-gap", "mean-gap", "sustain", "speed/s", "ons/s", "v5"
+    );
+    for r in rows {
+        println!(
+            "{:<44} {:>5.1}s {:>6.2} {:>6.2} {:>6.2} {:>8.2} {:>7.1}s {:>7.1}s {:>7.1}s {:>8.3} {:>7.2} {:>6}{}",
+            format!(
+                "{} {:.1}s–{:.1}s",
+                recs[r.rec],
+                r.span.start_ms as f64 / 1000.0,
+                r.span.end_ms as f64 / 1000.0
+            ),
+            (r.span.end_ms - r.span.start_ms) as f64 / 1000.0,
+            r.feats.presence[0],
+            r.feats.presence[1],
+            r.feats.presence[SPAN_K2],
+            r.feats.fired[SPAN_K2],
+            r.feats.max_gap_s,
+            r.feats.mean_gap_s,
+            r.feats.sustained_s,
+            r.feats.mean_speed,
+            r.feats.onset_per_s,
+            if r.v5_clears { "yes" } else { "no" },
+            if r.missed22 { "  *MISSED*" } else { "" }
+        );
+    }
+    println!(
+        "{:<44} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}",
+        "medians",
+        "",
+        med_cell(rows.iter().map(|r| r.feats.presence[0])),
+        med_cell(rows.iter().map(|r| r.feats.presence[1])),
+        med_cell(rows.iter().map(|r| r.feats.presence[SPAN_K2])),
+        med_cell(rows.iter().map(|r| r.feats.fired[SPAN_K2])),
+        med_cell(rows.iter().map(|r| r.feats.max_gap_s)),
+        med_cell(rows.iter().map(|r| r.feats.mean_gap_s)),
+        med_cell(rows.iter().map(|r| r.feats.sustained_s)),
+        med_cell(rows.iter().map(|r| r.feats.mean_speed)),
+        med_cell(rows.iter().map(|r| r.feats.onset_per_s)),
+    );
+}
+
+/// The span-score separation report (issue #93 round 3): span features over the
+/// three populations, the declared score grid's both-sides table, the audio
+/// columns per recording, and the zone verdict against the declared criterion.
+fn spans_and_report(recordings: &[CorpusRecording]) {
+    let p = segment::Params::default();
+    let mut rec_names: Vec<String> = Vec::new();
+    let mut gold_rows: Vec<SpanRow> = Vec::new();
+    let mut out_rows: Vec<SpanRow> = Vec::new();
+    let mut fp_rows: Vec<SpanRow> = Vec::new();
+    let mut total_skipped = 0usize;
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            println!("SKIP  {}  (not gold)", rec.rel_path);
+            continue;
+        }
+        let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occupancy.as_ref(), &p);
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .collect();
+        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
+            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+        );
+        let onsets = segment::onset_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &p);
+        let views = occupancy.as_ref().map(|occ| span_track_views(occ, &p));
+        let (out_windows, skipped) = matched_out_windows(&rec.gold, duration_ms);
+        total_skipped += skipped;
+        let ri = rec_names.len();
+        rec_names.push(rec.rel_path.clone());
+
+        // The v5 same-population reference: would the shipped density judge
+        // propose inside this span (peak fired density at k = 0 over the bar)?
+        let v5_clears = |iv: Interval| {
+            views.as_ref().is_some_and(|v| {
+                let (lo, hi) = sample_range(iv, v.fps, v.fired[0].len());
+                peak_density(&v.fired[0], lo, hi, half_window(&p, v.fps)) >= p.occupancy_density
+            })
+        };
+        let row = |iv: Interval, missed22: bool| SpanRow {
+            span: iv,
+            rec: ri,
+            feats: span_features(iv, views.as_ref(), &onsets),
+            v5_clears: v5_clears(iv),
+            missed22,
+        };
+        for g in &rec.gold {
+            let missed = !draft.iter().any(|d| d.overlaps(g));
+            gold_rows.push(row(*g, missed));
+        }
+        out_rows.extend(out_windows.iter().map(|&w| row(w, false)));
+        fp_rows.extend(
+            draft
+                .iter()
+                .filter(|d| !rec.gold.iter().any(|g| d.overlaps(g)))
+                .map(|&d| row(d, false)),
+        );
+        println!(
+            "CACHE {}  ({} gold, {} matched-out{}, {} fp spans)",
+            rec.rel_path,
+            rec.gold.len(),
+            out_windows.len(),
+            if skipped > 0 { format!(" ({skipped} skipped: no gap fits)") } else { String::new() },
+            fp_rows.iter().filter(|r| r.rec == ri).count(),
+        );
+    }
+    if gold_rows.is_empty() {
+        println!("no gold recordings to measure");
+        return;
+    }
+    if total_skipped > 0 {
+        println!("(duration matching skipped {total_skipped} window(s) corpus-wide — no out-of-gold gap fits)");
+    }
+
+    let missed_total = gold_rows.iter().filter(|r| r.missed22).count();
+    print_span_population("all gold rallies (missed at v5 defaults flagged *)", &gold_rows, &rec_names);
+    print_span_population("duration-matched out-of-gold windows", &out_rows, &rec_names);
+    print_span_population("v5 false-positive spans (advisory for #92)", &fp_rows, &rec_names);
+
+    // Audio onset features per recording — history says a minority of recordings
+    // poison the onset baseline (neighbour-court bleed, ADR 0015), so the audio
+    // column is never pooled across recordings.
+    println!("\n=== audio onset density per recording (median onsets/s) ===");
+    println!(
+        "{:<44} {:>10} {:>12} {:>10}",
+        "recording", "gold", "matched-out", "fp spans"
+    );
+    for (ri, name) in rec_names.iter().enumerate() {
+        let of = |rows: &[SpanRow]| {
+            med_cell(rows.iter().filter(|r| r.rec == ri).map(|r| r.feats.onset_per_s))
+        };
+        println!(
+            "{:<44} {:>10} {:>12} {:>10}",
+            name,
+            of(&gold_rows),
+            of(&out_rows),
+            of(&fp_rows)
+        );
+    }
+
+    // The both-sides separation table over the declared grid.
+    let v5_gold_missed = gold_rows.iter().filter(|r| !r.v5_clears).count();
+    let v5_out_clear = out_rows.iter().filter(|r| r.v5_clears).count();
+    let v5_fp_clear = fp_rows.iter().filter(|r| r.v5_clears).count();
+    let frac = |n: usize, d: usize| 100.0 * n as f64 / d.max(1) as f64;
+    let v5_out_frac = frac(v5_out_clear, out_rows.len());
+    println!("\n=== span-score separation over the declared grid (both sides) ===");
+    println!(
+        "{:<64} {:>14} {:>10} {:>12} {:>10}",
+        "score point", "gold below", "(of 22)", "out clear%", "fp clear%"
+    );
+    println!(
+        "{:<64} {:>14} {:>10} {:>11.1}% {:>9.1}%   <- same-population v5 reference",
+        "v5 density judge (peak fired@k0 >= 0.50)",
+        format!("{v5_gold_missed}/{}", gold_rows.len()),
+        format!("{}/{missed_total}", gold_rows.iter().filter(|r| r.missed22 && !r.v5_clears).count()),
+        v5_out_frac,
+        frac(v5_fp_clear, fp_rows.len()),
+    );
+    struct SepRow {
+        label: String,
+        gold_below: usize,
+        missed_below: usize,
+        out_frac: f64,
+        fp_frac: f64,
+    }
+    let mut sep: Vec<SepRow> = Vec::new();
+    for pt in span_score_points(&p) {
+        let gold_below = gold_rows.iter().filter(|r| !(pt.admits)(&r.feats)).count();
+        let missed_below = gold_rows
+            .iter()
+            .filter(|r| r.missed22 && !(pt.admits)(&r.feats))
+            .count();
+        let out_clear = out_rows.iter().filter(|r| (pt.admits)(&r.feats)).count();
+        let fp_clear = fp_rows.iter().filter(|r| (pt.admits)(&r.feats)).count();
+        let row = SepRow {
+            label: pt.label,
+            gold_below,
+            missed_below,
+            out_frac: frac(out_clear, out_rows.len()),
+            fp_frac: frac(fp_clear, fp_rows.len()),
+        };
+        println!(
+            "{:<64} {:>14} {:>10} {:>11.1}% {:>9.1}%",
+            row.label,
+            format!("{}/{}", row.gold_below, gold_rows.len()),
+            format!("{}/{missed_total}", row.missed_below),
+            row.out_frac,
+            row.fp_frac,
+        );
+        sep.push(row);
+    }
+
+    // The zone verdict against the criterion declared on the issue before these
+    // numbers existed. Green: ≤ 5 of the gold rallies below some point at
+    // out-clearance no worse than v5's own (same-population reference). Gray: the
+    // frontier moves but doesn't reach. Red: unmoved. A reading, not a decision.
+    println!("\n=== zone verdict (criterion declared on issue #93) ===");
+    println!(
+        "reference: v5 clears {v5_out_frac:.1}% of the matched out-of-gold windows (round-1 sample-centered figure: ~29%)"
+    );
+    let green: Vec<&SepRow> = sep
+        .iter()
+        .filter(|r| r.gold_below <= 5 && r.out_frac <= v5_out_frac)
+        .collect();
+    let gray: Vec<&SepRow> = sep
+        .iter()
+        .filter(|r| {
+            (r.gold_below <= 10 && r.out_frac <= v5_out_frac)
+                || (r.gold_below <= 5 && r.out_frac <= 35.0)
+        })
+        .collect();
+    let zone = if !green.is_empty() {
+        "GREEN — proceed to the span-scoring design session"
+    } else if !gray.is_empty() {
+        "GRAY — frontier moved but did not reach; design and spec conversation share the agenda"
+    } else {
+        "RED — frontier unmoved; the spec-level conversation is the pre-declared fallback"
+    };
+    println!("zone: {zone}");
+    let qualifying = if green.is_empty() { &gray } else { &green };
+    for r in qualifying {
+        println!(
+            "  qualifying point: {}  ({} gold below, {:.1}% out clear)",
+            r.label, r.gold_below, r.out_frac
+        );
+    }
+    // The closest operating points either way, for the report's frontier read.
+    let mut frontier: Vec<&SepRow> = sep.iter().collect();
+    frontier.sort_by(|a, b| a.gold_below.cmp(&b.gold_below).then(a.out_frac.total_cmp(&b.out_frac)));
+    println!("\nbest operating points (by gold below, then out clearance):");
+    for r in frontier.iter().take(8) {
+        println!(
+            "  {:<62} {:>3} gold below ({} of 22) | {:>5.1}% out | {:>5.1}% fp",
+            r.label, r.gold_below, r.missed_below, r.out_frac, r.fp_frac
+        );
+    }
+}
+
 /// One recording's line block: the headline path, then the three numbers with the
 /// counts behind them.
 fn print_recording(rel_path: &str, s: &Score) {
@@ -2072,6 +2687,7 @@ struct Options {
     headroom: bool,
     edges: bool,
     presence: bool,
+    spans: bool,
     scratch: Option<String>,
     help: bool,
 }
@@ -2090,6 +2706,7 @@ impl Options {
             headroom: false,
             edges: false,
             presence: false,
+            spans: false,
             scratch: None,
             help: false,
         };
@@ -2103,6 +2720,7 @@ impl Options {
                 "--headroom" => opts.headroom = true,
                 "--edges" => opts.edges = true,
                 "--presence" => opts.presence = true,
+                "--spans" => opts.spans = true,
                 "--scratch" => {
                     opts.scratch = Some(it.next().ok_or("--scratch needs a directory")?.clone());
                 }
@@ -2143,6 +2761,7 @@ fn print_usage() {
          --headroom             price the velocity firing rule and 5 fps sampling (issue #93)\n    \
          --edges                split boundary errors by edge provenance (issue #93)\n    \
          --presence             presence headroom: sub-threshold + bridged (issue #93)\n    \
+         --spans                span-score separation over the declared grid (issue #93)\n    \
          --scratch DIR          cache dir for scratch detection tracks (default: temp)\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
@@ -2806,6 +3425,183 @@ mod tests {
         assert!((flag_fraction(&flags, 0, 2) - 0.5).abs() < 1e-9);
         assert!((flag_fraction(&flags, 2, 99) - 1.0).abs() < 1e-9, "clips at the track end");
         assert_eq!(flag_fraction(&flags, 4, 4), 0.0, "an empty range has no presence");
+    }
+
+    // ── Span-score separation (issue #93, round 3) ────────────────────────────
+
+    #[test]
+    fn matched_out_windows_match_durations_and_stay_out_of_gold() {
+        let gold = ivals(&[(10_000, 14_000), (30_000, 33_000)]);
+        let (windows, skipped) = matched_out_windows(&gold, 60_000);
+        assert_eq!(skipped, 0);
+        // One window per gold rally, at that rally's duration.
+        let mut durations: Vec<i64> = windows.iter().map(|w| w.end_ms - w.start_ms).collect();
+        durations.sort_unstable();
+        assert_eq!(durations, vec![3_000, 4_000]);
+        // Never overlapping gold, never overlapping each other, inside the recording.
+        for (i, w) in windows.iter().enumerate() {
+            assert!(w.start_ms >= 0 && w.end_ms <= 60_000, "{w:?}");
+            assert!(!gold.iter().any(|g| w.overlaps(g)), "{w:?} overlaps gold");
+            for other in &windows[i + 1..] {
+                assert!(!w.overlaps(other), "{w:?} overlaps {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn matched_out_windows_skip_a_rally_no_gap_fits() {
+        // Gold covers all but 1 s: a 50 s rally fits in no gap and is skipped,
+        // never silently shrunk or dropped from the count.
+        let gold = ivals(&[(0, 50_000)]);
+        let (windows, skipped) = matched_out_windows(&gold, 51_000);
+        assert!(windows.is_empty(), "{windows:?}");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn matched_out_windows_of_an_empty_gold_set_are_empty() {
+        let (windows, skipped) = matched_out_windows(&[], 60_000);
+        assert!(windows.is_empty());
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn false_runs_and_longest_true_run_read_the_range() {
+        let flags = [true, false, false, true, false, true, true, true];
+        assert_eq!(false_runs(&flags, 0, 8), vec![2, 1]);
+        assert_eq!(longest_true_run(&flags, 0, 8), 3);
+        // Clipped to a sub-range: only what the span holds counts.
+        assert_eq!(false_runs(&flags, 1, 3), vec![2]);
+        assert_eq!(longest_true_run(&flags, 1, 5), 1);
+        // Beyond the track clamps; an empty range holds nothing.
+        assert_eq!(false_runs(&flags, 6, 99), Vec::<usize>::new());
+        assert_eq!(longest_true_run(&flags, 8, 8), 0);
+    }
+
+    #[test]
+    fn onsets_in_span_sum_the_overlapped_blocks() {
+        let ob = segment::OnsetBlocks {
+            block_ms: 1000,
+            onsets: vec![1, 2, 0, 3],
+        };
+        // 500–2500 ms overlaps blocks 0, 1, 2.
+        assert_eq!(onsets_in_span(Interval { start_ms: 500, end_ms: 2500 }, &ob), 3);
+        // Beyond the mask clamps to what exists.
+        assert_eq!(onsets_in_span(Interval { start_ms: 3000, end_ms: 9000 }, &ob), 3);
+        assert_eq!(onsets_in_span(Interval { start_ms: 9000, end_ms: 10_000 }, &ob), 0);
+    }
+
+    /// Hand-built views at 2 fps for span-feature fixtures: structure/fired flags
+    /// per bridge depth plus per-sample speeds.
+    fn views(structure: [&[bool]; 3], fired: [&[bool]; 3], speed: &[f64]) -> SpanTrackViews {
+        SpanTrackViews {
+            fps: 2.0,
+            structure: structure.iter().map(|s| s.to_vec()).collect(),
+            fired: fired.iter().map(|f| f.to_vec()).collect(),
+            speed: speed.to_vec(),
+        }
+    }
+
+    #[test]
+    fn span_features_slice_the_views_over_the_span() {
+        // 2 fps, 8 samples (0–4 s). Span 0–4 s covers all 8.
+        let s0 = [true, false, false, true, true, false, true, true];
+        let s2 = [true; 8];
+        let f2 = [false, true, true, true, false, false, true, false];
+        let v = views(
+            [&s0, &s2, &s2],
+            [&[false; 8], &f2, &f2],
+            &[0.1, 0.2, 0.1, 0.0, 0.1, 0.3, 0.2, 0.0],
+        );
+        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![1, 0, 2, 0] };
+        let f = span_features(Interval { start_ms: 0, end_ms: 4000 }, Some(&v), &ob);
+        assert!((f.presence[0] - 5.0 / 8.0).abs() < 1e-9);
+        assert!((f.presence[SPAN_K2] - 1.0).abs() < 1e-9);
+        assert!((f.fired[SPAN_K2] - 0.5).abs() < 1e-9);
+        // Dropout runs of s0: [2, 1] samples → max 1.0 s, mean 0.75 s at 2 fps.
+        assert!((f.max_gap_s - 1.0).abs() < 1e-9);
+        assert!((f.mean_gap_s - 0.75).abs() < 1e-9);
+        // Longest fired run at k2: samples 1–3 → 3 samples → 1.5 s.
+        assert!((f.sustained_s - 1.5).abs() < 1e-9);
+        // Movement integral: mean of the eight speeds.
+        assert!((f.mean_speed - 1.0 / 8.0).abs() < 1e-9);
+        // Onsets: blocks 0–3 → 3 onsets over 4 s.
+        assert_eq!(f.onset_count, 3);
+        assert!((f.onset_per_s - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn span_features_without_a_detector_read_as_one_full_gap() {
+        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![2, 2, 2, 2] };
+        let f = span_features(Interval { start_ms: 0, end_ms: 3000 }, None, &ob);
+        assert!(f.presence.iter().all(|&p| p == 0.0));
+        assert_eq!(f.max_gap_s, 3.0, "no samples → one span-length gap");
+        assert_eq!(f.sustained_s, 0.0);
+        // Audio still counts without vision.
+        assert_eq!(f.onset_count, 6);
+        assert!((f.onset_per_s - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn span_features_beyond_the_track_read_as_one_full_gap() {
+        let s = [true, true];
+        let v = views([&s, &s, &s], [&s, &s, &s], &[0.1, 0.1]);
+        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![0; 40] };
+        // A span past the track's end holds no samples.
+        let f = span_features(Interval { start_ms: 30_000, end_ms: 34_000 }, Some(&v), &ob);
+        assert_eq!(f.presence[0], 0.0);
+        assert_eq!(f.max_gap_s, 4.0);
+        assert_eq!(f.mean_speed, 0.0);
+    }
+
+    /// A feature fixture for score-point tests: everything zero except the given
+    /// k2 presence / k2 fired / onset density.
+    fn feats(presence_k2: f64, fired_k2: f64, onset_per_s: f64) -> SpanFeatures {
+        SpanFeatures {
+            presence: vec![0.0, 0.0, presence_k2],
+            fired: vec![0.0, 0.0, fired_k2],
+            max_gap_s: 0.0,
+            mean_gap_s: 0.0,
+            mean_speed: 0.0,
+            sustained_s: 0.0,
+            onset_count: 0,
+            onset_per_s,
+        }
+    }
+
+    #[test]
+    fn audio_rescue_only_ever_adds_admission() {
+        let p = segment::Params::default();
+        let points = span_score_points(&p);
+        let rescue: Vec<_> = points.iter().filter(|pt| pt.label.contains('|')).collect();
+        assert!(!rescue.is_empty(), "the grid must include the rescue family");
+        for pt in &rescue {
+            // A span vision fully admits stays admitted with zero audio (audio
+            // never sinks)…
+            assert!((pt.admits)(&feats(0.0, 1.0, 0.0)), "{}", pt.label);
+            // …audio over the confirm bar rescues a span with enough presence…
+            assert!((pt.admits)(&feats(0.6, 0.0, 0.5)), "{}", pt.label);
+            // …but never conjures admission without the vision floor.
+            assert!(!(pt.admits)(&feats(0.1, 0.0, 5.0)), "{}", pt.label);
+        }
+    }
+
+    #[test]
+    fn the_score_grid_thresholds_behave_monotonically() {
+        let p = segment::Params::default();
+        let strong = feats(0.95, 0.65, 0.0);
+        let weak = feats(0.10, 0.05, 0.0);
+        for pt in span_score_points(&p) {
+            // Every declared point admits the saturated span; the sustained and
+            // gap-capped families read other fields, so only check the weak side
+            // for the pure presence/fired families.
+            if pt.label.starts_with("presence@k2 >=") || pt.label.starts_with("fired@k2") {
+                assert!(!(pt.admits)(&weak), "{}", pt.label);
+            }
+            if pt.label.starts_with("presence@k2 >=") && !pt.label.contains("max-gap") {
+                assert!((pt.admits)(&strong), "{}", pt.label);
+            }
+        }
     }
 
     #[test]
