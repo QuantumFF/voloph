@@ -41,7 +41,18 @@
 /// occupancy proposed zero spans on all real footage measured (#85), so this
 /// materially alters the draft anywhere a person detector runs. The staleness
 /// machinery (#80) silently re-drafts untouched recordings on this bump.
-pub const SEGMENTER_VERSION: u32 = 5;
+///
+/// v6 (ADR 0018, issue #96): the latent `probe_dimensions` trailing-separator parse
+/// is fixed (detect.rs). Some ffprobe builds emit `csv=s=x` output as `1920x1080x`;
+/// the old `split_once('x')` parse dropped that to `None`, so detection silently fell
+/// back to a 416×416 square-frame assumption and back-mapped every occupancy box
+/// against the wrong geometry on 1920×1080 recordings. Correcting the geometry
+/// reshapes the occupancy proposal, so this materially alters the draft wherever a
+/// person detector runs — the staleness machinery (#80) re-drafts untouched
+/// recordings on this bump. (The motion-envelope end-edge placement scoped into #96
+/// was measured RED against its acceptance bar — it cut boundary median but raised
+/// hard misses above budget — and was not shipped; see ADR 0018 / #96.)
+pub const SEGMENTER_VERSION: u32 = 6;
 
 /// A detected rally interval over a recording, in milliseconds from its start,
 /// carrying a per-region confidence in `[0, 1]`. Low-confidence rallies surface

@@ -470,9 +470,21 @@ fn probe_dimensions(path: &str) -> Option<(u32, u32)> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let (w, h) = text.trim().split_once('x')?;
-    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    parse_two_dims(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The first two unsigned integers in `text`, tolerating any non-digit separators
+/// and a **trailing** one — some ffprobe builds emit `csv=s=x` output as `1920x1080x`
+/// (a trailing separator), which the old `split_once('x')` parse dropped to `None`,
+/// silently falling back to a 416×416 square frame and back-mapping every occupancy
+/// box against the wrong geometry (ADR 0018, issue #96). Mirrors the pose pass's own
+/// robust probe ([`crate::pose::probe_source_dimensions`]).
+fn parse_two_dims(text: &str) -> Option<(u32, u32)> {
+    let mut nums = text
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u32>().ok());
+    Some((nums.next()?, nums.next()?))
 }
 
 /// Extract the per-recording **detection track** (issue #83): stream the recording as
@@ -850,6 +862,19 @@ fn default_db_path() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dimension parse tolerates a trailing separator (`1920x1080x`) — the
+    /// ffprobe-build regression (ADR 0018, #96) that the old `split_once('x')` parse
+    /// dropped to `None`, silently falling back to a 416×416 square frame. The clean
+    /// forms still parse, and genuinely missing dimensions still yield `None`.
+    #[test]
+    fn parse_two_dims_tolerates_a_trailing_separator() {
+        assert_eq!(parse_two_dims("1920x1080x"), Some((1920, 1080)));
+        assert_eq!(parse_two_dims("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_two_dims("1920x1080\n"), Some((1920, 1080)));
+        assert_eq!(parse_two_dims(""), None);
+        assert_eq!(parse_two_dims("1920"), None);
+    }
 
     /// One anchor with a high person score decodes to a box centered at its grid cell,
     /// widths exp-scaled by the stride, and survives thresholding.
