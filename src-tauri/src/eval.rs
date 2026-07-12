@@ -279,15 +279,17 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         trace_and_report(&recordings);
     } else if opts.fp_trace {
         fp_trace_and_report(&recordings);
-    } else if opts.headroom || opts.presence {
+    } else if opts.headroom || opts.presence || opts.serve {
         let scratch = opts
             .scratch
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("voloph-eval-scratch"));
         if opts.headroom {
             headroom_and_report(&recordings, &scratch);
-        } else {
+        } else if opts.presence {
             presence_and_report(&recordings, &scratch);
+        } else {
+            serve_and_report(&recordings, &scratch);
         }
     } else if opts.edges {
         edges_and_report(&recordings);
@@ -2657,6 +2659,719 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
     }
 }
 
+// ── Serve-cue viability (ADR 0017, issue #95 round 4) ───────────────────────────
+//
+// Measurement only. Round 3 closed every vision direction in v5's own signal space
+// (velocity, rate, sub-threshold, persistence, span-integrated) and #92 showed v5's
+// false positives are vision-indistinguishable from gold — two real people really
+// moving. The one measured separator is audio onset density, and no FP span contains
+// a serve. ADR 0017's bet: a *new signal class* — posture — admits a proposal to the
+// default timeline (serve-cue OR strong audio), everything else drops to the
+// suppressed tier. This mode prices that bet: serve-cue recall at the gold rally
+// starts, false-serve on chatter and v5's FP spans, the serve∨audio confirmation
+// frontier, and the end-edge table. It ships nothing — `SEGMENTER_VERSION` stays 5
+// and the shipped draft is untouched (the standard score line is byte-identical).
+
+/// Densified decode rate for the serve windows (ADR 0017: 10–15 fps, targeted and
+/// scratch-only). At the top of the band — a serve is brief, so temporal density
+/// buys detectability.
+const SERVE_DENSIFY_FPS: u32 = 15;
+/// Serve window before a candidate start: the server is set before the first shot.
+const SERVE_WINDOW_PRE_MS: i64 = 1000;
+/// Serve window after a candidate start: the serve stroke lands within ~2 s.
+const SERVE_WINDOW_POST_MS: i64 = 2000;
+/// Keypoint confidence floor — a keypoint below this does not vote in a cue.
+const SERVE_KP_MIN: f32 = 0.30;
+/// Minimum torso height (source-norm) for a pose to yield a cue value — guards the
+/// normalization denominator against a collapsed/occluded skeleton.
+const SERVE_MIN_TORSO: f64 = 0.02;
+/// The declared serve-cue threshold grid: a wrist/elbow raised this fraction of the
+/// torso height above the shoulder (negative = below). Interpretable, no fitting.
+const SERVE_CUE_TAUS: &[f64] = &[-0.10, 0.00, 0.10, 0.20, 0.30, 0.40];
+/// The audio confirm bars swept for the frontier (onsets/s) — through the measured
+/// separating region (#92: gold 1.08 / chatter 0.40 / FP 0.35 median). The last
+/// column is serve-only (audio never admits), the poisoned-recording degrade.
+const SERVE_AUDIO_BARS: &[f64] = &[0.50, 0.60, 0.70, 0.80];
+/// Motion-decay end-edge rule (T4): the rally end is placed at the last motion frame
+/// whose energy clears this fraction of the rally's 75th-percentile energy.
+const SERVE_MOTION_DECAY_FRAC: f64 = 0.50;
+
+/// The interpretable serve-posture cues, each a normalized keypoint-elevation over a
+/// declared threshold grid. A serve holds a hand high — the shuttle before the drop,
+/// the racket cocked — where milling and shuttle-collection keep hands low.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeCue {
+    /// Highest wrist above the shoulder line, over torso height.
+    WristOverShoulder,
+    /// Highest elbow above the shoulder line (a fully raised arm).
+    ElbowOverShoulder,
+    /// Highest wrist above the hip line (arm at least mid-height — a looser bar).
+    WristOverHip,
+}
+
+/// The declared cue set; index 0 is the primary cue the frontier sweeps.
+const SERVE_CUES: &[(ServeCue, &str)] = &[
+    (ServeCue::WristOverShoulder, "wrist-over-shoulder"),
+    (ServeCue::ElbowOverShoulder, "elbow-over-shoulder"),
+    (ServeCue::WristOverHip, "wrist-over-hip"),
+];
+
+/// Which court half the serving player is on. A camera from one baseline puts the
+/// near court low in frame (large y), the far court high (small y) — so the serve
+/// cue's blind spots are expected to correlate with `Far` (smaller, more occluded
+/// players), the correlated-failure risk ADR 0017 keeps recoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Near,
+    Far,
+}
+
+impl Side {
+    fn from_y(y: f32) -> Side {
+        if y >= 0.5 {
+            Side::Near
+        } else {
+            Side::Far
+        }
+    }
+}
+
+/// A confident keypoint's `(x, y)` in source-normalized coords, or `None` when it
+/// sits below [`SERVE_KP_MIN`].
+fn confident_kp(p: &crate::pose::PlayerPose, i: usize) -> Option<(f64, f64)> {
+    let k = p.keypoints[i];
+    if k.score >= SERVE_KP_MIN {
+        Some((k.x as f64, k.y as f64))
+    } else {
+        None
+    }
+}
+
+/// Mean y of a left/right keypoint pair using whichever members are confident.
+fn pair_mean_y(a: Option<(f64, f64)>, b: Option<(f64, f64)>) -> Option<f64> {
+    match (a, b) {
+        (Some(u), Some(v)) => Some((u.1 + v.1) / 2.0),
+        (Some(u), None) | (None, Some(u)) => Some(u.1),
+        (None, None) => None,
+    }
+}
+
+/// One player's value for one cue, or `None` when the needed keypoints are not
+/// confident or the torso is too short to normalize. Pure and unit-tested. `y` grows
+/// downward, so "above" is a smaller y and the elevation numerator is
+/// `(reference_y - joint_y)`, positive when the joint is higher than the reference.
+fn player_cue_value(p: &crate::pose::PlayerPose, cue: ServeCue) -> Option<f64> {
+    use crate::pose::*;
+    let shoulder_y = pair_mean_y(
+        confident_kp(p, KP_L_SHOULDER),
+        confident_kp(p, KP_R_SHOULDER),
+    )?;
+    let hip_y = pair_mean_y(confident_kp(p, KP_L_HIP), confident_kp(p, KP_R_HIP))?;
+    let torso = (hip_y - shoulder_y).abs();
+    if torso < SERVE_MIN_TORSO {
+        return None;
+    }
+    let (left, right, reference_y) = match cue {
+        ServeCue::WristOverShoulder => (KP_L_WRIST, KP_R_WRIST, shoulder_y),
+        ServeCue::ElbowOverShoulder => (KP_L_ELBOW, KP_R_ELBOW, shoulder_y),
+        ServeCue::WristOverHip => (KP_L_WRIST, KP_R_WRIST, hip_y),
+    };
+    let mut best: Option<f64> = None;
+    for i in [left, right] {
+        if let Some((_, jy)) = confident_kp(p, i) {
+            let elevation = (reference_y - jy) / torso;
+            best = Some(best.map_or(elevation, |b| b.max(elevation)));
+        }
+    }
+    best
+}
+
+/// The window's best (largest) value for one cue across all frames and players,
+/// optionally restricted to players on one court `side`. `None` when no qualifying
+/// frame yields a confident cue value. Passing `side = None` pools both courts (the
+/// "a serve on either side" detection the frontier uses); passing a side measures
+/// that court alone — the near/far split T1 needs, since the far player is smaller
+/// and would always lose an unrestricted max (the correlated blind spot ADR 0017
+/// keeps recoverable).
+fn window_best_cue(
+    win: &crate::pose::PoseWindow,
+    cue: ServeCue,
+    side: Option<Side>,
+) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for frame in &win.frames {
+        for player in &frame.players {
+            if side.is_some_and(|s| Side::from_y(player.box_center_y()) != s) {
+                continue;
+            }
+            if let Some(v) = player_cue_value(player, cue) {
+                best = Some(best.map_or(v, |b| b.max(v)));
+            }
+        }
+    }
+    best
+}
+
+/// Wall-clock accounting for the compute-envelope report (T1): densified footage
+/// actually decoded (cache misses only) against the wall time it took.
+#[derive(Default)]
+struct ServeTiming {
+    decoded_ms: i64,
+    wall_ms: u128,
+    frames: u64,
+}
+
+/// One measured serve window in a population: the per-cue window-best values at the
+/// candidate start, the serving side, and the span's audio onset density (measured
+/// over the rally/FP span/chatter window, as #92 measured it).
+struct ServeRow {
+    rec: usize,
+    /// Best value per cue over *both* courts, index-aligned to [`SERVE_CUES`];
+    /// `None` = no pose signal. Index 0 is the primary cue.
+    cue_vals: Vec<Option<f64>>,
+    /// Primary-cue best restricted to the near court, and to the far court — the
+    /// per-side recall split (each `None` when no player stood on that court).
+    near_primary: Option<f64>,
+    far_primary: Option<f64>,
+    onset_per_s: f64,
+}
+
+impl ServeRow {
+    /// Does the primary cue clear `tau` on *either* court (a serve detected)?
+    fn serve_detected(&self, tau: f64) -> bool {
+        self.cue_vals[0].is_some_and(|v| v >= tau)
+    }
+}
+
+/// Load (or extract and cache) the densified pose window `[start, start+dur)` at
+/// [`SERVE_DENSIFY_FPS`]. Keyed by relative path + window + rate under `scratch_dir`,
+/// mirroring [`scratch_track`]; the app's tracks and Analyses are never touched.
+#[allow(clippy::too_many_arguments)]
+fn scratch_pose_window(
+    scratch_dir: &std::path::Path,
+    rel_path: &str,
+    abs_path: &str,
+    start_ms: i64,
+    dur_ms: i64,
+    src_w: u32,
+    src_h: u32,
+    detector: &mut crate::detect::Detector,
+    pose: &mut crate::pose::PoseEstimator,
+    timing: &mut ServeTiming,
+) -> Option<crate::pose::PoseWindow> {
+    let stem = rel_path.replace(['/', '\\'], "_");
+    let file =
+        scratch_dir.join(format!("{stem}@serve@{start_ms}+{dur_ms}@{SERVE_DENSIFY_FPS}fps.json"));
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        if let Ok(win) = serde_json::from_str::<crate::pose::PoseWindow>(&text) {
+            return Some(win);
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let win = match crate::pose::extract_pose_window(
+        abs_path,
+        start_ms,
+        dur_ms,
+        SERVE_DENSIFY_FPS,
+        src_w,
+        src_h,
+        detector,
+        pose,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("      (serve window unavailable at {start_ms}ms — {e})");
+            return None;
+        }
+    };
+    timing.wall_ms += t0.elapsed().as_millis();
+    timing.decoded_ms += dur_ms;
+    timing.frames += win.frames.len() as u64;
+    if let Ok(json) = serde_json::to_string(&win) {
+        let _ = std::fs::create_dir_all(scratch_dir).and_then(|()| std::fs::write(&file, json));
+    }
+    Some(win)
+}
+
+/// The serve-cue viability report (ADR 0017, issue #95 round 4). Four tables and a
+/// zone verdict, gold corpus only. Loads the detector and pose model once; degrades
+/// with a message and produces nothing if either is unavailable (measurement, not a
+/// ship path). All pose windows are scratch-cached so re-runs are cheap.
+fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Path) {
+    let p = segment::Params::default();
+    let mut detector = match crate::detect::vendored_model_path()
+        .and_then(|m| crate::detect::Detector::load(&m))
+    {
+        Ok(d) => d,
+        Err(e) => {
+            println!("serve mode unavailable — detector: {e}");
+            return;
+        }
+    };
+    let mut pose = match crate::pose::vendored_pose_model_path()
+        .and_then(|m| crate::pose::PoseEstimator::load(&m))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            println!("serve mode unavailable — pose model: {e}");
+            return;
+        }
+    };
+    let mut timing = ServeTiming::default();
+
+    let mut rec_names: Vec<String> = Vec::new();
+    let mut poisoned: Vec<bool> = Vec::new();
+    let mut gold_rows: Vec<ServeRow> = Vec::new();
+    let mut chatter_rows: Vec<ServeRow> = Vec::new();
+    let mut fp_rows: Vec<ServeRow> = Vec::new();
+    // T4 end-edge error samples, per recording.
+    let mut edge_audio: Vec<Vec<f64>> = Vec::new();
+    let mut edge_motion: Vec<Vec<f64>> = Vec::new();
+    let mut edge_audio_missing = 0usize;
+
+    // Build one row from a candidate span: extract its start window, read the cues.
+    let ncues = SERVE_CUES.len();
+
+    for rec in recordings {
+        if rec.segment_state != "ready" || !rec.hand_corrected {
+            println!("SKIP  {}  (not gold)", rec.rel_path);
+            continue;
+        }
+        let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("ERR   {}  ({e})", rec.rel_path);
+                continue;
+            }
+        };
+        let seg = segment::segment_with(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occupancy.as_ref(),
+            &p,
+        );
+        let draft: Vec<Interval> = seg
+            .rallies
+            .iter()
+            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .collect();
+        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
+            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+        );
+        let onsets = segment::onset_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &p);
+        let (out_windows, _skipped) = matched_out_windows(&rec.gold, duration_ms);
+        let fp_spans: Vec<Interval> = draft
+            .iter()
+            .copied()
+            .filter(|d| !rec.gold.iter().any(|g| d.overlaps(g)))
+            .collect();
+
+        // Probe the source frame size once per recording (cheap, header-only) — the
+        // pose windows all decode at this resolution.
+        let (src_w, src_h) = match crate::pose::probe_source_dimensions(&rec.abs_path) {
+            Some(d) => d,
+            None => {
+                println!("ERR   {}  (could not probe dimensions)", rec.rel_path);
+                continue;
+            }
+        };
+
+        let ri = rec_names.len();
+        rec_names.push(rec.rel_path.clone());
+        // The known poisoned recording (IMG_5933, neighbour-court bleed) degrades to
+        // serve-only confirmation on the frontier — audio never admits there.
+        poisoned.push(rec.rel_path.contains("5933"));
+
+        // Read one candidate span into a ServeRow (start window pose + span audio).
+        let read_row = |span: Interval,
+                            detector: &mut crate::detect::Detector,
+                            pose: &mut crate::pose::PoseEstimator,
+                            timing: &mut ServeTiming|
+         -> ServeRow {
+            let start = (span.start_ms - SERVE_WINDOW_PRE_MS).max(0);
+            let dur = SERVE_WINDOW_PRE_MS + SERVE_WINDOW_POST_MS;
+            let win = scratch_pose_window(
+                scratch_dir,
+                &rec.rel_path,
+                &rec.abs_path,
+                start,
+                dur,
+                src_w,
+                src_h,
+                detector,
+                pose,
+                timing,
+            );
+            let mut cue_vals = vec![None; ncues];
+            let mut near_primary = None;
+            let mut far_primary = None;
+            if let Some(win) = &win {
+                for (ci, &(cue, _)) in SERVE_CUES.iter().enumerate() {
+                    cue_vals[ci] = window_best_cue(win, cue, None);
+                }
+                let (primary, _) = SERVE_CUES[0];
+                near_primary = window_best_cue(win, primary, Some(Side::Near));
+                far_primary = window_best_cue(win, primary, Some(Side::Far));
+            }
+            let secs = (span.end_ms - span.start_ms).max(0) as f64 / 1000.0;
+            let onset_per_s = if secs > 0.0 {
+                onsets_in_span(span, &onsets) as f64 / secs
+            } else {
+                0.0
+            };
+            ServeRow { rec: ri, cue_vals, near_primary, far_primary, onset_per_s }
+        };
+
+        for g in &rec.gold {
+            gold_rows.push(read_row(*g, &mut detector, &mut pose, &mut timing));
+        }
+        for w in &out_windows {
+            chatter_rows.push(read_row(*w, &mut detector, &mut pose, &mut timing));
+        }
+        for f in &fp_spans {
+            fp_rows.push(read_row(*f, &mut detector, &mut pose, &mut timing));
+        }
+
+        // T4 end-edge samples for this recording.
+        let mut ea = Vec::new();
+        let mut em = Vec::new();
+        for g in &rec.gold {
+            match audio_last_onset_error(*g, &onsets) {
+                Some(e) => ea.push(e),
+                None => edge_audio_missing += 1,
+            }
+            if let Some(e) = motion_decay_error(*g, &motion) {
+                em.push(e);
+            }
+        }
+        edge_audio.push(ea);
+        edge_motion.push(em);
+
+        println!(
+            "CACHE {}  ({} gold, {} matched-out, {} fp spans{})",
+            rec.rel_path,
+            rec.gold.len(),
+            out_windows.len(),
+            fp_spans.len(),
+            if poisoned[ri] { ", POISONED → serve-only" } else { "" }
+        );
+    }
+
+    if gold_rows.is_empty() {
+        println!("no gold recordings to measure");
+        return;
+    }
+
+    print_serve_corpus(&rec_names, &gold_rows, &chatter_rows, &fp_rows, &timing);
+    print_serve_recall(&rec_names, &gold_rows);
+    print_serve_false_rate(&chatter_rows, &fp_rows);
+    print_serve_frontier(&gold_rows, &chatter_rows, &fp_rows, &poisoned);
+    print_serve_end_edge(&rec_names, &edge_audio, &edge_motion, edge_audio_missing);
+}
+
+/// The corpus line + the compute-envelope reading (T1's compute half).
+fn print_serve_corpus(
+    rec_names: &[String],
+    gold: &[ServeRow],
+    chatter: &[ServeRow],
+    fp: &[ServeRow],
+    timing: &ServeTiming,
+) {
+    println!(
+        "\n=== serve-cue corpus: {} recording(s), {} gold rallies, {} chatter, {} fp spans ===",
+        rec_names.len(),
+        gold.len(),
+        chatter.len(),
+        fp.len()
+    );
+    // Compute envelope: wall time against the densified footage actually decoded.
+    // (Only cache misses are timed; a fully cached re-run reports ~0.)
+    if timing.decoded_ms > 0 {
+        let decoded_s = timing.decoded_ms as f64 / 1000.0;
+        let wall_s = timing.wall_ms as f64 / 1000.0;
+        println!(
+            "compute (this run, cache misses only): {:.1}s densified footage in {:.1}s wall = {:.2}x real-time, {} frames ({:.1} fps effective)",
+            decoded_s,
+            wall_s,
+            wall_s / decoded_s.max(1e-6),
+            timing.frames,
+            timing.frames as f64 / wall_s.max(1e-6),
+        );
+        println!(
+            "  (window-scoped: densified decode runs only around candidate starts, not whole recordings; ADR 0015 envelope is ≤ ~1.5x real-time CPU)"
+        );
+    } else {
+        println!("compute: fully cached this run (no timing) — delete the scratch dir to re-measure");
+    }
+}
+
+/// T1 — serve-cue recall at the gold rally starts, per recording × court side, across
+/// the declared cue grid.
+fn print_serve_recall(rec_names: &[String], gold: &[ServeRow]) {
+    println!("\n=== T1: serve-cue recall at gold rally starts (per recording × side × cue grid) ===");
+    println!("(near/far measure the near/far-court player's own posture separately — a rally counts once per side that has a player; \"either\" = a serve on either court)");
+    // Primary cue, split by recording and side.
+    let taus = SERVE_CUE_TAUS;
+    print!("{:<40} {:>6} {:>5}", "recording (primary: wrist-over-shoulder)", "side", "n");
+    for t in taus {
+        print!("  τ{t:>+.2}");
+    }
+    println!();
+    // A (selector → value) view of the row for one side: near, far, or either court.
+    let recall_line = |name: &str, rows: Vec<&ServeRow>| {
+        if rows.is_empty() {
+            return;
+        }
+        let sides: [(&str, fn(&ServeRow) -> Option<f64>); 3] = [
+            ("either", |r: &ServeRow| r.cue_vals[0]),
+            ("near", |r: &ServeRow| r.near_primary),
+            ("far", |r: &ServeRow| r.far_primary),
+        ];
+        for (label, sel) in sides {
+            // The denominator is rallies with a player on that court (a side with no
+            // player cannot serve there and does not count against recall).
+            let present: Vec<f64> = rows.iter().filter_map(|r| sel(r)).collect();
+            if present.is_empty() {
+                continue;
+            }
+            print!("{:<40} {:>6} {:>5}", name, label, present.len());
+            for &t in taus {
+                let hit = present.iter().filter(|&&v| v >= t).count();
+                print!("  {:>4.0}%", 100.0 * hit as f64 / present.len() as f64);
+            }
+            println!();
+        }
+    };
+    for (ri, name) in rec_names.iter().enumerate() {
+        recall_line(name, gold.iter().filter(|r| r.rec == ri).collect());
+    }
+    recall_line("— corpus —", gold.iter().collect());
+
+    // Alternative cues, corpus-wide recall over the grid (all sides pooled).
+    println!("\n--- alternative cues (corpus recall, all sides) ---");
+    print!("{:<40} {:>5}", "cue", "n");
+    for t in taus {
+        print!("  τ{t:>+.2}");
+    }
+    println!();
+    for (ci, (cue, name)) in SERVE_CUES.iter().enumerate() {
+        let _ = cue;
+        print!("{:<40} {:>5}", name, gold.len());
+        for &t in taus {
+            let hit = gold
+                .iter()
+                .filter(|r| r.cue_vals[ci].is_some_and(|v| v >= t))
+                .count();
+            print!("  {:>4.0}%", 100.0 * hit as f64 / gold.len() as f64);
+        }
+        println!();
+    }
+}
+
+/// T2 — false-serve rate: the same cues over duration-matched chatter windows and
+/// v5's FP spans.
+fn print_serve_false_rate(chatter: &[ServeRow], fp: &[ServeRow]) {
+    println!("\n=== T2: false-serve rate (detection where there is no gold serve) ===");
+    let taus = SERVE_CUE_TAUS;
+    print!("{:<32} {:<12} {:>5}", "cue", "population", "n");
+    for t in taus {
+        print!("  τ{t:>+.2}");
+    }
+    println!();
+    for (ci, (_, name)) in SERVE_CUES.iter().enumerate() {
+        for (pop, rows) in [("matched-chatter", chatter), ("v5 fp spans", fp)] {
+            if rows.is_empty() {
+                continue;
+            }
+            print!("{:<32} {:<12} {:>5}", name, pop, rows.len());
+            for &t in taus {
+                let hit = rows
+                    .iter()
+                    .filter(|r| r.cue_vals[ci].is_some_and(|v| v >= t))
+                    .count();
+                print!("  {:>4.0}%", 100.0 * hit as f64 / rows.len() as f64);
+            }
+            println!();
+        }
+    }
+}
+
+/// T3 — the serve∨audio confirmation frontier, and the zone verdict against the
+/// pre-declared kill criterion. Admission = primary serve cue (τ) OR audio onsets/s
+/// clears the bar (except on a poisoned recording, which degrades to serve-only).
+/// Suppression = not admitted → the suppressed tier.
+fn print_serve_frontier(
+    gold: &[ServeRow],
+    chatter: &[ServeRow],
+    fp: &[ServeRow],
+    poisoned: &[bool],
+) {
+    println!("\n=== T3: serve∨audio confirmation frontier (both sides) ===");
+    println!(
+        "admit = (wrist-over-shoulder ≥ τ) OR (onsets/s ≥ audio bar, poisoned→serve-only). suppress = not admitted."
+    );
+    println!(
+        "kill criterion: GREEN if some point suppresses ≥80% of {} fp spans while suppressing ≤20 of {} gold.",
+        fp.len(),
+        gold.len()
+    );
+    let audio_admits = |r: &ServeRow, bar: Option<f64>| match bar {
+        Some(b) => !poisoned[r.rec] && r.onset_per_s >= b,
+        None => false, // serve-only column
+    };
+    let admits = |r: &ServeRow, tau: f64, bar: Option<f64>| r.serve_detected(tau) || audio_admits(r, bar);
+
+    println!(
+        "\n{:<24} {:>16} {:>16} {:>16}",
+        "operating point", "gold suppr.", "fp suppr.", "chatter admit"
+    );
+    // Sweep serve-only first, then each audio bar, across the τ grid.
+    let bars: Vec<Option<f64>> = std::iter::once(None)
+        .chain(SERVE_AUDIO_BARS.iter().map(|&b| Some(b)))
+        .collect();
+    struct FrontPoint {
+        label: String,
+        gold_suppr: usize,
+        fp_suppr: usize,
+        chatter_admit: usize,
+        green: bool,
+    }
+    let mut points: Vec<FrontPoint> = Vec::new();
+    for &bar in &bars {
+        for &tau in SERVE_CUE_TAUS {
+            let gold_suppr = gold.iter().filter(|r| !admits(r, tau, bar)).count();
+            let fp_suppr = fp.iter().filter(|r| !admits(r, tau, bar)).count();
+            let chatter_admit = chatter.iter().filter(|r| admits(r, tau, bar)).count();
+            let fp_suppr_frac = 100.0 * fp_suppr as f64 / fp.len().max(1) as f64;
+            let green = fp_suppr_frac >= 80.0 && gold_suppr <= 20;
+            let bar_label = bar.map_or("serve-only".to_string(), |b| format!("audio≥{b:.2}"));
+            let label = format!("τ{tau:>+.2} {bar_label}");
+            println!(
+                "{:<24} {:>7} ({:>4.1}%) {:>7} ({:>4.1}%) {:>7} ({:>4.1}%){}",
+                label,
+                gold_suppr,
+                100.0 * gold_suppr as f64 / gold.len().max(1) as f64,
+                fp_suppr,
+                fp_suppr_frac,
+                chatter_admit,
+                100.0 * chatter_admit as f64 / chatter.len().max(1) as f64,
+                if green { "  <- GREEN" } else { "" },
+            );
+            points.push(FrontPoint {
+                label,
+                gold_suppr,
+                fp_suppr,
+                chatter_admit,
+                green,
+            });
+        }
+    }
+
+    // Zone verdict against the pre-declared criterion.
+    println!("\n=== zone verdict (criterion declared on issue #95 before the numbers) ===");
+    let green: Vec<&FrontPoint> = points.iter().filter(|pt| pt.green).collect();
+    // Red: every point reaching ≥80% fp suppression suppresses ≥40 gold.
+    let reaching: Vec<&FrontPoint> = points
+        .iter()
+        .filter(|pt| 100.0 * pt.fp_suppr as f64 / fp.len().max(1) as f64 >= 80.0)
+        .collect();
+    let all_reaching_bad =
+        !reaching.is_empty() && reaching.iter().all(|pt| pt.gold_suppr >= 40);
+    let zone = if !green.is_empty() {
+        "GREEN — proceed to the v6 build"
+    } else if reaching.is_empty() || all_reaching_bad {
+        "RED — posture closes like velocity and 5 fps; the spec-level conversation is the fallback"
+    } else {
+        "GRAY — frontier moved but did not reach; judgment session"
+    };
+    println!("zone: {zone}");
+    // The most FP the frontier suppresses while staying inside the ≤20 gold budget —
+    // the frontier read whether or not it reaches green.
+    let best = points
+        .iter()
+        .filter(|pt| pt.gold_suppr <= 20)
+        .max_by_key(|pt| pt.fp_suppr);
+    if let Some(best) = best {
+        println!(
+            "  best point within the ≤20-gold budget: {}  ({} gold suppr, {} fp suppr, {} chatter admit)",
+            best.label, best.gold_suppr, best.fp_suppr, best.chatter_admit
+        );
+    } else {
+        println!("  no operating point stays within the ≤20-gold budget");
+    }
+}
+
+/// T4 — end-edge placement: at each gold rally end, the |error| of the audio
+/// last-onset vs the motion-envelope decay as the end placer, per recording.
+fn print_serve_end_edge(
+    rec_names: &[String],
+    edge_audio: &[Vec<f64>],
+    edge_motion: &[Vec<f64>],
+    audio_missing: usize,
+) {
+    println!("\n=== T4: end-edge error at gold rally ends (median |error|, seconds) ===");
+    println!(
+        "{:<44} {:>16} {:>16}",
+        "recording", "audio last-onset", "motion decay"
+    );
+    let med_s = |v: &[f64]| -> String {
+        let mut ms: Vec<i64> = v.iter().map(|x| (x * 1000.0).round() as i64).collect();
+        ms.sort_unstable();
+        median(&ms).map_or("n/a".to_string(), |m| format!("{:.2}s", m / 1000.0))
+    };
+    let mut all_audio: Vec<f64> = Vec::new();
+    let mut all_motion: Vec<f64> = Vec::new();
+    for (ri, name) in rec_names.iter().enumerate() {
+        let a = edge_audio.get(ri).map(|v| v.as_slice()).unwrap_or(&[]);
+        let m = edge_motion.get(ri).map(|v| v.as_slice()).unwrap_or(&[]);
+        all_audio.extend_from_slice(a);
+        all_motion.extend_from_slice(m);
+        println!("{:<44} {:>16} {:>16}", name, med_s(a), med_s(m));
+    }
+    println!(
+        "{:<44} {:>16} {:>16}",
+        "— corpus —",
+        med_s(&all_audio),
+        med_s(&all_motion)
+    );
+    if audio_missing > 0 {
+        println!("(audio last-onset undefined for {audio_missing} gold rally/rallies with no onset inside — excluded, never silently zeroed)");
+    }
+}
+
+/// |error|, seconds, of placing a rally's end at its last audio onset. `None` when
+/// no onset falls inside the rally (reported, never zeroed).
+fn audio_last_onset_error(rally: Interval, ob: &segment::OnsetBlocks) -> Option<f64> {
+    let bm = ob.block_ms.max(1);
+    let lo = (rally.start_ms.max(0) / bm) as usize;
+    let hi = ((rally.end_ms.max(0) as u64).div_ceil(bm as u64) as usize).min(ob.onsets.len());
+    let lo = lo.min(hi);
+    let last = (lo..hi).rev().find(|&i| ob.onsets[i] > 0)?;
+    // Block centre as the onset time.
+    let t = last as i64 * bm + bm / 2;
+    Some((t - rally.end_ms).abs() as f64 / 1000.0)
+}
+
+/// |error|, seconds, of placing a rally's end at the motion-envelope decay: the last
+/// frame inside the rally whose energy clears [`SERVE_MOTION_DECAY_FRAC`] of the
+/// rally's 75th-percentile energy. `None` when the rally spans no motion frame.
+fn motion_decay_error(rally: Interval, motion: &segment::MotionTrack) -> Option<f64> {
+    let fps = motion.fps.max(1e-6);
+    let lo = ((rally.start_ms.max(0) as f64 / 1000.0) * fps).floor() as usize;
+    let hi = (((rally.end_ms.max(0) as f64 / 1000.0) * fps).ceil() as usize).min(motion.energy.len());
+    if lo >= hi {
+        return None;
+    }
+    let mut sorted: Vec<f64> = motion.energy[lo..hi].to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let p75 = sorted[(sorted.len() * 3 / 4).min(sorted.len() - 1)];
+    let thresh = SERVE_MOTION_DECAY_FRAC * p75;
+    let decay_idx = (lo..hi).rev().find(|&i| motion.energy[i] >= thresh)?;
+    let t = (decay_idx as f64 / fps * 1000.0) as i64;
+    Some((t - rally.end_ms).abs() as f64 / 1000.0)
+}
+
 /// One recording's line block: the headline path, then the three numbers with the
 /// counts behind them.
 fn print_recording(rel_path: &str, s: &Score) {
@@ -2688,6 +3403,7 @@ struct Options {
     edges: bool,
     presence: bool,
     spans: bool,
+    serve: bool,
     scratch: Option<String>,
     help: bool,
 }
@@ -2707,6 +3423,7 @@ impl Options {
             edges: false,
             presence: false,
             spans: false,
+            serve: false,
             scratch: None,
             help: false,
         };
@@ -2721,6 +3438,7 @@ impl Options {
                 "--edges" => opts.edges = true,
                 "--presence" => opts.presence = true,
                 "--spans" => opts.spans = true,
+                "--serve" => opts.serve = true,
                 "--scratch" => {
                     opts.scratch = Some(it.next().ok_or("--scratch needs a directory")?.clone());
                 }
@@ -2762,7 +3480,8 @@ fn print_usage() {
          --edges                split boundary errors by edge provenance (issue #93)\n    \
          --presence             presence headroom: sub-threshold + bridged (issue #93)\n    \
          --spans                span-score separation over the declared grid (issue #93)\n    \
-         --scratch DIR          cache dir for scratch detection tracks (default: temp)\n    \
+         --serve                serve-cue + confirmation viability, gold only (ADR 0017, issue #95)\n    \
+         --scratch DIR          cache dir for scratch detection/pose tracks (default: temp)\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
          Recordings without a hand-corrected timeline are skipped, never scored."
@@ -3613,5 +4332,114 @@ mod tests {
         let s = score(&draft, &gold, 0);
         assert_eq!(s.false_positives, 1);
         assert!((s.false_positives_per_hour - 600.0).abs() < 1e-9, "{s:?}");
+    }
+
+    // ── serve-cue heuristic (issue #95 round 4) ─────────────────────────────────
+
+    /// A player pose with the listed keypoints set (index, x, y, score); the rest sit
+    /// at zero confidence. The box centre is placed low in frame (near court).
+    fn pose_with(kps: &[(usize, f32, f32, f32)]) -> crate::pose::PlayerPose {
+        let mut keypoints = [crate::pose::Keypoint { x: 0.0, y: 0.0, score: 0.0 }; crate::pose::NUM_KP];
+        for &(i, x, y, s) in kps {
+            keypoints[i] = crate::pose::Keypoint { x, y, score: s };
+        }
+        crate::pose::PlayerPose {
+            bbox: crate::detect::Box { x: 0.45, y: 0.6, w: 0.1, h: 0.3, score: 0.9 },
+            keypoints,
+        }
+    }
+
+    #[test]
+    fn cue_value_measures_elevation_over_torso() {
+        use crate::pose::*;
+        // Shoulders at y=0.5, hips at y=0.8 → torso 0.3. A wrist at y=0.2 is 0.3 above
+        // the shoulder line = 1.0 torso-height; above the hip line = 2.0.
+        let p = pose_with(&[
+            (KP_L_SHOULDER, 0.4, 0.5, 0.9),
+            (KP_R_SHOULDER, 0.6, 0.5, 0.9),
+            (KP_L_HIP, 0.4, 0.8, 0.9),
+            (KP_R_HIP, 0.6, 0.8, 0.9),
+            (KP_R_WRIST, 0.6, 0.2, 0.9),
+        ]);
+        assert!((player_cue_value(&p, ServeCue::WristOverShoulder).unwrap() - 1.0).abs() < 1e-6);
+        assert!((player_cue_value(&p, ServeCue::WristOverHip).unwrap() - 2.0).abs() < 1e-6);
+        // No elbow keypoint is confident → the elbow cue has nothing to read.
+        assert!(player_cue_value(&p, ServeCue::ElbowOverShoulder).is_none());
+    }
+
+    #[test]
+    fn cue_value_needs_confident_anchor_keypoints() {
+        use crate::pose::*;
+        // Shoulders present but a hip below the confidence floor → torso undefined.
+        let p = pose_with(&[
+            (KP_L_SHOULDER, 0.4, 0.5, 0.9),
+            (KP_R_SHOULDER, 0.6, 0.5, 0.9),
+            (KP_R_WRIST, 0.6, 0.2, 0.9),
+            (KP_L_HIP, 0.4, 0.8, 0.1), // below SERVE_KP_MIN
+        ]);
+        assert!(player_cue_value(&p, ServeCue::WristOverShoulder).is_none());
+    }
+
+    #[test]
+    fn window_best_cue_takes_the_max_and_reports_the_side() {
+        use crate::pose::*;
+        let low = pose_with(&[
+            (KP_L_SHOULDER, 0.4, 0.5, 0.9),
+            (KP_R_SHOULDER, 0.6, 0.5, 0.9),
+            (KP_L_HIP, 0.4, 0.8, 0.9),
+            (KP_R_HIP, 0.6, 0.8, 0.9),
+            (KP_R_WRIST, 0.6, 0.55, 0.9), // wrist just below shoulder
+        ]);
+        let high = pose_with(&[
+            (KP_L_SHOULDER, 0.4, 0.5, 0.9),
+            (KP_R_SHOULDER, 0.6, 0.5, 0.9),
+            (KP_L_HIP, 0.4, 0.8, 0.9),
+            (KP_R_HIP, 0.6, 0.8, 0.9),
+            (KP_R_WRIST, 0.6, 0.2, 0.9), // wrist well above shoulder
+        ]);
+        let win = crate::pose::PoseWindow {
+            fps: 15.0,
+            frames: vec![
+                crate::pose::PoseFrame { t_ms: 0, players: vec![low] },
+                crate::pose::PoseFrame { t_ms: 66, players: vec![high] },
+            ],
+        };
+        // The high frame wins the pooled max; the near-court selector sees it (box
+        // centre 0.75 → near), the far-court selector sees nothing.
+        let v = window_best_cue(&win, ServeCue::WristOverShoulder, None).unwrap();
+        assert!((v - 1.0).abs() < 1e-6);
+        let near = window_best_cue(&win, ServeCue::WristOverShoulder, Some(Side::Near)).unwrap();
+        assert!((near - 1.0).abs() < 1e-6);
+        assert!(window_best_cue(&win, ServeCue::WristOverShoulder, Some(Side::Far)).is_none());
+    }
+
+    #[test]
+    fn side_splits_on_frame_midline() {
+        assert_eq!(Side::from_y(0.75), Side::Near);
+        assert_eq!(Side::from_y(0.30), Side::Far);
+        assert_eq!(Side::from_y(0.50), Side::Near); // the boundary is near
+    }
+
+    #[test]
+    fn audio_last_onset_error_is_distance_to_the_final_onset() {
+        // Blocks 0..4 at 1 s; onsets in blocks 1 and 3. Rally 0–5000 ends at 5000; the
+        // last onset is block 3, centre 3500 → 1.5 s error.
+        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![0, 2, 0, 1, 0] };
+        let e = audio_last_onset_error(Interval { start_ms: 0, end_ms: 5000 }, &ob).unwrap();
+        assert!((e - 1.5).abs() < 1e-6, "{e}");
+        // A rally with no onset inside is undefined, never zeroed.
+        let ob0 = segment::OnsetBlocks { block_ms: 1000, onsets: vec![0, 0, 0] };
+        assert!(audio_last_onset_error(Interval { start_ms: 0, end_ms: 3000 }, &ob0).is_none());
+    }
+
+    #[test]
+    fn motion_decay_error_finds_the_last_energetic_frame() {
+        // 10 fps, rally 0–1000 ms → frames 0..10. p75 of a ramp, decay at the last
+        // frame clearing 50% of it. Energy tail goes quiet after frame 5.
+        let energy = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let motion = segment::MotionTrack { fps: 10.0, energy };
+        let e = motion_decay_error(Interval { start_ms: 0, end_ms: 1000 }, &motion).unwrap();
+        // last frame >= 0.5*p75 (p75=1.0) is index 5 → 500 ms; end 1000 → 0.5 s error.
+        assert!((e - 0.5).abs() < 1e-6, "{e}");
     }
 }

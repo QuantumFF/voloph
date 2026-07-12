@@ -9,6 +9,11 @@ pub mod eval;
 mod export;
 mod media;
 mod media_worker;
+/// Serve-cue pose extraction (ADR 0017, issue #95 round 4): a nano RTMPose-t
+/// estimator run in densified windows to decide whether a candidate span shows
+/// a serve. Public so the `eval-harness --serve` measurement mode can drive it.
+/// Observational only — the shipped app never runs it until the gated v6 build.
+pub mod pose;
 mod segment;
 mod staging;
 

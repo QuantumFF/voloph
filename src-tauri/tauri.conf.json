@@ -34,7 +34,8 @@
       "binaries/ffprobe"
     ],
     "resources": [
-      "models/yolox_nano.onnx"
+      "models/yolox_nano.onnx",
+      "models/rtmpose_t.onnx"
     ],
     "icon": [
       "icons/32x32.png",

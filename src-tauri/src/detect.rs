@@ -47,8 +47,13 @@ use crate::media::sidecar_path;
 pub const DETECT_FPS: u32 = 3;
 
 /// The square side the model consumes (YOLOX-Nano: 416). Frames are letterboxed to
-/// `MODEL_SIZE x MODEL_SIZE` before inference.
-const MODEL_SIZE: u32 = 416;
+/// `MODEL_SIZE x MODEL_SIZE` before inference. `pub(crate)` so the serve-cue pose
+/// pass (issue #95) can letterbox its own source frames to the same input.
+pub(crate) const MODEL_SIZE: u32 = 416;
+
+/// The grayscale pad value (114) YOLOX's letterbox fills with — the byte form of
+/// [`PAD_HEX`], exposed so the pose pass's in-Rust letterbox matches ffmpeg's.
+pub(crate) const PAD_VALUE: u8 = 114;
 
 /// Grayscale pad value YOLOX's `preproc` letterboxes with (114). ffmpeg's `pad`
 /// takes it as a hex color; all three channels equal so BGR vs RGB is moot.
@@ -171,6 +176,24 @@ impl Detector {
         Ok(Detector { session, input_name })
     }
 
+    /// Infer on one already-letterboxed `MODEL_SIZE` BGR frame and map the decoded
+    /// person boxes straight into source-frame-normalized coordinates through
+    /// `letterbox`. The serve-cue pose pass (issue #95) letterboxes its own source
+    /// frames in Rust and reuses this to get the per-frame boxes it crops around,
+    /// without touching the private [`PixelBox`] type.
+    pub(crate) fn boxes_in_frame(
+        &mut self,
+        bgr: &[u8],
+        score_floor: f32,
+        letterbox: &Letterbox,
+    ) -> Result<Vec<Box>, String> {
+        let pixel_boxes = self.infer(bgr, score_floor)?;
+        Ok(pixel_boxes
+            .iter()
+            .filter_map(|b| letterbox.to_source_norm(b))
+            .collect())
+    }
+
     /// Run the detector on one already-letterboxed `MODEL_SIZE x MODEL_SIZE` BGR frame
     /// (raw bytes, `H*W*3`), returning the decoded person boxes at or above
     /// `score_floor` in **model-input** pixel coordinates before letterbox
@@ -230,7 +253,7 @@ struct PixelBox {
 /// them unconditionally never fails to compile; only registration is conditional, and
 /// that is handled silently at runtime. On CPU-only machines this list is simply
 /// ignored, and detections are identical either way (ADR 0015 — no user choice).
-fn gpu_execution_providers() -> Vec<ExecutionProviderDispatch> {
+pub(crate) fn gpu_execution_providers() -> Vec<ExecutionProviderDispatch> {
     #[cfg(target_os = "linux")]
     {
         vec![ort::execution_providers::CUDAExecutionProvider::default().build()]
@@ -333,7 +356,7 @@ fn iou(a: &PixelBox, b: &PixelBox) -> f32 {
 /// padding. Carries just enough to invert it, mapping a model-space box back into
 /// source-frame-normalized `[0,1]` coordinates.
 #[derive(Debug, Clone, Copy)]
-struct Letterbox {
+pub(crate) struct Letterbox {
     scale: f32,
     pad_x: f32,
     pad_y: f32,
@@ -344,7 +367,7 @@ struct Letterbox {
 impl Letterbox {
     /// Build the transform for a source of `src_w x src_h`, matching ffmpeg's
     /// `scale=...:force_original_aspect_ratio=decrease` + centered `pad`.
-    fn new(src_w: u32, src_h: u32) -> Letterbox {
+    pub(crate) fn new(src_w: u32, src_h: u32) -> Letterbox {
         let side = MODEL_SIZE as f32;
         let (sw, sh) = (src_w as f32, src_h as f32);
         let scale = (side / sw).min(side / sh);
@@ -357,6 +380,14 @@ impl Letterbox {
             src_w: sw,
             src_h: sh,
         }
+    }
+
+    /// Map a model-input pixel `(mx, my)` back to the continuous **source pixel** it
+    /// samples from (undo the centered pad, then the uniform scale). A coordinate
+    /// outside `[0, src)` lands in the pad region. Used by the pose pass's in-Rust
+    /// letterbox (issue #95).
+    pub(crate) fn model_px_to_source(self, mx: f32, my: f32) -> (f32, f32) {
+        ((mx - self.pad_x) / self.scale, (my - self.pad_y) / self.scale)
     }
 
     /// Map one model-space pixel box back into source-frame-normalized coordinates,
