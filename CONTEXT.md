@@ -28,6 +28,10 @@ _Avoid_: cut list, EDL, edit
 A span the segmenter marks as low-confidence — where it is unsure whether play is happening or where a rally boundary sits. Surfaced on the timeline during review as "check this," so correcting the draft becomes "visit the few spots the machine doubts" rather than scanning everything. Machine-produced and segmentation-related — distinct from a **Flag** (user-produced, about a rally's review value). Catches *uncertain* errors only, not confident-but-wrong segmentation.
 _Avoid_: flag, low-confidence marker, suspect
 
+**Suppressed span**:
+A draft span the segmenter judged to be non-play — off the default timeline, so review and export skip it, but never destroyed: revealed on demand during review and restorable to a rally with one operation. The third tier between "rally on the timeline" and "nothing there": it lets the segmenter fight false positives aggressively while no span of play is ever unrecoverable. Distinct from an **Uncertain region**, which stays visible ("check this"); a suppressed span is hidden ("judged non-play — recoverable if the machine was wrong").
+_Avoid_: deleted rally, hidden span, rejected span, trash, filtered rally
+
 **Analysis**:
 The machine-produced output of segmenting one recording, captured the moment segmentation completes — before any human correction: the draft timeline with per-rally confidence (uncertain regions included), the waveform, the duration, and the capture day. Impersonal — a pure function of the recording and the segmenter, carrying no review state and no attribution, which is why another user may adopt it silently. Hand corrections never enter an Analysis; they travel only inside a session bundle.
 _Avoid_: analyzed segments, segmentation results, analysis cache, draft (alone)
