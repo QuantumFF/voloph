@@ -374,7 +374,7 @@ pub fn vendored_pose_model_path() -> Result<PathBuf, String> {
 }
 
 /// Probe the pose pass's *decoded* source frame size — width/height parsed
-/// robustly (see [`parse_two_dims`]) and swapped when a ±90°/270° display rotation
+/// robustly (see [`detect::parse_two_dims`]) and swapped when a ±90°/270° display rotation
 /// makes ffmpeg autorotate the raw output. `None` if ffprobe cannot run. Cheap
 /// (header-only), so the harness probes it **once per recording** and threads the
 /// result into [`extract_pose_window`], never per window.
@@ -392,21 +392,11 @@ pub(crate) fn probe_source_dimensions(path: &str) -> Option<(u32, u32)> {
     if !out.status.success() {
         return None;
     }
-    let (mut w, mut h) = parse_two_dims(&String::from_utf8_lossy(&out.stdout))?;
+    let (mut w, mut h) = detect::parse_two_dims(&String::from_utf8_lossy(&out.stdout))?;
     if probe_rotation(path).is_some_and(|r| r.rem_euclid(180) == 90) {
         std::mem::swap(&mut w, &mut h);
     }
     Some((w, h))
-}
-
-/// The first two unsigned integers in `text`, tolerating any non-digit separators
-/// and a trailing one (`"1920x1080x"`, `"1920,1080,"` → `(1920, 1080)`).
-fn parse_two_dims(text: &str) -> Option<(u32, u32)> {
-    let mut nums = text
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<u32>().ok());
-    Some((nums.next()?, nums.next()?))
 }
 
 /// Best-effort display-matrix rotation in degrees (e.g. `-90`, `90`), or `None` when
@@ -574,17 +564,6 @@ mod tests {
         let (nx, ny) = crop.to_source_norm(POSE_W as f32 / 2.0, POSE_H as f32 / 2.0);
         assert!((nx - 0.4).abs() < 1e-3);
         assert!((ny - 0.4).abs() < 1e-3);
-    }
-
-    #[test]
-    fn parse_two_dims_tolerates_the_trailing_separator() {
-        // The regression: some ffprobe builds emit a trailing separator.
-        assert_eq!(parse_two_dims("1920x1080x"), Some((1920, 1080)));
-        assert_eq!(parse_two_dims("1920,1080,"), Some((1920, 1080)));
-        assert_eq!(parse_two_dims("1920x1080"), Some((1920, 1080)));
-        assert_eq!(parse_two_dims("720x1280\n"), Some((720, 1280)));
-        assert_eq!(parse_two_dims(""), None);
-        assert_eq!(parse_two_dims("1920"), None);
     }
 
     #[test]

@@ -477,9 +477,10 @@ fn probe_dimensions(path: &str) -> Option<(u32, u32)> {
 /// and a **trailing** one — some ffprobe builds emit `csv=s=x` output as `1920x1080x`
 /// (a trailing separator), which the old `split_once('x')` parse dropped to `None`,
 /// silently falling back to a 416×416 square frame and back-mapping every occupancy
-/// box against the wrong geometry (ADR 0018, issue #96). Mirrors the pose pass's own
-/// robust probe ([`crate::pose::probe_source_dimensions`]).
-fn parse_two_dims(text: &str) -> Option<(u32, u32)> {
+/// box against the wrong geometry (ADR 0018, issue #96). Shared with the pose pass's
+/// probe ([`crate::pose::probe_source_dimensions`]) so the two never diverge on the
+/// separator handling this fix depends on.
+pub(crate) fn parse_two_dims(text: &str) -> Option<(u32, u32)> {
     let mut nums = text
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
@@ -870,8 +871,10 @@ mod tests {
     #[test]
     fn parse_two_dims_tolerates_a_trailing_separator() {
         assert_eq!(parse_two_dims("1920x1080x"), Some((1920, 1080)));
+        assert_eq!(parse_two_dims("1920,1080,"), Some((1920, 1080)));
         assert_eq!(parse_two_dims("1920x1080"), Some((1920, 1080)));
         assert_eq!(parse_two_dims("1920x1080\n"), Some((1920, 1080)));
+        assert_eq!(parse_two_dims("720x1280\n"), Some((720, 1280)));
         assert_eq!(parse_two_dims(""), None);
         assert_eq!(parse_two_dims("1920"), None);
     }
