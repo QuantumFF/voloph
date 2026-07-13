@@ -1,7 +1,19 @@
 mod db;
+/// Occupancy detection extraction (ADR 0015 Stage 2, issue #83): the nano person
+/// detector behind the sidecar. Public so the `detect-dump` dev CLI can drive it.
+/// Feeds nothing yet — fusion is issue #84.
+pub mod detect;
+/// The eval harness (ADR 0015): a dev CLI that referees the segmenter against
+/// hand-corrected timelines. Public so the `eval-harness` bin can drive it.
+pub mod eval;
 mod export;
 mod media;
 mod media_worker;
+/// Serve-cue pose extraction (ADR 0017, issue #95 round 4): a nano RTMPose-t
+/// estimator run in densified windows to decide whether a candidate span shows
+/// a serve. Public so the `eval-harness --serve` measurement mode can drive it.
+/// Observational only — the shipped app never runs it until the gated v6 build.
+pub mod pose;
 mod segment;
 mod staging;
 
@@ -553,6 +565,27 @@ async fn filter_moments(
     .map_err(|e| e.to_string())
 }
 
+/// The rallies of one recording (its `src` index among the export's inputs) as
+/// export cuts, keeping only the selected `rally_ids` (`None` keeps every rally).
+/// Timeline order is already start_ms-ascending, so the cuts come out in timeline
+/// order — appending each recording's cuts in turn yields capture-then-timeline
+/// order across a whole session.
+fn selected_cuts(
+    rallies: &[db::TimelineRally],
+    src: usize,
+    rally_ids: &Option<Vec<i64>>,
+) -> Vec<export::Cut> {
+    rallies
+        .iter()
+        .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
+        .map(|r| export::Cut {
+            src,
+            start_ms: r.start_ms,
+            end_ms: r.end_ms,
+        })
+        .collect()
+}
+
 /// Render one new MP4 at `output` from a selection of the rallies of the
 /// recording at `path` (issue #12 — the Export engine). `rally_ids` picks which
 /// rallies; `None` exports **all** of them (the condensed-recording case). The
@@ -573,17 +606,7 @@ async fn export_rallies(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "recording is not registered".to_string())?
     };
-    // Timeline order is already start_ms-ascending; keep only the selected rallies.
-    let cuts: Vec<export::Cut> = timeline
-        .rallies
-        .iter()
-        .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
-        .map(|r| export::Cut {
-            src: 0,
-            start_ms: r.start_ms,
-            end_ms: r.end_ms,
-        })
-        .collect();
+    let cuts = selected_cuts(&timeline.rallies, 0, &rally_ids);
     export::export(&app, &[&path], &output, &cuts)
 }
 
@@ -611,19 +634,7 @@ async fn export_session(
             let timeline = db::recording_timeline(&conn, path)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("recording is not registered: {path}"))?;
-            // Timeline order is already start_ms-ascending, so appending each
-            // recording's rallies in turn yields capture-then-timeline order.
-            cuts.extend(
-                timeline
-                    .rallies
-                    .iter()
-                    .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
-                    .map(|r| export::Cut {
-                        src,
-                        start_ms: r.start_ms,
-                        end_ms: r.end_ms,
-                    }),
-            );
+            cuts.extend(selected_cuts(&timeline.rallies, src, &rally_ids));
         }
         cuts
     };

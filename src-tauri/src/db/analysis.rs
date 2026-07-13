@@ -47,11 +47,28 @@ pub struct Analysis {
     pub rallies: Vec<AnalysisRally>,
 }
 
-/// The Analysis file's name in `.voloph/analysis/`: quick hash + file size, the
-/// recording's existing content-key identity (ADR 0013). Survives renames and
-/// moves within the library and dedups copies.
-fn analysis_file_name(quick_hash: &str, file_size: i64) -> String {
-    format!("{quick_hash}_{file_size}.vanalysis")
+/// The Analysis file's name in `.voloph/analysis/` for a given segmenter version
+/// (ADR 0013/0015). The base is quick hash + file size — the recording's existing
+/// content-key identity, surviving renames and moves and deduping copies. Version 1
+/// keeps the bare `{key}.vanalysis` name it has always used, so older Voloph builds
+/// (segmenter v1) still find and adopt it; a newer version gets a `_s{N}` suffix so
+/// it is **published alongside** the stale one rather than overwriting it — nothing
+/// in shared storage is ever deleted, and adoption prefers the highest version.
+pub(crate) fn analysis_file_name(quick_hash: &str, file_size: i64, segmenter_version: u32) -> String {
+    if segmenter_version <= 1 {
+        format!("{quick_hash}_{file_size}.vanalysis")
+    } else {
+        format!("{quick_hash}_{file_size}_s{segmenter_version}.vanalysis")
+    }
+}
+
+/// The content-key filename prefix shared by every version's Analysis for one
+/// recording — the base `{quick_hash}_{file_size}` (ADR 0013/0015). Used to
+/// enumerate all published versions of a recording's Analysis when adopting the
+/// highest one; anything after this prefix is either `.vanalysis` (v1) or
+/// `_s{N}.vanalysis` (a later version).
+fn analysis_key_prefix(quick_hash: &str, file_size: i64) -> String {
+    format!("{quick_hash}_{file_size}")
 }
 
 struct AnalysisRow {
@@ -61,6 +78,7 @@ struct AnalysisRow {
     capture_day: String,
     duration_ms: Option<i64>,
     waveform_json: Option<String>,
+    segmenter_version: Option<i64>,
 }
 
 /// Read the DB row + rallies for recording `id` and assemble its pristine machine
@@ -82,7 +100,8 @@ fn analysis_of_any_library(conn: &Connection, id: i64) -> Option<(String, i64, A
 fn analysis_of_impl(conn: &Connection, id: i64, require_shared: bool) -> Option<(String, i64, Analysis)> {
     let row = conn
         .query_row(
-            "SELECT library, file_size, quick_hash, capture_day, duration_ms, waveform
+            "SELECT library, file_size, quick_hash, capture_day, duration_ms, waveform,
+                    segmenter_version
              FROM recordings WHERE id = ?1",
             [id],
             |r| {
@@ -93,6 +112,7 @@ fn analysis_of_impl(conn: &Connection, id: i64, require_shared: bool) -> Option<
                     capture_day: r.get(3)?,
                     duration_ms: r.get(4)?,
                     waveform_json: r.get(5)?,
+                    segmenter_version: r.get(6)?,
                 })
             },
         )
@@ -128,7 +148,15 @@ fn analysis_of_impl(conn: &Connection, id: i64, require_shared: bool) -> Option<
     let analysis = Analysis {
         format: ANALYSIS_FORMAT.to_string(),
         version: ANALYSIS_VERSION,
-        segmenter_version: crate::segment::SEGMENTER_VERSION,
+        // The version that actually produced this draft (ADR 0013/0015), so the
+        // published file names and describes itself honestly — a draft adopted from
+        // an older Analysis republishes as that older version, not as the active one.
+        // A row with no stamp (only unsegmented rows, which never reach here) falls
+        // back to the active version.
+        segmenter_version: row
+            .segmenter_version
+            .map(|v| v as u32)
+            .unwrap_or(crate::segment::SEGMENTER_VERSION),
         capture_day: row.capture_day,
         duration_ms: row.duration_ms,
         waveform: parse_waveform(row.waveform_json.as_deref()),
@@ -152,7 +180,7 @@ pub fn publish_analysis(conn: &Connection, id: i64) {
         return; // shared library not designated on this device
     };
     let dir = Path::new(&root).join(".voloph").join("analysis");
-    let name = analysis_file_name(&quick_hash, file_size);
+    let name = analysis_file_name(&quick_hash, file_size, analysis.segmenter_version);
     if let Err(e) = write_analysis(&dir, &name, &analysis) {
         // Silent to the user (ADR 0013): the analysis is already in the DB.
         log::warn!("analysis: could not publish {name}: {e}");
@@ -212,12 +240,15 @@ pub fn publish_missing_analyses(conn: &Connection) {
         let Some((quick_hash, file_size, analysis)) = analysis_of_any_library(conn, id) else {
             continue;
         };
-        // Present and readable → invariant already holds, leave it alone. Missing or
-        // unreadable (wrong version, truncated) counts as absent and is (re)written.
-        if read_analysis(&root, &quick_hash, file_size).is_some() {
+        // The invariant is per version (ADR 0013/0015): this draft's own
+        // `.vanalysis` should exist. A newer-version draft publishes *alongside* the
+        // stale one under its own name rather than checking for any file — so a bump
+        // backfills the superseding file without touching the older sibling. Present
+        // and readable → leave it alone; missing or unreadable (truncated) → rewrite.
+        let name = analysis_file_name(&quick_hash, file_size, analysis.segmenter_version);
+        if read_analysis_file(&dir.join(&name)).is_some() {
             continue;
         }
-        let name = analysis_file_name(&quick_hash, file_size);
         if let Err(e) = write_analysis(&dir, &name, &analysis) {
             log::warn!("analysis: could not publish {name}: {e}");
         }
@@ -237,24 +268,55 @@ fn write_analysis(dir: &Path, name: &str, analysis: &Analysis) -> std::io::Resul
     std::fs::rename(&tmp, dir.join(name))
 }
 
-/// Read the published Analysis for a recording keyed by `quick_hash` + `file_size`
-/// (ADR 0013), or `None` when there is no matching file, it cannot be read, or it
-/// is not a readable Analysis (malformed, wrong format, or a newer version). Failure
-/// is silent by design — an Analysis is plumbing the user never knew existed, so an
-/// unreadable file just means the normal pipeline analyzes as if it weren't there.
-fn read_analysis(root: &str, quick_hash: &str, file_size: i64) -> Option<Analysis> {
-    let path = Path::new(root)
-        .join(".voloph")
-        .join("analysis")
-        .join(analysis_file_name(quick_hash, file_size));
-    let bytes = std::fs::read(&path).ok()?;
+/// Parse the `.vanalysis` at `path`, or `None` when it cannot be read or is not a
+/// readable Analysis — malformed, wrong format, or a wire `version` from a newer
+/// Voloph (ADR 0013). Failure is silent by design: an Analysis is plumbing the user
+/// never knew existed, so an unreadable file just means the pipeline analyzes as if
+/// it weren't there. Note the wire `version` (the file *format*) is distinct from
+/// the `segmenter_version` (which segmenter produced the draft); only the former
+/// gates readability, since a newer segmenter's output is still readable JSON.
+fn read_analysis_file(path: &Path) -> Option<Analysis> {
+    let bytes = std::fs::read(path).ok()?;
     let analysis: Analysis = serde_json::from_slice(&bytes).ok()?;
-    // Format/version envelope check (ADR 0013): a wrong format or a version from a
-    // newer Voloph is ignored, not adopted, so a future format change stays safe.
     if analysis.format != ANALYSIS_FORMAT || analysis.version > ANALYSIS_VERSION {
         return None;
     }
     Some(analysis)
+}
+
+/// The **highest-version** published Analysis for a recording keyed by its content
+/// key (quick hash and file size; ADR 0013/0015), or `None` when none is readable.
+/// Every version of the Analysis for one recording shares the content-key prefix and lives
+/// alongside its siblings (nothing is ever deleted from shared storage), so this
+/// enumerates them and prefers the one the highest segmenter produced — the best
+/// draft, which is what adoption should carry. A malformed or wrong-format sibling
+/// is skipped silently, never blocking a good one.
+fn read_best_analysis(root: &str, quick_hash: &str, file_size: i64) -> Option<Analysis> {
+    let dir = Path::new(root).join(".voloph").join("analysis");
+    let prefix = analysis_key_prefix(quick_hash, file_size);
+    let mut best: Option<Analysis> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Match this recording's content key exactly: either the bare v1 name or a
+        // `_s{N}` versioned sibling. The `_` guard stops `<hash>_<size>` from also
+        // matching a longer size that happens to start with these digits.
+        let is_ours = name == format!("{prefix}.vanalysis")
+            || name.starts_with(&format!("{prefix}_s")) && name.ends_with(".vanalysis");
+        if !is_ours {
+            continue;
+        }
+        let Some(analysis) = read_analysis_file(&entry.path()) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|b| analysis.segmenter_version > b.segmenter_version)
+        {
+            best = Some(analysis);
+        }
+    }
+    best
 }
 
 /// Silently adopt a published Analysis for the shared-library recordings that a
@@ -292,7 +354,10 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
         if is_hand_touched(tx, id)? {
             continue;
         }
-        let Some(analysis) = read_analysis(&root, &quick_hash, file_size) else {
+        // Prefer the highest-version Analysis when several are published for these
+        // bytes (ADR 0013/0015): every device converges on the best draft, older
+        // files stay on disk.
+        let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size) else {
             continue;
         };
         tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
@@ -307,11 +372,20 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
         }
         // Playable straight away, like a bundle-registered recording: the draft came
         // from the Analysis, so probe + segment are both satisfied (ADR 0008/0013).
+        // Carry the Analysis's segmenter version onto the row (#80) so a later bump
+        // can tell an adopted draft is stale exactly as it tells a locally produced
+        // one — and so republishing this draft names itself by the version that made it.
         tx.execute(
             "UPDATE recordings
-             SET probe_state = 'ready', segment_state = 'ready', duration_ms = ?1, waveform = ?2
-             WHERE id = ?3",
-            rusqlite::params![analysis.duration_ms, waveform_to_json(&analysis.waveform), id],
+             SET probe_state = 'ready', segment_state = 'ready', duration_ms = ?1, waveform = ?2,
+                 segmenter_version = ?3
+             WHERE id = ?4",
+            rusqlite::params![
+                analysis.duration_ms,
+                waveform_to_json(&analysis.waveform),
+                analysis.segmenter_version,
+                id
+            ],
         )?;
     }
     Ok(())
@@ -338,8 +412,14 @@ mod tests {
                 confidence: 0.9,
             }],
         };
-        let name = analysis_file_name("abc123", 4242);
+        let name = analysis_file_name("abc123", 4242, 1);
         assert_eq!(name, "abc123_4242.vanalysis");
+        // A later segmenter version is published alongside under a `_s{N}` name so
+        // it never overwrites the v1 sibling (ADR 0013/0015).
+        assert_eq!(
+            analysis_file_name("abc123", 4242, 2),
+            "abc123_4242_s2.vanalysis"
+        );
 
         write_analysis(&dir, &name, &analysis).unwrap();
 

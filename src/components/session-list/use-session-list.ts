@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react"
+import { listen } from "@tauri-apps/api/event"
 import { open, save } from "@tauri-apps/plugin-dialog"
 
 import { trackedInvoke } from "@/lib/tauri"
 
+import {
+  remainingByRecording as deriveRemaining,
+  type AnalysisProgress,
+} from "./analysis-progress"
 import { isProcessing } from "./recording-state"
 import type {
   Browsing,
@@ -81,6 +86,18 @@ export function useSessionList(rescanOnMount: boolean) {
   // shared review after its offer was received or dismissed. Null when closed.
   const [browsing, setBrowsing] = useState<Browsing | null>(null)
 
+  // Run an action with the list's uniform error surfacing: clear any prior error,
+  // run the body, and show a failure in the error banner. The handlers that also
+  // toggle a busy flag (scan/refresh/reanalyze-all) keep their own try/finally.
+  const guard = useCallback(async (body: () => Promise<void>) => {
+    setError(null)
+    try {
+      await body()
+    } catch (e) {
+      setError(String(e))
+    }
+  }, [])
+
   const refresh = useCallback(async () => {
     try {
       const [next, state, offers, label, bundles] = await Promise.all([
@@ -104,30 +121,24 @@ export function useSessionList(rescanOnMount: boolean) {
   // Accept an offer: carry the review — timeline, flags, annotations, and the
   // analyzed segments — to the other copy, then refresh (the offer disappears once
   // both sides match). The carried copy is not re-analyzed.
-  async function handleCarry(offer: CarryOffer) {
-    setError(null)
-    try {
+  function handleCarry(offer: CarryOffer) {
+    return guard(async () => {
       await trackedInvoke("carry_review", {
         fromPath: offer.from_path,
         toPath: offer.to_path,
       })
       await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    })
   }
 
   // Dismiss an offer's inline button: persist it (ADR 0011) so the carry stops
   // being offered for this copy, then refresh so the button disappears. Unlike a
   // transient "not now" this holds across restarts.
-  async function handleDismiss(offer: CarryOffer) {
-    setError(null)
-    try {
+  function handleDismiss(offer: CarryOffer) {
+    return guard(async () => {
       await trackedInvoke("dismiss_carry", { toPath: offer.to_path })
       await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    })
   }
 
   // Receive a run of bundles in order (ADR 0012, issue #67), tallying the
@@ -219,28 +230,22 @@ export function useSessionList(rescanOnMount: boolean) {
   // Decline a discovered bundle offer (ADR 0012, issue #67): record it so it
   // stops being offered until the sharer re-shares it, and release the recordings
   // it held back to the analysis queue. Refresh so the offer disappears.
-  async function handleDeclineOffer(offer: BundleOffer) {
-    setError(null)
-    try {
+  function handleDeclineOffer(offer: BundleOffer) {
+    return guard(async () => {
       await trackedInvoke("decline_bundle", { bundlePath: offer.bundle_path })
       await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    })
   }
 
   // Dismiss every discovered offer at once: decline each, then refresh so the
   // combined box disappears.
-  async function handleDeclineAll() {
-    setError(null)
-    try {
+  function handleDeclineAll() {
+    return guard(async () => {
       for (const offer of bundleOffers) {
         await trackedInvoke("decline_bundle", { bundlePath: offer.bundle_path })
       }
       await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    })
   }
 
   // Open the bundle browser for a session day (issue): list every shared review
@@ -301,6 +306,32 @@ export function useSessionList(rescanOnMount: boolean) {
     const interval = setInterval(() => void refresh(), 3000)
     return () => clearInterval(interval)
   }, [stillWorking, refresh])
+
+  // Live analysis-time estimate (issue #81, spec #75 user story #13). The media
+  // worker emits `analysis:progress` as it decodes each recording; we keep the
+  // latest tick per recording and turn it into a remaining-ms estimate the row
+  // renders. One listener for the list's lifetime — a recording's analysis
+  // outlives any single poll. A ready/failed recording drops out of the map on
+  // the next refresh (it is no longer processing), so stale ticks never linger.
+  const [progress, setProgress] = useState<Map<number, AnalysisProgress>>(
+    new Map()
+  )
+  useEffect(() => {
+    const unlisten = listen<AnalysisProgress>("analysis:progress", (e) =>
+      setProgress((prev) => new Map(prev).set(e.payload.recording_id, e.payload))
+    )
+    return () => {
+      void unlisten.then((off) => off())
+    }
+  }, [])
+  // Only recordings still analyzing carry an estimate; keying on ids keeps the
+  // map from growing unbounded across a long session of imports.
+  const analyzing = new Set(
+    sessions.flatMap((s) =>
+      s.recordings.filter((r) => isProcessing(r)).map((r) => r.id)
+    )
+  )
+  const remainingByRecording = deriveRemaining(analyzing, progress)
 
   // Designate (or re-designate) a library of `kind` ("local" | "shared") with the
   // folder where it is mounted here and its declared `mount` locality ("local" |
@@ -363,15 +394,12 @@ export function useSessionList(rescanOnMount: boolean) {
   // Forget an unresolved recording: discard the review state the DB retained for
   // a file that vanished from the library (ADR 0011). Drops it from the amber list
   // and refreshes so any session it emptied disappears too.
-  async function handleForget(path: string) {
-    setError(null)
-    try {
+  function handleForget(path: string) {
+    return guard(async () => {
       await trackedInvoke("delete_recording", { path })
       setUnresolved((prev) => prev.filter((p) => p !== path))
       await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    })
   }
 
   // Re-detect rallies for every recording. Discards every draft timeline,
@@ -397,14 +425,11 @@ export function useSessionList(rescanOnMount: boolean) {
 
   // Per-recording re-analyze: re-run rally detection for one recording in place
   // (discards its draft timeline). Mirrors the player's Re-analyze action.
-  async function handleReanalyze(path: string) {
-    setError(null)
-    try {
+  function handleReanalyze(path: string) {
+    return guard(async () => {
       await trackedInvoke("reanalyze_recording", { path })
       await refresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    })
   }
 
   // Open the share dialog for a session (ADR 0012). `saveAs` picks the fallback
@@ -537,6 +562,7 @@ export function useSessionList(rescanOnMount: boolean) {
     setBrowsing,
     library,
     carryByPath,
+    remainingByRecording,
     handleCarry,
     handleDismiss,
     handleReceiveOffer,

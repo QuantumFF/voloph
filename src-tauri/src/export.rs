@@ -209,22 +209,7 @@ pub fn export(app: &AppHandle, srcs: &[&str], dest: &str, cuts: &[Cut]) -> Resul
         }
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
-    if !status.success() {
-        let stderr = child
-            .stderr
-            .take()
-            .map(|mut s| {
-                let mut buf = String::new();
-                use std::io::Read;
-                let _ = s.read_to_string(&mut buf);
-                buf
-            })
-            .unwrap_or_default();
-        return Err(format!("ffmpeg failed to export: {stderr}"));
-    }
+    crate::media::wait_ffmpeg(&mut child, "ffmpeg failed to export")?;
 
     let _ = app.emit(EVENT_PROGRESS, 1.0);
     Ok(())

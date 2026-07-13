@@ -57,17 +57,22 @@ pub fn recording_annotations(conn: &Connection, path: &str) -> rusqlite::Result<
          WHERE recording_id = ?1 ORDER BY time_ms, id",
     )?;
     let annotations = stmt
-        .query_map([rid], |row| {
-            Ok(Annotation {
-                id: row.get(0)?,
-                time_ms: row.get(1)?,
-                verdict: row.get(2)?,
-                aspect: row.get(3)?,
-                note: row.get(4)?,
-            })
-        })?
+        .query_map([rid], map_annotation)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(annotations)
+}
+
+/// Map an `annotations` row selected as `id, time_ms, verdict, aspect, note` (in that
+/// column order) into an [`Annotation`]. Shared by every query that reads them back so
+/// the column order lives in one place.
+fn map_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
+    Ok(Annotation {
+        id: row.get(0)?,
+        time_ms: row.get(1)?,
+        verdict: row.get(2)?,
+        aspect: row.get(3)?,
+        note: row.get(4)?,
+    })
 }
 
 /// Enrich or re-classify one annotation (issue #9): set its `verdict`, structured
@@ -221,15 +226,7 @@ pub fn filter_moments(
         r.annotations = astmt
             .query_map(
                 rusqlite::params![r.recording_id, r.start_ms, r.end_ms, verdict, aspect],
-                |row| {
-                    Ok(Annotation {
-                        id: row.get(0)?,
-                        time_ms: row.get(1)?,
-                        verdict: row.get(2)?,
-                        aspect: row.get(3)?,
-                        note: row.get(4)?,
-                    })
-                },
+                map_annotation,
             )?
             .collect::<rusqlite::Result<_>>()?;
     }

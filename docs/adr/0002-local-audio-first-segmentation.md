@@ -1,6 +1,8 @@
 # Local, audio-first heuristic segmentation
 
 > **Revised by [ADR 0006](0006-hybrid-audio-visual-motion-segmentation.md):** audio alone proved insufficient for rally boundaries in practice. Visual motion is now the primary boundary signal and audio is confirmation. Everything else below — local, GPU-free, heuristic-not-learned, replaceable behind the timeline, per-region confidence, and the inclusion bias — still holds.
+>
+> **Further revised by [ADR 0015](0015-eval-gated-occupancy-first-segmentation.md):** *GPU-free* relaxes to GPU-optional/CPU-capable and *heuristic-not-learned* may be broken by a small learned detector (eval-gated). Local, replaceable-behind-the-timeline, per-region confidence, and the inclusion bias still hold.
 
 Rally/gap segmentation runs **fully locally** and is driven primarily by **audio** (the rhythm and onset density of shuttle hits vs the quiet of a gap), starting as a **tunable heuristic** rather than a trained model.
 

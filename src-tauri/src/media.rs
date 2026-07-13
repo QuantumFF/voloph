@@ -9,6 +9,7 @@
 //!
 //! ffmpeg/ffprobe are the bundled sidecars from ADR 0004.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -72,41 +73,58 @@ const MOTION_HEIGHT: u32 = 54;
 /// boundary signal for segmentation (ADR 0006) and assumes a roughly static
 /// camera. Returns one value per frame transition (so `frames - 1` values), or an
 /// error if the sidecar cannot run, fails, or the video yields no frames.
-pub fn extract_motion(path: &str) -> Result<Vec<f64>, String> {
+///
+/// `on_progress` is called with the processed footage position in ms as each
+/// frame arrives, so the background-work UI can estimate remaining analysis time
+/// (issue #81) — video decode is the long pole of analysis, so tracking it tracks
+/// the wall clock well. The frames stream from ffmpeg's stdout rather than being
+/// buffered whole, so progress ticks live instead of jumping straight to done.
+pub fn extract_motion(
+    path: &str,
+    mut on_progress: impl FnMut(i64),
+) -> Result<Vec<f64>, String> {
     let vf = format!("fps={MOTION_FPS},scale={MOTION_WIDTH}:{MOTION_HEIGHT},format=gray");
-    let output = Command::new(sidecar_path("ffmpeg"))
+    let mut child = Command::new(sidecar_path("ffmpeg"))
         .args([
             "-v", "error", "-nostats", "-i", path,
             "-an", // drop audio; the motion track is video-only
             "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "-",
         ])
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("ffmpeg could not run: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg failed to extract frames: {stderr}"));
-    }
-
     let frame_size = (MOTION_WIDTH * MOTION_HEIGHT) as usize;
-    if output.stdout.len() < frame_size * 2 {
-        return Err("video yielded too few frames for motion analysis".to_string());
+    let mut energy = Vec::new();
+    // Mean absolute difference between each frame and its predecessor, computed as
+    // frames stream in one at a time so we never hold the whole video in memory.
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut frame = vec![0u8; frame_size];
+        let mut prev: Option<Vec<u8>> = None;
+        let mut frames = 0u64;
+        while stdout.read_exact(&mut frame).is_ok() {
+            if let Some(previous) = &prev {
+                let sum: u64 = frame
+                    .iter()
+                    .zip(previous)
+                    .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs() as u64)
+                    .sum();
+                energy.push(sum as f64 / frame_size as f64);
+            }
+            prev = Some(frame.clone());
+            frames += 1;
+            // Each frame is `1/MOTION_FPS` seconds of footage; report the wall
+            // position reached so the UI can pace its estimate.
+            on_progress(frames as i64 * 1000 / i64::from(MOTION_FPS));
+        }
     }
 
-    // Mean absolute difference between each frame and its predecessor.
-    let mut energy = Vec::with_capacity(output.stdout.len() / frame_size);
-    let mut prev: Option<&[u8]> = None;
-    for frame in output.stdout.chunks_exact(frame_size) {
-        if let Some(previous) = prev {
-            let sum: u64 = frame
-                .iter()
-                .zip(previous)
-                .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs() as u64)
-                .sum();
-            energy.push(sum as f64 / frame_size as f64);
-        }
-        prev = Some(frame);
+    wait_ffmpeg(&mut child, "ffmpeg failed to extract frames")?;
+
+    if energy.is_empty() {
+        return Err("video yielded too few frames for motion analysis".to_string());
     }
     Ok(energy)
 }
@@ -123,6 +141,30 @@ pub(crate) fn sidecar_path(name: &str) -> PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(&file)))
         .unwrap_or_else(|| PathBuf::from(file))
+}
+
+/// Wait for a spawned ffmpeg sidecar `child` and turn a non-zero exit into an error,
+/// draining the child's stderr into the message behind a `context` prefix (e.g.
+/// `"ffmpeg failed to extract frames"`). `Ok(())` on a clean exit. Shared by every
+/// pass that streams from the sidecar — motion, export, detection, and pose — so the
+/// wait/drain shape lives in one place.
+pub(crate) fn wait_ffmpeg(child: &mut std::process::Child, context: &str) -> Result<(), String> {
+    let status = child
+        .wait()
+        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    Err(format!("{context}: {stderr}"))
 }
 
 /// Confirm a recording is readable so the importer can mark it `ready` (libmpv
@@ -151,6 +193,35 @@ pub fn probe(path: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// The recording's total duration in ms, read from its container with the
+/// `ffprobe` sidecar. Used only to pace the analysis-time estimate (issue #81):
+/// the fraction of footage decoded so far vs this total. Returns `None` when
+/// ffprobe cannot run or the container declares no usable duration — the estimate
+/// then simply does not show, which is harmless.
+pub fn probe_duration_ms(path: &str) -> Option<i64> {
+    let output = Command::new(sidecar_path("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let seconds: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    if seconds <= 0.0 {
+        return None;
+    }
+    Some((seconds * 1000.0) as i64)
 }
 
 /// The capture date a recording carries in its container metadata. Both fields

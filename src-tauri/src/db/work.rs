@@ -5,7 +5,9 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::{absolute, active_kind, library_path_of, pending_bundle_paths, stored_key};
+use super::{
+    absolute, active_kind, is_hand_touched, library_path_of, pending_bundle_paths, stored_key,
+};
 
 /// One unit of work for the background media worker, in priority order: probe a
 /// recording for its frame rate (which also marks it playable), then produce its
@@ -182,7 +184,8 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
     )?;
     conn.execute(
         "UPDATE recordings
-         SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL
+         SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
+             segmenter_version = NULL
          WHERE library = ?1 AND path = ?2",
         rusqlite::params![&kind, &key],
     )?;
@@ -202,10 +205,61 @@ pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
         [&kind],
     )?;
     conn.execute(
-        "UPDATE recordings SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL
+        "UPDATE recordings
+         SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
+             segmenter_version = NULL
          WHERE library = ?1",
         [&kind],
     )?;
+    Ok(())
+}
+
+/// Silently re-queue every **untouched** recording whose draft an outranked
+/// segmenter produced, so the background worker re-analyzes it under the active
+/// segmenter (ADR 0013/0015, issue #80). A recording is stale when it is `ready`
+/// with a `segmenter_version` strictly below the active `SEGMENTER_VERSION` (a NULL
+/// stamp is pre-versioning and treated as current — never stale). Reset drops its
+/// rallies and returns it to `unknown`, keeping `probe_state` (the bytes did not
+/// change), so it flows back through segmentation and its new draft replaces the old.
+///
+/// A **hand-touched** recording is never touched and never even asked — corrections
+/// are the most authoritative data in the system; explicit per-recording Re-analyze
+/// stays the one override ([`reset_segmentation`]). Unlike adoption (shared-only,
+/// since no one can reach the local library's bytes), this spans **both** libraries:
+/// an untouched draft is cheap to recompute locally, so a local recording is
+/// re-analyzed on the same terms as a shared one. Runs inside the scan's
+/// transaction, ahead of adoption, so a stale shared recording that has a newer
+/// published Analysis adopts it instead of re-computing (adoption prefers the
+/// highest version); one without falls to the worker. No column change lands inert:
+/// while `SEGMENTER_VERSION` is 1, nothing outranks anything and this is a no-op.
+pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let active = crate::segment::SEGMENTER_VERSION as i64;
+    let stale: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM recordings
+             WHERE segment_state = 'ready'
+               AND segmenter_version IS NOT NULL
+               AND segmenter_version < ?1",
+        )?;
+        let ids = stmt
+            .query_map([active], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids
+    };
+    for id in stale {
+        // Hand-touched drafts carry corrections that no version bump may clobber.
+        if is_hand_touched(tx, id)? {
+            continue;
+        }
+        tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
+        tx.execute(
+            "UPDATE recordings
+             SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
+                 segmenter_version = NULL
+             WHERE id = ?1",
+            [id],
+        )?;
+    }
     Ok(())
 }
 
@@ -249,9 +303,19 @@ pub fn save_rallies(
             ])?;
         }
     }
+    // Stamp the producing segmenter's version onto the draft (ADR 0013/0015) so a
+    // later bump can tell this draft is stale. A fresh machine analysis is always
+    // the active version — re-analyze and silent re-analysis both flow through here.
     tx.execute(
-        "UPDATE recordings SET segment_state = 'ready', duration_ms = ?1, waveform = ?2 WHERE id = ?3",
-        rusqlite::params![duration_ms, waveform_json, recording_id],
+        "UPDATE recordings
+         SET segment_state = 'ready', duration_ms = ?1, waveform = ?2, segmenter_version = ?3
+         WHERE id = ?4",
+        rusqlite::params![
+            duration_ms,
+            waveform_json,
+            crate::segment::SEGMENTER_VERSION,
+            recording_id
+        ],
     )?;
     tx.commit()
 }

@@ -400,7 +400,8 @@ pub fn mpv_load(
     if rc < 0 {
         return Err(format!("mpv loadfile failed: {}", mpv_err(rc)));
     }
-    // loadfile starts paused-less; make the intent explicit.
+    // Force playback on load: set pause explicitly so a prior paused state can't
+    // carry over into the newly loaded file.
     set_property(state.handle, "pause", "no")
 }
 
