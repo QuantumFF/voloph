@@ -343,7 +343,7 @@ pub fn segment_with(
     // 1–3. Per-frame audio energy → per-frame onsets → per-block onset counts.
     let (block_onsets, grid) = onset_block_counts(samples, sample_rate, p);
     let (block_secs, block_ms) = (grid.block_secs, grid.block_ms);
-    let num_blocks = block_onsets.len();
+    let num_blocks = grid.num_blocks; // == block_onsets.len() by construction
 
     // 4–5. Map the motion track onto the same block grid and threshold it: a block
     //    is play when its mean motion clears the threshold (motion is primary).
@@ -406,9 +406,64 @@ pub fn segment_with(
     //    leave the motion-derived confidence intact. (Motion-free audio bleed
     //    never reaches here — with no motion there is no span to modulate.)
     let min_blocks = (p.min_rally_ms / block_ms.max(1)).max(1) as usize;
+    let (rallies, mut verdicts) = spans_to_rallies(
+        &merged,
+        &block_onsets,
+        block_secs,
+        block_ms,
+        min_blocks,
+        total_ms,
+        p,
+    );
+
+    // 8b. Motion-never-fired (ADR 0015 Stage 0): audio-confirmed regions the motion
+    //     gate never opened for. Motion is primary, so these never reach the pass
+    //     above and a rally lost to the motion gate would be invisible — this is the
+    //     symmetric counterpart to `unconfirmed-by-audio`.
+    verdicts.extend(motion_only_verdicts(
+        &block_onsets,
+        &candidate,
+        block_secs,
+        block_ms,
+        min_blocks,
+        bridge_blocks,
+        p,
+    ));
+    verdicts.sort_by_key(|v| v.start_ms);
+
+    // 9. Padding can make neighbours overlap; coalesce them.
+    Segmentation {
+        rallies: merge_overlaps(rallies),
+        verdicts,
+    }
+}
+
+/// Whether a span's shuttle-hit onset density clears the audio confirmation rate
+/// (ADR 0015). A zero-length span never confirms.
+fn audio_confirms(onsets: usize, span_secs: f64, p: &Params) -> bool {
+    span_secs > 0.0 && (onsets as f64 / span_secs) >= p.confirm_onsets_per_sec
+}
+
+/// Turn the merged candidate spans `(start, end, active_blocks)` into padded
+/// [`Rally`] intervals plus their gate verdicts (ADR 0015 Stage 0). Sub-rally-length
+/// spans record `TooShort` and yield no rally. Confidence starts as the share of the
+/// span that was real movement (bridged downtime lowers it → surfaces as an uncertain
+/// region), then audio *modulates* it: too few shuttle-hit onsets cap it at
+/// `unconfirmed_confidence` rather than deleting the rally (issue #79 — no single
+/// signal drops a rally on its own). Each verdict keeps the raw block boundaries;
+/// the rally itself is padded.
+fn spans_to_rallies(
+    merged: &[(usize, usize, usize)],
+    block_onsets: &[usize],
+    block_secs: f64,
+    block_ms: i64,
+    min_blocks: usize,
+    total_ms: i64,
+    p: &Params,
+) -> (Vec<Rally>, Vec<SpanVerdict>) {
     let mut rallies: Vec<Rally> = Vec::new();
     let mut verdicts: Vec<SpanVerdict> = Vec::new();
-    for (start, end, active_blocks) in merged {
+    for &(start, end, active_blocks) in merged {
         let span_blocks = end - start;
         let raw_start = start as i64 * block_ms;
         let raw_end = end as i64 * block_ms;
@@ -422,8 +477,8 @@ pub fn segment_with(
         }
         let onsets: usize = block_onsets[start..end].iter().sum();
         let span_secs = span_blocks as f64 * block_secs;
+        let confirmed = audio_confirms(onsets, span_secs, p);
         let mut confidence = (active_blocks as f64 / span_blocks as f64).clamp(0.0, 1.0);
-        let confirmed = span_secs > 0.0 && (onsets as f64 / span_secs) >= p.confirm_onsets_per_sec;
         if !confirmed {
             confidence = confidence.min(p.unconfirmed_confidence);
         }
@@ -442,17 +497,26 @@ pub fn segment_with(
             confidence,
         });
     }
+    (rallies, verdicts)
+}
 
-    // 8b. Motion-never-fired (ADR 0015 Stage 0): audio-confirmed regions the motion
-    //     gate never opened for. Motion is primary, so these never reach the pass
-    //     above and a rally lost to the motion gate would be invisible — this is the
-    //     symmetric counterpart to `unconfirmed-by-audio`. Group the shuttle-hit blocks
-    //     with the same bridging, then flag only spans that are rally-length,
-    //     audio-confirmed, and carry no motion (a span with motion already spoke
-    //     above). Shorter or unconfirmed audio is not a candidate rally.
+/// Audio-confirmed spans the motion gate never opened for. Group the shuttle-hit
+/// blocks with the same bridging as the main pass, then flag only spans that are
+/// rally-length, audio-confirmed, and carry no motion/occupancy candidate (a span
+/// with either already spoke in [`spans_to_rallies`]). These record a
+/// `MotionNeverFired` verdict but no rally — a diagnostic, not a proposal.
+fn motion_only_verdicts(
+    block_onsets: &[usize],
+    candidate: &[bool],
+    block_secs: f64,
+    block_ms: i64,
+    min_blocks: usize,
+    bridge_blocks: usize,
+    p: &Params,
+) -> Vec<SpanVerdict> {
     let audio_hot: Vec<bool> = block_onsets.iter().map(|&n| n > 0).collect();
-    let audio_spans = bridge_runs(mask_runs(&audio_hot), bridge_blocks);
-    for (start, end) in audio_spans {
+    let mut verdicts = Vec::new();
+    for (start, end) in bridge_runs(mask_runs(&audio_hot), bridge_blocks) {
         let span_blocks = end - start;
         if span_blocks < min_blocks {
             continue;
@@ -462,7 +526,7 @@ pub fn segment_with(
         }
         let onsets: usize = block_onsets[start..end].iter().sum();
         let span_secs = span_blocks as f64 * block_secs;
-        if span_secs > 0.0 && (onsets as f64 / span_secs) < p.confirm_onsets_per_sec {
+        if !audio_confirms(onsets, span_secs, p) {
             continue; // audio itself never confirmed play here
         }
         verdicts.push(SpanVerdict {
@@ -471,13 +535,7 @@ pub fn segment_with(
             verdict: GateVerdict::MotionNeverFired,
         });
     }
-    verdicts.sort_by_key(|v| v.start_ms);
-
-    // 9. Padding can make neighbours overlap; coalesce them.
-    Segmentation {
-        rallies: merge_overlaps(rallies),
-        verdicts,
-    }
+    verdicts
 }
 
 /// The block grid segmentation runs on: audio energy frames group into fixed

@@ -64,6 +64,22 @@ impl Interval {
     }
 }
 
+impl From<&segment::Rally> for Interval {
+    /// A segmenter draft rally collapses to its span; the scorer ignores confidence.
+    fn from(r: &segment::Rally) -> Interval {
+        Interval {
+            start_ms: r.start_ms,
+            end_ms: r.end_ms,
+        }
+    }
+}
+
+/// A recording's duration in ms inferred from its decoded mono PCM sample count,
+/// for the harness paths that have no DB-stored duration to fall back on.
+fn samples_to_ms(len: usize) -> i64 {
+    (len as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64
+}
+
 /// The scored verdict for one recording (or, aggregated, a whole corpus): the three
 /// acceptance-bar numbers plus the counts they are derived from. `boundary_errors_ms`
 /// is carried out so a corpus aggregate can pool every recording's edge errors and
@@ -435,15 +451,8 @@ fn rerun_segmenter(abs_path: &str) -> Result<(Vec<Interval>, i64), String> {
         &motion,
         occupancy.as_ref(),
     );
-    let draft = seg
-        .rallies
-        .into_iter()
-        .map(|r| Interval {
-            start_ms: r.start_ms,
-            end_ms: r.end_ms,
-        })
-        .collect();
-    let duration_ms = (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
+    let draft = seg.rallies.iter().map(Interval::from).collect();
+    let duration_ms = samples_to_ms(samples.len());
     Ok((draft, duration_ms))
 }
 
@@ -506,7 +515,7 @@ fn score_config(tracks: &[CachedTracks], p: &segment::Params) -> (usize, usize, 
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .map(Interval::from)
             .collect();
         let s = score(&draft, &t.gold, t.duration_ms);
         misses += s.misses;
@@ -547,7 +556,7 @@ fn sweep_and_report(recordings: &[CorpusRecording]) {
         let duration_ms = rec
             .duration_ms
             .filter(|&d| d > 0)
-            .unwrap_or((samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64);
+            .unwrap_or(samples_to_ms(samples.len()));
         println!("CACHE {}", rec.rel_path);
         tracks.push(CachedTracks {
             rel_path: rec.rel_path.clone(),
@@ -677,7 +686,7 @@ fn trace_and_report(recordings: &[CorpusRecording]) {
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .map(Interval::from)
             .collect();
         let firing = occupancy.as_ref().map(|o| (segment::occupancy_firing(o, &p), o.fps));
         println!("TRACE {}", rec.rel_path);
@@ -984,17 +993,14 @@ fn fp_trace_and_report(recordings: &[CorpusRecording]) {
             .as_ref()
             .map(|o| (segment::occupancy_firing(o, &p), o.fps));
         let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+            samples_to_ms(samples.len()),
         );
         let spans: Vec<SpanSupport> = seg
             .rallies
             .iter()
             .map(|r| {
                 classify_span(
-                    Interval {
-                        start_ms: r.start_ms,
-                        end_ms: r.end_ms,
-                    },
+                    Interval::from(r),
                     &blocks,
                     &seg.verdicts,
                     firing.as_ref().map(|(f, fps)| (f.as_slice(), *fps)),
@@ -1377,7 +1383,7 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         )
         .map(|t| t.to_occupancy_track());
         let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+            samples_to_ms(samples.len()),
         );
         // The fixed missed-window list every rule is probed on: what the shipped
         // draft misses at the defaults on the app's own 3 fps tracks.
@@ -1385,7 +1391,7 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .map(Interval::from)
             .collect();
         let missed: Vec<Interval> = rec
             .gold
@@ -1589,7 +1595,7 @@ fn edges_and_report(recordings: &[CorpusRecording]) {
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .map(Interval::from)
             .collect();
         let before = split.occupancy_gold_edges.len();
         split_boundary_errors(&draft, &rec.gold, &blocks, &mut split);
@@ -1855,7 +1861,7 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .map(Interval::from)
             .collect();
         let missed: Vec<Interval> = rec
             .gold
@@ -2479,10 +2485,10 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .map(Interval::from)
             .collect();
         let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+            samples_to_ms(samples.len()),
         );
         let onsets = segment::onset_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &p);
         let views = occupancy.as_ref().map(|occ| span_track_views(occ, &p));
@@ -2954,10 +2960,10 @@ fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Pat
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|r| Interval { start_ms: r.start_ms, end_ms: r.end_ms })
+            .map(Interval::from)
             .collect();
         let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64,
+            samples_to_ms(samples.len()),
         );
         let onsets = segment::onset_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &p);
         let (out_windows, _skipped) = matched_out_windows(&rec.gold, duration_ms);

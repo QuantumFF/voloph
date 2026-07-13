@@ -203,7 +203,9 @@ impl Detector {
         let side = MODEL_SIZE as usize;
         debug_assert_eq!(bgr.len(), side * side * 3);
         // HWC bytes → CHW f32, no normalization (YOLOX consumes raw 0–255). Channel
-        // order stays BGR, as the model was exported to expect.
+        // order stays BGR, as the model was exported to expect. `chw` is three
+        // contiguous `side*side` planes (B, then G, then R); pixel (x, y) of channel
+        // c lands at `c * plane + y * side + x`.
         let mut chw = vec![0f32; 3 * side * side];
         let plane = side * side;
         for y in 0..side {
@@ -556,12 +558,7 @@ pub fn extract_detections_at(
         let mut frame = vec![0u8; frame_size];
         let mut frames = 0u64;
         while stdout.read_exact(&mut frame).is_ok() {
-            let pixel_boxes = detector.infer(&frame, score_floor)?;
-            let boxes = pixel_boxes
-                .iter()
-                .filter_map(|b| letterbox.to_source_norm(b))
-                .collect();
-            samples.push(boxes);
+            samples.push(detector.boxes_in_frame(&frame, score_floor, &letterbox)?);
             frames += 1;
             on_progress(frames as i64 * 1000 / i64::from(fps));
         }
