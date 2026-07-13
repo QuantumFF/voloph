@@ -44,7 +44,7 @@ pub struct Session {
 }
 
 /// Summary of a scan pass.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct ScanResult {
     pub registered: usize,
     pub skipped: usize,
@@ -164,12 +164,8 @@ pub fn scan_library(conn: &mut Connection) -> rusqlite::Result<ScanResult> {
 
     let kind = active_kind(conn)?;
     let Some(library) = library_path_of(conn, &kind)? else {
-        return Ok(ScanResult {
-            registered: 0,
-            skipped: 0,
-            relocated: 0,
-            unresolved: Vec::new(),
-        });
+        // No active library configured — nothing to scan.
+        return Ok(ScanResult::default());
     };
     let folder = Path::new(&library);
 

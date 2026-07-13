@@ -344,33 +344,7 @@ fn build_pose_input(frame: &[u8], src_w: usize, src_h: usize, crop: &CropRect) -
 /// Resolve the vendored RTMPose-t model, probing the same dev/release layouts as the
 /// detector ([`crate::detect::vendored_model_path`]).
 pub fn vendored_pose_model_path() -> Result<PathBuf, String> {
-    const MODEL_FILE: &str = "rtmpose_t.onnx";
-    let mut tried: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-    {
-        tried.push(dir.join("resources").join("models").join(MODEL_FILE));
-        tried.push(dir.join("models").join(MODEL_FILE));
-    }
-    tried.push(PathBuf::from("models").join(MODEL_FILE));
-    tried.push(PathBuf::from("src-tauri").join("models").join(MODEL_FILE));
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        tried.push(PathBuf::from(manifest).join("models").join(MODEL_FILE));
-    }
-    for p in &tried {
-        if p.exists() {
-            return Ok(p.clone());
-        }
-    }
-    Err(format!(
-        "vendored pose model not found; looked in: {}",
-        tried
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
+    detect::vendored_model_file("rtmpose_t.onnx", "pose")
 }
 
 /// Probe the pose pass's *decoded* source frame size — width/height parsed
@@ -497,19 +471,7 @@ pub fn extract_pose_window(
         }
     }
 
-    let status = child.wait().map_err(|e| format!("ffmpeg wait failed: {e}"))?;
-    if !status.success() {
-        let stderr = child
-            .stderr
-            .take()
-            .map(|mut s| {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            })
-            .unwrap_or_default();
-        return Err(format!("ffmpeg failed to extract window: {stderr}"));
-    }
+    crate::media::wait_ffmpeg(&mut child, "ffmpeg failed to extract window")?;
     if frames.is_empty() {
         return Err("window yielded no frames".to_string());
     }

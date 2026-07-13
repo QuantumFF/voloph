@@ -151,8 +151,7 @@ fn run_staged_analysis(app: &AppHandle, conn: &Mutex<Connection>, staging_dir: &
         return;
     }
     let mut cache = staging::StagingCache::new(staging_dir.to_path_buf(), staging::budget_bytes());
-    for i in 0..pending.len() {
-        let item = &pending[i];
+    for (i, item) in pending.iter().enumerate() {
         // A re-analyze or fresh scan can flip the active library mid-batch; bail so
         // the outer loop re-decides. (The cache drops here, evicting any prefetch.)
         if !is_network_mount(conn) {

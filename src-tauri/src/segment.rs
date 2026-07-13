@@ -164,6 +164,12 @@ impl DetBox {
     fn cy(&self) -> f64 {
         self.y + self.h / 2.0
     }
+
+    /// Box center in source-normalized coordinates — the point the occupancy
+    /// clustering and movement checks track (see [`cy`](Self::cy) on the depth caveat).
+    fn center(&self) -> (f64, f64) {
+        (self.x + self.w / 2.0, self.cy())
+    }
 }
 
 /// The per-recording **occupancy track**: the person boxes at each sampled frame,
@@ -838,7 +844,7 @@ fn filtered_samples(occ: &OccupancyTrack, p: &Params) -> Vec<FilteredSample> {
     //    player's small frame-to-frame wiggle is not mistaken for a still fixture.
     let static_positions = static_furniture_positions(occ, p.occupancy_static_frac);
     let is_furniture = |b: &DetBox| {
-        let (cx, cy) = (b.x + b.w / 2.0, b.cy());
+        let (cx, cy) = b.center();
         static_positions
             .iter()
             .any(|&(sx, sy)| (cx - sx).abs() <= p.occupancy_static_frac && (cy - sy).abs() <= p.occupancy_static_frac)
@@ -877,7 +883,7 @@ fn filtered_samples(occ: &OccupancyTrack, p: &Params) -> Vec<FilteredSample> {
                 .iter()
                 .filter(|b| !is_furniture(b) && b.area() <= area_cap)
                 .collect();
-            let centers: Vec<(f64, f64)> = live.iter().map(|b| (b.x + b.w / 2.0, b.cy())).collect();
+            let centers: Vec<(f64, f64)> = live.iter().map(|b| b.center()).collect();
             let min_area = live.iter().map(|b| b.area()).fold(f64::INFINITY, f64::min);
             let max_area = live.iter().map(|b| b.area()).fold(0.0, f64::max);
             let size_structure =
@@ -907,7 +913,8 @@ fn static_furniture_positions(occ: &OccupancyTrack, frac: f64) -> Vec<(f64, f64)
     // A player's between-sample step is far larger than furniture's jitter; link
     // within this radius so one player is one cluster, then judge staticness by span.
     const LINK_RADIUS: f64 = 0.2;
-    // Per cluster: (count, seed_cx, seed_cy, min_cx, max_cx, min_cy, max_cy).
+    // Per cluster: a count, its running centroid (cx, cy), and the bounding box of
+    // every center linked into it (min/max on each axis) used to judge staticness.
     struct Cluster {
         count: usize,
         cx: f64,
@@ -920,7 +927,7 @@ fn static_furniture_positions(occ: &OccupancyTrack, frac: f64) -> Vec<(f64, f64)
     let mut clusters: Vec<Cluster> = Vec::new();
     for s in &occ.samples {
         for b in s {
-            let (cx, cy) = (b.x + b.w / 2.0, b.cy());
+            let (cx, cy) = b.center();
             let hit = clusters
                 .iter_mut()
                 .find(|c| (cx - c.cx).abs() <= LINK_RADIUS && (cy - c.cy).abs() <= LINK_RADIUS);
@@ -964,13 +971,16 @@ fn centers_moved(prev: &[(f64, f64)], cur: &[(f64, f64)], frac: f64) -> bool {
     if prev.is_empty() || cur.is_empty() {
         return false;
     }
-    cur.iter().any(|&(cx, cy)| {
-        let nearest = prev
-            .iter()
-            .map(|&(px, py)| ((cx - px).powi(2) + (cy - py).powi(2)).sqrt())
-            .fold(f64::INFINITY, f64::min);
-        nearest > frac
-    })
+    cur.iter().any(|&c| nearest_prev_dist(c, prev) > frac)
+}
+
+/// Distance from `c` to its nearest center in `prev` — the nearest-match step both
+/// [`centers_moved`] and [`max_center_step`] read. `∞` when `prev` is empty (callers
+/// guard that case first).
+fn nearest_prev_dist((cx, cy): (f64, f64), prev: &[(f64, f64)]) -> f64 {
+    prev.iter()
+        .map(|&(px, py)| ((cx - px).powi(2) + (cy - py).powi(2)).sqrt())
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// The largest nearest-match center step from `prev` to `cur` — the magnitude
@@ -982,11 +992,7 @@ fn max_center_step(prev: &[(f64, f64)], cur: &[(f64, f64)]) -> Option<f64> {
         return None;
     }
     cur.iter()
-        .map(|&(cx, cy)| {
-            prev.iter()
-                .map(|&(px, py)| ((cx - px).powi(2) + (cy - py).powi(2)).sqrt())
-                .fold(f64::INFINITY, f64::min)
-        })
+        .map(|&c| nearest_prev_dist(c, prev))
         .fold(None, |m: Option<f64>, d| Some(m.map_or(d, |m| m.max(d))))
 }
 

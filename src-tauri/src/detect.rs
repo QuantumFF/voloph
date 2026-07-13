@@ -395,10 +395,12 @@ impl Letterbox {
     /// the box collapses to zero area after clamping.
     fn to_source_norm(self, b: &PixelBox) -> Option<Box> {
         // Undo pad + scale to get source pixels, then normalize by source size.
-        let sx1 = ((b.x1 - self.pad_x) / self.scale / self.src_w).clamp(0.0, 1.0);
-        let sy1 = ((b.y1 - self.pad_y) / self.scale / self.src_h).clamp(0.0, 1.0);
-        let sx2 = ((b.x2 - self.pad_x) / self.scale / self.src_w).clamp(0.0, 1.0);
-        let sy2 = ((b.y2 - self.pad_y) / self.scale / self.src_h).clamp(0.0, 1.0);
+        let (px1, py1) = self.model_px_to_source(b.x1, b.y1);
+        let (px2, py2) = self.model_px_to_source(b.x2, b.y2);
+        let sx1 = (px1 / self.src_w).clamp(0.0, 1.0);
+        let sy1 = (py1 / self.src_h).clamp(0.0, 1.0);
+        let sx2 = (px2 / self.src_w).clamp(0.0, 1.0);
+        let sy2 = (py2 / self.src_h).clamp(0.0, 1.0);
         let w = sx2 - sx1;
         let h = sy2 - sy1;
         if w <= 0.0 || h <= 0.0 {
@@ -414,28 +416,34 @@ impl Letterbox {
     }
 }
 
-/// Resolve the vendored YOLOX-Nano model. Tauri copies `bundle.resources` into a
+/// Resolve the vendored YOLOX-Nano detector model. See [`vendored_model_file`].
+pub fn vendored_model_path() -> Result<PathBuf, String> {
+    vendored_model_file("yolox_nano.onnx", "detector")
+}
+
+/// Resolve a vendored ONNX model file by name. Tauri copies `bundle.resources` into a
 /// `resources/` folder beside the app executable in a release build, and the same
 /// layout is used in `tauri dev`; the dev CLIs run from `target/<profile>/` where the
 /// model is likewise expected at `resources/models/…` or `models/…`. We probe the
 /// candidate layouts in order and return the first that exists, so both dev and release
-/// resolve without a code change. Errors listing the tried paths when none is found.
-pub fn vendored_model_path() -> Result<PathBuf, String> {
-    const MODEL_FILE: &str = "yolox_nano.onnx";
+/// resolve without a code change. `label` names the model in the not-found error, which
+/// lists every tried path. Shared by the detector and the pose pass
+/// ([`crate::pose::vendored_pose_model_path`]).
+pub(crate) fn vendored_model_file(model_file: &str, label: &str) -> Result<PathBuf, String> {
     let mut tried: Vec<PathBuf> = Vec::new();
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()));
     if let Some(dir) = &exe_dir {
         // Release/dev bundle layout: resources next to the executable.
-        tried.push(dir.join("resources").join("models").join(MODEL_FILE));
-        tried.push(dir.join("models").join(MODEL_FILE));
+        tried.push(dir.join("resources").join("models").join(model_file));
+        tried.push(dir.join("models").join(model_file));
     }
     // Source-tree layout: running the dev CLI from the crate root / target dir.
-    tried.push(PathBuf::from("models").join(MODEL_FILE));
-    tried.push(PathBuf::from("src-tauri").join("models").join(MODEL_FILE));
+    tried.push(PathBuf::from("models").join(model_file));
+    tried.push(PathBuf::from("src-tauri").join("models").join(model_file));
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        tried.push(PathBuf::from(manifest).join("models").join(MODEL_FILE));
+        tried.push(PathBuf::from(manifest).join("models").join(model_file));
     }
     for p in &tried {
         if p.exists() {
@@ -443,7 +451,7 @@ pub fn vendored_model_path() -> Result<PathBuf, String> {
         }
     }
     Err(format!(
-        "vendored detector model not found; looked in: {}",
+        "vendored {label} model not found; looked in: {}",
         tried
             .iter()
             .map(|p| p.display().to_string())
@@ -559,19 +567,7 @@ pub fn extract_detections_at(
         }
     }
 
-    let status = child.wait().map_err(|e| format!("ffmpeg wait failed: {e}"))?;
-    if !status.success() {
-        let stderr = child
-            .stderr
-            .take()
-            .map(|mut s| {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            })
-            .unwrap_or_default();
-        return Err(format!("ffmpeg failed to extract frames: {stderr}"));
-    }
+    crate::media::wait_ffmpeg(&mut child, "ffmpeg failed to extract frames")?;
     if samples.is_empty() {
         return Err("video yielded too few frames for detection".to_string());
     }

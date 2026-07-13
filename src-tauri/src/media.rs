@@ -121,21 +121,7 @@ pub fn extract_motion(
         }
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
-    if !status.success() {
-        let stderr = child
-            .stderr
-            .take()
-            .map(|mut s| {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            })
-            .unwrap_or_default();
-        return Err(format!("ffmpeg failed to extract frames: {stderr}"));
-    }
+    wait_ffmpeg(&mut child, "ffmpeg failed to extract frames")?;
 
     if energy.is_empty() {
         return Err("video yielded too few frames for motion analysis".to_string());
@@ -155,6 +141,30 @@ pub(crate) fn sidecar_path(name: &str) -> PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(&file)))
         .unwrap_or_else(|| PathBuf::from(file))
+}
+
+/// Wait for a spawned ffmpeg sidecar `child` and turn a non-zero exit into an error,
+/// draining the child's stderr into the message behind a `context` prefix (e.g.
+/// `"ffmpeg failed to extract frames"`). `Ok(())` on a clean exit. Shared by every
+/// pass that streams from the sidecar — motion, export, detection, and pose — so the
+/// wait/drain shape lives in one place.
+pub(crate) fn wait_ffmpeg(child: &mut std::process::Child, context: &str) -> Result<(), String> {
+    let status = child
+        .wait()
+        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+    Err(format!("{context}: {stderr}"))
 }
 
 /// Confirm a recording is readable so the importer can mark it `ready` (libmpv
