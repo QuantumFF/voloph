@@ -7,6 +7,9 @@ import { ThemeProvider } from "@/components/theme-provider.tsx"
 import { ExportProvider } from "@/components/use-export.ts"
 import { ExternalLinkGuard } from "./components/external-link-guard.tsx"
 import { DebugPanel } from "./components/debug-panel.tsx"
+import { drainPerformanceBuffer } from "./lib/dev-performance-buffer.ts"
+
+if (import.meta.env.DEV) drainPerformanceBuffer()
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
