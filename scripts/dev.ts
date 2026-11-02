@@ -91,15 +91,12 @@ const sidecars = ["ffmpeg", "ffprobe"].map(
   (n) => `src-tauri/binaries/${n}-${triple}${ext}`
 )
 const missing = sidecars.filter((f) => !existsSync(path.join(root, f)))
+const main = sh(["git", "worktree", "list", "--porcelain"]).match(
+  /^worktree (.+)$/m
+)?.[1]
+const inWorktree = main !== undefined && main !== root
 if (missing.length) {
-  const main = sh(["git", "worktree", "list", "--porcelain"]).match(
-    /^worktree (.+)$/m
-  )?.[1]
-  if (
-    main &&
-    main !== root &&
-    missing.every((f) => existsSync(path.join(main, f)))
-  ) {
+  if (inWorktree && missing.every((f) => existsSync(path.join(main, f)))) {
     for (const f of missing) {
       copyFileSync(path.join(main, f), path.join(root, f))
       chmodSync(path.join(root, f), 0o755)
@@ -145,6 +142,13 @@ const override = {
 }
 
 env.VOLOPH_DEV_PORT = String(port)
+// Share the main checkout's Rust build dir so a new worktree reuses its
+// ~500 compiled dependencies instead of building from scratch; only the app
+// crate itself rebuilds when switching worktrees. Cargo releases its build lock
+// before the app starts, so concurrent worktree runs only queue on compiling.
+if (inWorktree && !process.env.CARGO_TARGET_DIR) {
+  env.CARGO_TARGET_DIR = path.join(main, "src-tauri/target")
+}
 if (isolated) {
   env.XDG_DATA_HOME = path.join(root, ".dev-data")
   mkdirSync(env.XDG_DATA_HOME, { recursive: true })
