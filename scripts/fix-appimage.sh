@@ -35,6 +35,12 @@ rm -f  "$lib"/libpipewire-0.3.so* \
 rm -rf "$lib"/pipewire-0.3 "$lib"/spa-0.2
 log "stripped bundled pipewire/pulse/jack from AppDir"
 
+# The extracted AppDir keeps restrictive modes (0700 dirs, 0770 AppRun.wrapped),
+# which appimagetool now rejects: other users running the AppImage would get
+# "Permission denied". Make everything world-readable and dirs/executables
+# world-executable, as appimagetool recommends.
+chmod -R a+rX "$work/squashfs-root"
+
 curl -fsSL -o "$work/appimagetool" \
   "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
 chmod +x "$work/appimagetool"
