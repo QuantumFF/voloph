@@ -1,5 +1,5 @@
 //! The metadata database: the schema layered over the recordings and every
-//! query the app runs against it. Split by domain concern (CONTEXT.md); the
+//! query the app runs against it. Split by domain concern (GLOSSARY.md); the
 //! submodules re-export flat, so callers keep referring to `db::x`.
 
 mod analysis;

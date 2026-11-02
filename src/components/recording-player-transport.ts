@@ -117,7 +117,7 @@ export interface PlaylistRecording {
 }
 
 /**
- * The three verdicts an annotation can carry (CONTEXT.md): the one-keystroke
+ * The three verdicts an annotation can carry (GLOSSARY.md): the one-keystroke
  * classification captured in the moment. `mistake` is an outright, point-ending
  * unforced error; `bad` is suboptimal but not point-ending; `good` is well done.
  */
@@ -125,7 +125,7 @@ export const VERDICTS = ["good", "bad", "mistake"] as const
 export type Verdict = (typeof VERDICTS)[number]
 
 /**
- * The seeded aspect vocabulary (CONTEXT.md, issue #9): the dimension a verdict
+ * The seeded aspect vocabulary (GLOSSARY.md, issue #9): the dimension a verdict
  * judges, a structured filterable field. This slice exposes the seeded list only;
  * adding custom aspects from settings is deferred. Stored as free text in the DB
  * (a user-editable vocabulary, not a fixed enum), so an annotation may carry an
@@ -209,7 +209,7 @@ export interface FilteredRally {
   rally_id: number
   start_ms: number
   end_ms: number
-  /** Derived from duration (CONTEXT.md), never from quality. */
+  /** Derived from duration (GLOSSARY.md), never from quality. */
   long: boolean
   flagged: boolean
   annotations: Annotation[]

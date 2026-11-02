@@ -186,14 +186,14 @@ src-tauri/                    Backend (Rust / Tauri)
 docs/
   adr/                        Architecture Decision Records
   tuning-segmentation.md      Human-in-the-loop segmenter tuning guide
-CONTEXT.md                    Domain model and shared vocabulary
+GLOSSARY.md                   Domain model and shared vocabulary
 ```
 
 ---
 
 ## Documentation
 
-- **[CONTEXT.md](CONTEXT.md)** — the domain model and the precise language the
+- **[GLOSSARY.md](GLOSSARY.md)** — the domain model and the precise language the
   project uses (session, recording, rally, gap, timeline, annotation, verdict,
   aspect, flag, export). Read this first to understand how the app thinks.
 - **[docs/adr/](docs/adr/)** — Architecture Decision Records capturing the key

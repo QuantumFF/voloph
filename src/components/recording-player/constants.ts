@@ -12,7 +12,7 @@ export const SESSION_PX_PER_SEC_MAX = 240
 export const SESSION_ZOOM_FACTOR = 1.5
 
 /**
- * Rally length threshold (CONTEXT.md: every rally is classified long or short
+ * Rally length threshold (GLOSSARY.md: every rally is classified long or short
  * by duration, objectively and automatically). UI-only until length filtering
  * lands; 15s reads as a sustained exchange.
  */

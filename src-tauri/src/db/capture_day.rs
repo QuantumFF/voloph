@@ -1,4 +1,4 @@
-//! Deriving a recording's session day (CONTEXT.md: the embedded capture date,
+//! Deriving a recording's session day (GLOSSARY.md: the embedded capture date,
 //! falling back to mtime) and re-homing a recording once the embedded date is
 //! read (ADR 0007).
 

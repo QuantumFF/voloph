@@ -6,7 +6,7 @@ use Opus for general-purpose agents
 
 ### Issue tracker
 
-Issues and PRDs are tracked as GitHub issues in `QuantumFF/voloph` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues and specs are tracked as GitHub issues in `QuantumFF/voloph` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
@@ -14,4 +14,4 @@ Five canonical triage roles, each mapped to a label string of the same name. See
 
 ### Domain docs
 
-Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context: one `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.

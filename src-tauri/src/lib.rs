@@ -296,7 +296,7 @@ async fn resolve_bundle_conflict(
 /// The aspect vocabulary present in the active library's annotations (issue #66),
 /// so the moment browser's aspect filter can offer aspects a received bundle
 /// imported alongside its seeded list. A user-editable vocabulary, not a fixed
-/// enum (CONTEXT.md).
+/// enum (GLOSSARY.md).
 #[tauri::command]
 async fn aspect_vocabulary(db: State<'_, Db>) -> Result<Vec<String>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;

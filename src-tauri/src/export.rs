@@ -1,4 +1,4 @@
-//! Export engine: render one new MP4 from a **selection of rallies** (CONTEXT.md,
+//! Export engine: render one new MP4 from a **selection of rallies** (GLOSSARY.md,
 //! issue #12). Given one or more source recordings and a set of rally intervals
 //! (each naming its source), cut those rallies out and concatenate them in order
 //! into a single clean file — no burned-in overlays, sources never touched

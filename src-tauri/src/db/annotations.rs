@@ -1,4 +1,4 @@
-//! Verdict annotations pinned to a moment (CONTEXT.md), and the cross-session
+//! Verdict annotations pinned to a moment (GLOSSARY.md), and the cross-session
 //! moment filter that is the payoff of the structured data (issue #11).
 
 use rusqlite::Connection;
@@ -112,7 +112,7 @@ pub fn delete_annotation(conn: &Connection, path: &str, id: i64) -> rusqlite::Re
     Ok(changed > 0)
 }
 
-/// Rally-length threshold in ms (CONTEXT.md: every rally is classified long or
+/// Rally-length threshold in ms (GLOSSARY.md: every rally is classified long or
 /// short by its duration against a threshold, objectively — never from quality).
 /// Mirrors `LONG_RALLY_MS` in the player frontend; kept here so the cross-session
 /// filter derives length in SQL without a round-trip.
@@ -234,7 +234,7 @@ pub fn filter_moments(
 }
 
 /// Distinct aspects present on annotations in the active library — the aspect
-/// vocabulary as it actually exists in the data (CONTEXT.md: a user-editable
+/// vocabulary as it actually exists in the data (GLOSSARY.md: a user-editable
 /// vocabulary, not a fixed enum). The frontend unions this with its seeded list
 /// so aspects a received bundle imported (ADR 0012) — which may lie outside the
 /// seeds — still appear as filter options. Sorted for a stable order.

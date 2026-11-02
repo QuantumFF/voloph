@@ -1,6 +1,6 @@
 //! The draft timeline (ADR 0002): reading a recording's rallies for the player
 //! and the five inline corrections (adjust, split, merge, add, delete) plus the
-//! rally flag. Rallies are the atomic unit of review (CONTEXT.md).
+//! rally flag. Rallies are the atomic unit of review (GLOSSARY.md).
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
