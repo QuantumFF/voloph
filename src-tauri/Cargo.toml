@@ -4,9 +4,10 @@ version = "0.1.0"
 description = "Frictionless review of badminton games you recorded yourself."
 authors = ["QuantumFF"]
 edition = "2021"
-# The crate ships two binaries — the Tauri app and the `eval-harness` dev CLI
-# (ADR 0015). `tauri dev`/`cargo run` would be ambiguous without naming the app
-# as the default; `cargo run --bin eval-harness` still reaches the harness.
+# The crate holds the Tauri app plus two dev CLIs (`eval-harness`, `detect-dump`;
+# ADR 0015). `tauri dev`/`cargo run` would be ambiguous without naming the app
+# as the default; `cargo run --features dev-tools --bin eval-harness` still
+# reaches the harness.
 default-run = "tauri-native"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -23,6 +24,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [[bin]]
 name = "eval-harness"
 path = "src/bin/eval-harness.rs"
+required-features = ["dev-tools"]
 
 # The detection dump (ADR 0015 Stage 2, issue #83): a dev CLI that runs the occupancy
 # detector on one recording and prints its per-sample box track. Reuses the app's DB,
@@ -30,6 +32,13 @@ path = "src/bin/eval-harness.rs"
 [[bin]]
 name = "detect-dump"
 path = "src/bin/detect-dump.rs"
+required-features = ["dev-tools"]
+
+# Gates the dev CLIs above. Tauri bundles every built binary into the installers,
+# so without the gate a release ships both dev tools (~47 MB) and links each with
+# full LTO. Run them with `--features dev-tools`.
+[features]
+dev-tools = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

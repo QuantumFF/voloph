@@ -55,8 +55,8 @@ The harness is a second binary in the `src-tauri` crate. From the repo root:
 
 ```bash
 cd src-tauri
-cargo run --bin eval-harness            # score the whole active library
-cargo run --bin eval-harness -- gold.mp4   # score only recordings whose path contains "gold.mp4"
+cargo run --features dev-tools --bin eval-harness               # score the whole active library
+cargo run --features dev-tools --bin eval-harness -- gold.mp4   # score only recordings whose path contains "gold.mp4"
 ```
 
 With no arguments it reads the app's own database and scores every recording in
@@ -122,7 +122,7 @@ median boundary error : 0.42 s
 The harness re-runs the segmenter from source, so it measures whatever the code
 currently does — that is the point. To evaluate a change:
 
-1. Establish the baseline: `cargo run --bin eval-harness` on the gold corpus,
+1. Establish the baseline: `cargo run --features dev-tools --bin eval-harness` on the gold corpus,
    note the three numbers.
 2. Change the segmenter — a threshold in `Default for Params`, or the algorithm
    itself (`src-tauri/src/segment.rs`).
