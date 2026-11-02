@@ -17,23 +17,27 @@
 //! open the DB, gather the gold corpus, re-run the segmenter, feed the pure core,
 //! print. Re-running as new footage arrives is a single command.
 //!
-//! **Gold vs. machine draft are separable artifacts** (ADR 0015). Gold is the
-//! recording's *current* DB timeline, kept only when it shows hand-correction — the
-//! confidence sentinel [`crate::db::CORRECTED_CONFIDENCE`] an inline edit stamps on a
-//! rally. A recording with no such rally is **skipped and reported**, never scored
-//! against unverified gold. The machine draft is produced fresh by re-running the
-//! segmenter here, so rebuilding with a changed segmenter and re-running the harness
-//! re-measures it — the eval gate of Stages 1–2. (Reading the machine draft from the
-//! published Analysis instead would only ever measure the version frozen there before
-//! the human corrected it; a gold recording's Analysis never regenerates.)
+//! **Gold vs. machine draft are separable artifacts** (ADR 0015). Gold is a **gold
+//! file** ([`gold`]) — a recording's timeline exported with `--export-gold` once a
+//! human has verified the whole recording, matched back to the recording by content
+//! identity (size + quick hash), never by path. A recording with no gold file is
+//! **skipped and reported**, never scored. (Gold used to be the live DB timeline
+//! flagged by the confidence sentinel, but machine drafts hit that sentinel too and
+//! the DB proved disposable — see [`gold`].) The machine draft is produced fresh by
+//! re-running the segmenter here, so rebuilding with a changed segmenter and
+//! re-running the harness re-measures it — the eval gate of Stages 1–2. (Reading the
+//! machine draft from the published Analysis instead would only ever measure the
+//! version frozen there before the human corrected it.)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use crate::db::{self, CORRECTED_CONFIDENCE};
+use crate::db;
 use crate::media;
 use crate::segment;
+
+pub mod gold;
 
 // ── Pure scoring core ────────────────────────────────────────────────────────
 //
@@ -220,10 +224,11 @@ struct CorpusRecording {
     rel_path: String,
     duration_ms: Option<i64>,
     segment_state: String,
+    /// The verified timeline from this recording's gold file (empty when it has none).
     gold: Vec<Interval>,
-    /// Whether the timeline shows hand-correction — the confidence sentinel on at
-    /// least one rally. Only these are scored; the rest are reported as skipped.
-    hand_corrected: bool,
+    /// Whether a gold file matched this recording. Only these are scored; the rest
+    /// are reported as skipped.
+    has_gold: bool,
 }
 
 /// Run the eval harness. `args` is the process arguments **after** the program name.
@@ -257,6 +262,14 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
+    if let Some(out) = &opts.dump_draft {
+        let root = opts
+            .root
+            .as_deref()
+            .ok_or("--dump-draft needs --root DIR (the videos to segment)")?;
+        return dump_drafts(Path::new(root), Path::new(out), opts.filter.as_deref());
+    }
+
     let db_path = match opts.db {
         Some(p) => PathBuf::from(p),
         None => default_db_path()?,
@@ -283,7 +296,18 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             )
         })?;
 
-    let mut recordings = gather_corpus(&conn, &kind, &library).map_err(|e| e.to_string())?;
+    let gold_dir = opts
+        .gold
+        .map(PathBuf::from)
+        .unwrap_or_else(default_gold_dir);
+    if opts.export_gold {
+        let filter = opts.filter.as_deref().ok_or(
+            "--export-gold needs a RECORDING filter (exports are per recording, on purpose)",
+        )?;
+        return export_gold(&conn, &kind, filter, &gold_dir);
+    }
+
+    let mut recordings = gather_corpus(&conn, &kind, &library, &gold_dir)?;
     if let Some(filter) = &opts.filter {
         recordings.retain(|r| r.abs_path.contains(filter) || r.rel_path.contains(filter));
         if recordings.is_empty() {
@@ -294,9 +318,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     }
 
     println!(
-        "eval harness — segmenter v{} against '{kind}' library ({})\n",
+        "eval harness — segmenter v{} against '{kind}' library ({})\ngold: {}\n",
         segment::SEGMENTER_VERSION,
-        library
+        library,
+        gold_dir.display()
     );
     if opts.sweep {
         sweep_and_report(&recordings);
@@ -326,57 +351,191 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Read every recording in the `kind` library, resolve its absolute path, and load
-/// its gold timeline (the current DB rallies) together with whether that timeline
-/// shows hand-correction (the confidence sentinel).
+/// Read every recording in the `kind` library, resolve its absolute path, and attach
+/// its gold timeline from the matching gold file in `gold_dir` (matched by file size
+/// + quick hash). The DB's own rallies are never read as gold.
 fn gather_corpus(
     conn: &Connection,
     kind: &str,
     library: &str,
-) -> rusqlite::Result<Vec<CorpusRecording>> {
-    let rows: Vec<(i64, String, Option<i64>, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, path, duration_ms, segment_state FROM recordings
-             WHERE library = ?1 ORDER BY path",
-        )?;
-        let rows = stmt
-            .query_map([kind], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-
-    let mut out = Vec::with_capacity(rows.len());
-    for (id, rel_path, duration_ms, segment_state) in rows {
-        let mut stmt = conn.prepare(
-            "SELECT start_ms, end_ms, confidence FROM rallies
-             WHERE recording_id = ?1 ORDER BY start_ms",
-        )?;
-        let mut gold = Vec::new();
-        let mut hand_corrected = false;
-        let mapped = stmt.query_map([id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, f64>(2)?,
-            ))
-        })?;
-        for row in mapped {
-            let (start_ms, end_ms, confidence) = row?;
-            if confidence >= CORRECTED_CONFIDENCE {
-                hand_corrected = true;
+    gold_dir: &Path,
+) -> Result<Vec<CorpusRecording>, String> {
+    let gold_files = gold::load_dir(gold_dir)?;
+    let rows = library_recordings(conn, kind).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let gold = gold_files.get(&(r.file_size, r.quick_hash.clone()));
+            CorpusRecording {
+                abs_path: db::absolute(library, &r.rel_path),
+                rel_path: r.rel_path,
+                duration_ms: r.duration_ms,
+                segment_state: r.segment_state,
+                gold: gold.map(gold::GoldFile::intervals).unwrap_or_default(),
+                has_gold: gold.is_some(),
             }
-            gold.push(Interval { start_ms, end_ms });
-        }
-        out.push(CorpusRecording {
-            abs_path: db::absolute(library, &rel_path),
-            rel_path,
-            duration_ms,
-            segment_state,
-            gold,
-            hand_corrected,
-        });
+        })
+        .collect())
+}
+
+/// One `recordings` row as the harness needs it.
+struct RecordingRow {
+    id: i64,
+    rel_path: String,
+    file_size: i64,
+    quick_hash: String,
+    duration_ms: Option<i64>,
+    segment_state: String,
+}
+
+/// Every recording in the `kind` library, ordered by path.
+fn library_recordings(conn: &Connection, kind: &str) -> rusqlite::Result<Vec<RecordingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, file_size, quick_hash, duration_ms, segment_state FROM recordings
+         WHERE library = ?1 ORDER BY path",
+    )?;
+    let rows = stmt
+        .query_map([kind], |r| {
+            Ok(RecordingRow {
+                id: r.get(0)?,
+                rel_path: r.get(1)?,
+                file_size: r.get(2)?,
+                quick_hash: r.get(3)?,
+                duration_ms: r.get(4)?,
+                segment_state: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `--export-gold`: declare each recording matching `filter` fully verified by
+/// writing its *current DB timeline* to a gold file in `gold_dir`. This is the only
+/// way a timeline becomes gold, so run it only after checking the whole recording —
+/// gaps included, since review skips them and a missed rally hides there.
+fn export_gold(conn: &Connection, kind: &str, filter: &str, gold_dir: &Path) -> Result<(), String> {
+    let rows: Vec<RecordingRow> = library_recordings(conn, kind)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.rel_path.contains(filter))
+        .collect();
+    if rows.is_empty() {
+        return Err(format!(
+            "no recording in the '{kind}' library matched \"{filter}\""
+        ));
     }
-    Ok(out)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for r in rows {
+        if r.segment_state != "ready" {
+            println!("SKIP  {}  (not segmented: {})", r.rel_path, r.segment_state);
+            continue;
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT start_ms, end_ms FROM rallies WHERE recording_id = ?1 ORDER BY start_ms",
+            )
+            .map_err(|e| e.to_string())?;
+        let rallies = stmt
+            .query_map([r.id], |row| {
+                Ok([row.get::<_, i64>(0)?, row.get::<_, i64>(1)?])
+            })
+            .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
+            .map_err(|e| e.to_string())?;
+        let file = gold::GoldFile {
+            format: gold::FORMAT,
+            recording: r.rel_path.clone(),
+            file_size: r.file_size,
+            quick_hash: r.quick_hash,
+            duration_ms: r.duration_ms,
+            verified_unix: now,
+            rallies,
+        };
+        let path = gold::save(gold_dir, &file).map_err(|e| format!("{}: {e}", r.rel_path))?;
+        println!(
+            "GOLD  {}  ({} rallies) → {}",
+            r.rel_path,
+            file.rallies.len(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// `--dump-draft`: run the current segmenter over every video under `root` (no DB
+/// needed) and write each draft in the gold-file schema as `*.draft.json` in `out`,
+/// so drafts can be scored by tools that read that schema (e.g. the rally audit)
+/// side by side with teacher and student timelines.
+fn dump_drafts(root: &Path, out: &Path, filter: Option<&str>) -> Result<(), String> {
+    const VIDEO_EXT: [&str; 4] = ["mov", "mp4", "mkv", "m4v"];
+    let mut videos: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            p.extension()
+                .map(|x| VIDEO_EXT.contains(&x.to_string_lossy().to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .filter(|p| filter.map_or(true, |f| p.to_string_lossy().contains(f)))
+        .collect();
+    videos.sort();
+    if videos.is_empty() {
+        return Err(format!("no videos under {}", root.display()));
+    }
+    println!(
+        "dumping segmenter v{} drafts for {} video(s) → {}",
+        segment::SEGMENTER_VERSION,
+        videos.len(),
+        out.display()
+    );
+    for path in videos {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let size = std::fs::metadata(&path)
+            .map_err(|e| format!("{rel}: {e}"))?
+            .len();
+        let hash = db::quick_hash(&path, size).map_err(|e| format!("{rel}: {e}"))?;
+        let (draft, duration_ms) = match rerun_segmenter(&path.to_string_lossy()) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("ERR   {rel}  ({e})");
+                continue;
+            }
+        };
+        let file = gold::GoldFile {
+            format: gold::FORMAT,
+            recording: rel.clone(),
+            file_size: size as i64,
+            quick_hash: hash,
+            duration_ms: Some(duration_ms),
+            verified_unix: 0, // a machine draft: never verified
+            rallies: draft.iter().map(|i| [i.start_ms, i.end_ms]).collect(),
+        };
+        let written =
+            gold::save_timeline(out, &file, "draft").map_err(|e| format!("{rel}: {e}"))?;
+        println!(
+            "DRAFT {rel}  ({} rallies) → {}",
+            file.rallies.len(),
+            written.display()
+        );
+    }
+    Ok(())
+}
+
+/// Where gold files live by default: `eval/gold/` at the repo root, so they are
+/// versioned with the code. Overridable with `--gold DIR`.
+fn default_gold_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("eval")
+        .join("gold")
 }
 
 /// Score each gold recording, print its numbers, and print the corpus aggregate.
@@ -401,11 +560,8 @@ fn score_and_report(recordings: &[CorpusRecording]) {
             skipped += 1;
             continue;
         }
-        if !rec.hand_corrected {
-            println!(
-                "SKIP  {}  (no hand-corrected timeline — not gold)",
-                rec.rel_path
-            );
+        if !rec.has_gold {
+            println!("SKIP  {}  (no gold file — not verified)", rec.rel_path);
             skipped += 1;
             continue;
         }
@@ -554,7 +710,7 @@ fn score_config(
 fn sweep_and_report(recordings: &[CorpusRecording]) {
     let mut tracks: Vec<CachedTracks> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -685,7 +841,7 @@ fn trace_and_report(recordings: &[CorpusRecording]) {
     let p = segment::Params::default();
     let mut total_missed = 0usize;
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             continue;
         }
         let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
@@ -991,7 +1147,7 @@ fn fp_trace_and_report(recordings: &[CorpusRecording]) {
     let p = segment::Params::default();
     let mut traced: Vec<TracedRecording> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             continue;
         }
         let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
@@ -1402,7 +1558,7 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     let p = segment::Params::default();
     let mut recs: Vec<HeadroomRecording> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -1667,7 +1823,7 @@ fn edges_and_report(recordings: &[CorpusRecording]) {
     let mut viability = [0usize; TRIM_RADII_MS.len()];
     let mut all_errors: Vec<i64> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             continue;
         }
         let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
@@ -1946,7 +2102,7 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     let p = segment::Params::default();
     let mut recs: Vec<PresenceRecording> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -2644,7 +2800,7 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
     let mut fp_rows: Vec<SpanRow> = Vec::new();
     let mut total_skipped = 0usize;
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -3147,7 +3303,7 @@ fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Pat
     let ncues = SERVE_CUES.len();
 
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -3634,6 +3790,10 @@ struct Options {
     spans: bool,
     serve: bool,
     scratch: Option<String>,
+    gold: Option<String>,
+    export_gold: bool,
+    dump_draft: Option<String>,
+    root: Option<String>,
     help: bool,
 }
 
@@ -3654,6 +3814,10 @@ impl Options {
             spans: false,
             serve: false,
             scratch: None,
+            gold: None,
+            export_gold: false,
+            dump_draft: None,
+            root: None,
             help: false,
         };
         let mut it = args.iter();
@@ -3668,6 +3832,20 @@ impl Options {
                 "--presence" => opts.presence = true,
                 "--spans" => opts.spans = true,
                 "--serve" => opts.serve = true,
+                "--export-gold" => opts.export_gold = true,
+                "--dump-draft" => {
+                    opts.dump_draft = Some(
+                        it.next()
+                            .ok_or("--dump-draft needs an output directory")?
+                            .clone(),
+                    );
+                }
+                "--root" => {
+                    opts.root = Some(it.next().ok_or("--root needs a directory")?.clone());
+                }
+                "--gold" => {
+                    opts.gold = Some(it.next().ok_or("--gold needs a directory")?.clone());
+                }
                 "--scratch" => {
                     opts.scratch = Some(it.next().ok_or("--scratch needs a directory")?.clone());
                 }
@@ -3698,7 +3876,8 @@ impl Options {
 fn print_usage() {
     println!(
         "eval-harness — referee the segmenter against hand-corrected timelines (ADR 0015)\n\n\
-         USAGE:\n    eval-harness [--db PATH] [--library local|shared] [--sweep] [RECORDING]\n\n\
+         USAGE:\n    eval-harness [--db PATH] [--library local|shared] [--gold DIR] [--sweep] [RECORDING]\n    \
+         eval-harness --export-gold RECORDING\n\n\
          OPTIONS:\n    \
          --db PATH              metadata DB to read (default: the app's own DB)\n    \
          --library local|shared which library to score (default: the active one)\n    \
@@ -3711,9 +3890,14 @@ fn print_usage() {
          --spans                span-score separation over the declared grid (issue #93)\n    \
          --serve                serve-cue + confirmation viability, gold only (ADR 0017, issue #95)\n    \
          --scratch DIR          cache dir for scratch detection/pose tracks (default: temp)\n    \
+         --gold DIR             gold-file dir (default: <repo>/eval/gold)\n    \
+         --export-gold          write the matching recordings' current DB timelines as gold\n    \
+                                files — run only once the whole recording is verified\n    \
+         --dump-draft OUT --root DIR  segment every video under DIR (no DB) and write the\n    \
+                                drafts as OUT/*.draft.json (gold-file schema)\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
-         Recordings without a hand-corrected timeline are skipped, never scored."
+         Recordings without a gold file are skipped, never scored."
     );
 }
 
