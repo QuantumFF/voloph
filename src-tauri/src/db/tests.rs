@@ -1694,8 +1694,8 @@ fn pending_offer_coexists_with_analysis_adoption() {
     let a_abs = lib.write("a.mp4", b"aaaa");
     lib.write("b.mp4", b"bbbb");
     let bundle_file = drop_bundle(&lib, "alice", "2026-01-01"); // covers a.mp4 + b.mp4
-    // Only a.mp4 has a published Analysis (a machine draft distinct from the
-    // bundle's); b.mp4 is covered but unanalyzed.
+                                                                // Only a.mp4 has a published Analysis (a machine draft distinct from the
+                                                                // bundle's); b.mp4 is covered but unanalyzed.
     publish_test_analysis(
         &lib,
         &a_abs,
@@ -1825,7 +1825,9 @@ fn segmenting_a_shared_recording_publishes_a_content_keyed_analysis() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
     assert_eq!(scan_library(&mut conn).unwrap().registered, 1);
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
 
     let rallies = vec![crate::segment::Rally {
         start_ms: 1000,
@@ -1840,9 +1842,11 @@ fn segmenting_a_shared_recording_publishes_a_content_keyed_analysis() {
     assert_eq!(a.version, ANALYSIS_VERSION);
     assert_eq!(a.segmenter_version, crate::segment::SEGMENTER_VERSION);
     let expected_day: String = conn
-        .query_row("SELECT capture_day FROM recordings WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT capture_day FROM recordings WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(a.capture_day, expected_day);
     assert_eq!(a.duration_ms, Some(60000));
@@ -1864,7 +1868,9 @@ fn re_analyze_overwrites_the_published_analysis() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
 
     save_rallies(
         &mut conn,
@@ -1914,7 +1920,9 @@ fn segmenting_a_local_recording_publishes_nothing() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "local", &lib.0, "local").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
 
     save_rallies(
         &mut conn,
@@ -1946,7 +1954,9 @@ fn shared_analyzed_without_file() -> (Connection, TempLib, std::path::PathBuf, i
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     save_rallies(
         &mut conn,
         id,
@@ -2040,7 +2050,9 @@ fn scan_publishes_a_pristine_local_recording_copied_into_shared() {
     // Analyze the recording in the local library — pristine, machine `ready`.
     designate_library(&mut conn, "local", &local.0, "local").unwrap();
     scan_library(&mut conn).unwrap();
-    let l_id = recording_id(&conn, &l_abs.to_string_lossy()).unwrap().unwrap();
+    let l_id = recording_id(&conn, &l_abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     save_rallies(
         &mut conn,
         l_id,
@@ -2081,7 +2093,9 @@ fn scan_does_not_publish_a_hand_touched_local_original() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "local", &local.0, "local").unwrap();
     scan_library(&mut conn).unwrap();
-    let l_id = recording_id(&conn, &l_abs.to_string_lossy()).unwrap().unwrap();
+    let l_id = recording_id(&conn, &l_abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     save_rallies(
         &mut conn,
         l_id,
@@ -2229,7 +2243,9 @@ fn already_analyzed_recording_is_not_churned() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     // Local segmentation lands first.
     save_rallies(
         &mut conn,
@@ -2387,7 +2403,9 @@ fn scan_resegments_an_untouched_stale_recording() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "local", &lib.0, "local").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     save_rallies(
         &mut conn,
         id,
@@ -2433,7 +2451,9 @@ fn scan_never_resegments_a_hand_touched_stale_recording() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "local", &lib.0, "local").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     save_rallies(
         &mut conn,
         id,
@@ -2480,7 +2500,9 @@ fn a_current_version_recording_is_left_alone() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "local", &lib.0, "local").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     save_rallies(
         &mut conn,
         id,
@@ -2551,7 +2573,9 @@ fn scan_adopts_the_highest_version_and_keeps_older_files() {
             .collect::<Vec<_>>(),
         vec![(5000, 9000)]
     );
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     let v: Option<i64> = conn
         .query_row(
             "SELECT segmenter_version FROM recordings WHERE id = ?1",
@@ -2577,7 +2601,9 @@ fn publish_writes_alongside_without_deleting_the_older_version() {
     let mut conn = open(Path::new(":memory:")).unwrap();
     designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
     scan_library(&mut conn).unwrap();
-    let id = recording_id(&conn, &abs.to_string_lossy()).unwrap().unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
     save_rallies(
         &mut conn,
         id,
@@ -2733,7 +2759,10 @@ fn version_bump_does_not_disturb_bundle_receive() {
     .unwrap();
     scan_library(&mut conn).unwrap();
     assert_eq!(
-        recording_timeline(&conn, &a_abs).unwrap().unwrap().segment_state,
+        recording_timeline(&conn, &a_abs)
+            .unwrap()
+            .unwrap()
+            .segment_state,
         "ready"
     );
 }

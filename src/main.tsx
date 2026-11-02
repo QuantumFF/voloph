@@ -17,7 +17,9 @@ createRoot(document.getElementById("root")!).render(
       <ExternalLinkGuard />
       {import.meta.env.DEV ? <DebugPanel /> : null}
       <ExportProvider>
-        <main data-ui-scroll-container><App /></main>
+        <main data-ui-scroll-container>
+          <App />
+        </main>
       </ExportProvider>
     </ThemeProvider>
   </StrictMode>

@@ -1,7 +1,11 @@
 import { emit } from "@tauri-apps/api/event"
 import { invoke, isTauri, type InvokeArgs } from "@tauri-apps/api/core"
 
-import { emitDebugEvent, serializeDebugValue, serializeError } from "./debug-events"
+import {
+  emitDebugEvent,
+  serializeDebugValue,
+  serializeError,
+} from "./debug-events"
 
 export async function trackedInvoke<T>(command: string, args?: InvokeArgs) {
   const startedAt = performance.now()

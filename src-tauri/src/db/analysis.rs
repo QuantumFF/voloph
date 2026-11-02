@@ -54,7 +54,11 @@ pub struct Analysis {
 /// (segmenter v1) still find and adopt it; a newer version gets a `_s{N}` suffix so
 /// it is **published alongside** the stale one rather than overwriting it — nothing
 /// in shared storage is ever deleted, and adoption prefers the highest version.
-pub(crate) fn analysis_file_name(quick_hash: &str, file_size: i64, segmenter_version: u32) -> String {
+pub(crate) fn analysis_file_name(
+    quick_hash: &str,
+    file_size: i64,
+    segmenter_version: u32,
+) -> String {
     if segmenter_version <= 1 {
         format!("{quick_hash}_{file_size}.vanalysis")
     } else {
@@ -97,7 +101,11 @@ fn analysis_of_any_library(conn: &Connection, id: i64) -> Option<(String, i64, A
     analysis_of_impl(conn, id, false)
 }
 
-fn analysis_of_impl(conn: &Connection, id: i64, require_shared: bool) -> Option<(String, i64, Analysis)> {
+fn analysis_of_impl(
+    conn: &Connection,
+    id: i64,
+    require_shared: bool,
+) -> Option<(String, i64, Analysis)> {
     let row = conn
         .query_row(
             "SELECT library, file_size, quick_hash, capture_day, duration_ms, waveform,

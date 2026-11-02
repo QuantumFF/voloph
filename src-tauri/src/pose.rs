@@ -137,7 +137,10 @@ impl PoseEstimator {
             .first()
             .map(|i| i.name.clone())
             .ok_or("pose model has no inputs")?;
-        Ok(PoseEstimator { session, input_name })
+        Ok(PoseEstimator {
+            session,
+            input_name,
+        })
     }
 
     /// Run the pose model on one prepared `3x256x192` RGB-normalized CHW crop and
@@ -154,7 +157,10 @@ impl PoseEstimator {
             .run(vec![(self.input_name.clone(), input)])
             .map_err(|e| format!("ort inference: {e}"))?;
         if outputs.len() < 2 {
-            return Err(format!("pose model gave {} outputs, expected 2", outputs.len()));
+            return Err(format!(
+                "pose model gave {} outputs, expected 2",
+                outputs.len()
+            ));
         }
         // Assign the two SimCC heads by their last dim (x=384, y=512) rather than by
         // position, so the decode is robust to export output ordering.
@@ -355,8 +361,15 @@ pub fn vendored_pose_model_path() -> Result<PathBuf, String> {
 pub(crate) fn probe_source_dimensions(path: &str) -> Option<(u32, u32)> {
     let out = Command::new(sidecar_path("ffprobe"))
         .args([
-            "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height", "-of", "csv=p=0", path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            path,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -380,8 +393,15 @@ pub(crate) fn probe_source_dimensions(path: &str) -> Option<(u32, u32)> {
 fn probe_rotation(path: &str) -> Option<i32> {
     let out = Command::new(sidecar_path("ffprobe"))
         .args([
-            "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream_side_data=rotation", "-of", "csv=p=0", path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream_side_data=rotation",
+            "-of",
+            "csv=p=0",
+            path,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -428,10 +448,8 @@ pub fn extract_pose_window(
     let vf = format!("fps={fps}");
     let mut child = Command::new(sidecar_path("ffmpeg"))
         .args([
-            "-v", "error", "-nostats",
-            "-ss", &ss, "-i", path, "-t", &t,
-            "-an",
-            "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+            "-v", "error", "-nostats", "-ss", &ss, "-i", path, "-t", &t, "-an", "-vf", &vf, "-f",
+            "rawvideo", "-pix_fmt", "bgr24", "-",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -451,7 +469,9 @@ pub fn extract_pose_window(
             let model_bgr = letterbox_to_model(&frame, sw, sh, &lb);
             let mut boxes = detector.boxes_in_frame(&model_bgr, SCORE_THRESHOLD, &lb)?;
             boxes.sort_by(|a, b| {
-                b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             boxes.truncate(MAX_PLAYERS);
 
@@ -460,7 +480,11 @@ pub fn extract_pose_window(
                 let crop = CropRect::for_box(&bbox, src_w, src_h);
                 let input = build_pose_input(&frame, sw, sh, &crop);
                 let decoded = pose.infer_crop(input)?;
-                let mut keypoints = [Keypoint { x: 0.0, y: 0.0, score: 0.0 }; NUM_KP];
+                let mut keypoints = [Keypoint {
+                    x: 0.0,
+                    y: 0.0,
+                    score: 0.0,
+                }; NUM_KP];
                 for (kp, &(kx, ky, score)) in keypoints.iter_mut().zip(decoded.iter()) {
                     let (x, y) = crop.to_source_norm(kx, ky);
                     *kp = Keypoint { x, y, score };
@@ -508,7 +532,13 @@ mod tests {
     fn crop_expands_to_model_aspect_and_pads() {
         // A wide box (aspect > 192/256) keeps its width and grows its height, then
         // both are padded by CROP_PAD.
-        let b = Box { x: 0.25, y: 0.4, w: 0.5, h: 0.1, score: 0.9 };
+        let b = Box {
+            x: 0.25,
+            y: 0.4,
+            w: 0.5,
+            h: 0.1,
+            score: 0.9,
+        };
         let crop = CropRect::for_box(&b, 1000, 1000);
         // width px = 0.5*1000 = 500; expected height = 500 / (192/256) = 666.67
         assert!((crop.cw - 500.0 * CROP_PAD).abs() < 1e-3);
@@ -520,7 +550,13 @@ mod tests {
 
     #[test]
     fn crop_source_norm_roundtrips_center() {
-        let b = Box { x: 0.2, y: 0.2, w: 0.4, h: 0.4, score: 0.9 };
+        let b = Box {
+            x: 0.2,
+            y: 0.2,
+            w: 0.4,
+            h: 0.4,
+            score: 0.9,
+        };
         let crop = CropRect::for_box(&b, 800, 600);
         // The crop-centre pixel maps back to the box centre, source-normalized.
         let (nx, ny) = crop.to_source_norm(POSE_W as f32 / 2.0, POSE_H as f32 / 2.0);

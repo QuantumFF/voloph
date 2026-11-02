@@ -318,7 +318,9 @@ export function useSessionList(rescanOnMount: boolean) {
   )
   useEffect(() => {
     const unlisten = listen<AnalysisProgress>("analysis:progress", (e) =>
-      setProgress((prev) => new Map(prev).set(e.payload.recording_id, e.payload))
+      setProgress((prev) =>
+        new Map(prev).set(e.payload.recording_id, e.payload)
+      )
     )
     return () => {
       void unlisten.then((off) => off())

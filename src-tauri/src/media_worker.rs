@@ -114,9 +114,7 @@ fn run_media_worker(app: &AppHandle, conn: &Mutex<Connection>, staging_dir: &std
                         db::MediaWork::Probe(id, path) => {
                             probe_recording(conn, id, &path);
                         }
-                        db::MediaWork::Segment(id, path) => {
-                            segment_recording(app, conn, id, &path)
-                        }
+                        db::MediaWork::Segment(id, path) => segment_recording(app, conn, id, &path),
                         db::MediaWork::CaptureDate(..) => unreachable!(),
                     }
                 }

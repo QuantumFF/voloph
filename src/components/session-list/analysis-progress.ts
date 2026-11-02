@@ -59,7 +59,11 @@ export function remainingByRecording(
   const remaining = new Map<number, number>()
   for (const [id, tick] of progress) {
     if (!analyzingIds.has(id)) continue
-    const ms = estimateRemainingMs(tick.processed_ms, tick.total_ms, tick.elapsed_ms)
+    const ms = estimateRemainingMs(
+      tick.processed_ms,
+      tick.total_ms,
+      tick.elapsed_ms
+    )
     if (ms != null) remaining.set(id, ms)
   }
   return remaining
