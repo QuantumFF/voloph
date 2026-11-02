@@ -31,9 +31,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -64,27 +61,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: bun install
-
-      # WiX only accepts a numeric pre-release (0.0.3-1), so an app version
-      # like 0.0.3-beta fails the MSI bundle. Pin the MSI version to the
-      # numeric core (0.0.3); the NSIS exe and asset names keep the full
-      # version. Tauri's MSI allows same-version upgrades, so 0.0.3-beta ->
-      # 0.0.3 still installs over. Merged into the Windows platform config at
-      # build time so tauri.conf.json stays the one place to bump the version.
-      - name: Set MSI version (Windows)
-        if: startsWith(matrix.platform, 'windows')
-        shell: bash
-        run: |
-          bun -e '
-            const fs = require("fs");
-            const path = "src-tauri/tauri.windows.conf.json";
-            const { version } = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8"));
-            const core = version.replace(/[-+].*$/, "");
-            const conf = JSON.parse(fs.readFileSync(path, "utf8"));
-            conf.bundle.windows = { ...conf.bundle.windows, wix: { ...conf.bundle.windows?.wix, version: core } };
-            fs.writeFileSync(path, JSON.stringify(conf, null, 2) + "\n");
-            console.log(`MSI version ${core} (app version ${version})`);
-          '
 
       - name: Build and publish
         id: tauri

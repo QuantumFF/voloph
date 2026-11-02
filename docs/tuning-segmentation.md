@@ -130,7 +130,7 @@ recording's extracted tracks once and re-scores the pure `segment_with` seam ove
 the whole occupancy grid:
 
 ```bash
-cargo run --release --bin eval-harness -- --sweep 21-06-2026
+cargo run --release --features dev-tools --bin eval-harness -- --sweep 21-06-2026
 ```
 
 Known hard edge (issue #91's sweep): missed rallies and edge quality trade
