@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# App data for `bun run app --isolated` (scripts/dev.ts)
+.dev-data

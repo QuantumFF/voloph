@@ -12,7 +12,8 @@ export default defineConfig({
     },
   },
   server: {
-    port: 1420,
+    // scripts/dev.ts picks a free port so several worktrees can run at once.
+    port: Number(process.env.VOLOPH_DEV_PORT ?? 1420),
     strictPort: true,
   },
 })

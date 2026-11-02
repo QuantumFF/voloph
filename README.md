@@ -149,8 +149,17 @@ bun install
 ### Run
 
 ```bash
-bun run tauri dev      # launch the app with hot-reload
+bun run app              # launch the app with hot-reload
+bun run app --isolated   # same, with throwaway app data in ./.dev-data
 ```
+
+`bun run app` (`scripts/dev.ts`) works the same in the main checkout and any
+git worktree: it installs `node_modules`, copies the ffmpeg/ffprobe sidecars
+from the main checkout (or fetches them), picks a free dev-server port so
+several worktrees can run side by side, puts the branch name in the window
+title, and finds your desktop display when the shell has none. Without
+`--isolated` every checkout shares the real app data. Plain
+`bun run tauri dev` still works in a fully set-up checkout.
 
 ### Other scripts
 
