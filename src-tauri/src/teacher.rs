@@ -183,6 +183,56 @@ pub fn segment(model: &TeacherModel, track: &[ShuttleFrame], pose: &PoseArrays) 
     )
 }
 
+/// The teacher (ADR 0019): TrackNetV3 shuttle track over the whole recording, then the
+/// players' poses (YOLOX + RTMPose-t at 5 fps, up to 4 people), then the teacher model.
+/// Any failure — a missing model, ort, ffmpeg — is an error (the analysis worker then falls
+/// back to the student), so choosing the teacher never costs a recording its draft.
+/// A day: "to the end" for the pose pass's ffmpeg `-t` (which stops at end of file;
+/// a much larger value overflows ffmpeg's time parsing).
+const WHOLE_RECORDING_MS: i64 = 86_400_000;
+
+pub fn segment_recording(path: &str, on_progress: impl FnMut(i64)) -> Result<Vec<Rally>, String> {
+    let started = std::time::Instant::now();
+    let model = TeacherModel::bundled()?;
+    let mut tracker = crate::tracknet::ShuttleTracker::load_vendored()?;
+    let track = crate::tracknet::track_recording(path, &mut tracker, on_progress)?;
+    let tracked = started.elapsed().as_millis();
+    let (w, h) = crate::pose::probe_source_dimensions(path)
+        .ok_or("could not probe the frame size for pose")?;
+    let mut detector = crate::detect::Detector::load(&crate::detect::vendored_model_path()?)?;
+    let mut estimator =
+        crate::pose::PoseEstimator::load(&crate::pose::vendored_pose_model_path()?)?;
+    let window = crate::pose::extract_pose_window_k(
+        path,
+        0,
+        WHOLE_RECORDING_MS,
+        POSE_FPS,
+        w,
+        h,
+        POSE_K,
+        &mut detector,
+        &mut estimator,
+    )?;
+    let pose = PoseArrays::from_window(&window);
+    let frames: Vec<ShuttleFrame> = track
+        .points
+        .iter()
+        .map(|p| ShuttleFrame {
+            visible: p.visible,
+            x: i64::from(p.x),
+            y: i64::from(p.y),
+        })
+        .collect();
+    let rallies = segment(model, &frames, &pose);
+    log::info!(
+        "teacher: segmented {path} — shuttle track {tracked} ms ({}), pose {} ms, {} rallies",
+        tracker.provider(),
+        started.elapsed().as_millis() - tracked,
+        rallies.len()
+    );
+    Ok(rallies)
+}
+
 // ---------------------------------------------------------------------------------
 // Shuttle track (silver-ctx.py load_track / features / _gap_dist / _flips)
 

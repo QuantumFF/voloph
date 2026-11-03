@@ -235,17 +235,31 @@ struct CorpusRecording {
 /// arrays (`teacher::PoseArrays` as JSON) and write its timeline — the parity check
 /// against `scripts/silver-ctx.py` on identical inputs.
 ///
-/// Usage: `teacher-run --track CSV --pose POSE.json --out TIMELINE.json`
+/// Usage: `teacher-run --track CSV --pose POSE.json --out TIMELINE.json`, or
+/// `teacher-run --file VIDEO --out TIMELINE.json` for the whole in-app pipeline
+/// (TrackNet → pose → teacher, exactly what the analysis worker runs).
 pub fn teacher_run_cli(args: Vec<String>) -> Result<(), String> {
-    let (mut track, mut pose, mut out) = (None, None, None);
+    let (mut track, mut pose, mut out, mut file) = (None, None, None, None);
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--track" => track = Some(it.next().ok_or("--track needs a path")?),
             "--pose" => pose = Some(it.next().ok_or("--pose needs a path")?),
             "--out" => out = Some(it.next().ok_or("--out needs a path")?),
+            "--file" => file = Some(it.next().ok_or("--file needs a path")?),
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if let Some(file) = file {
+        let out = out.ok_or("--out is required")?;
+        let t0 = std::time::Instant::now();
+        let rallies = crate::teacher::segment_recording(&file, |_| {})?;
+        let doc = serde_json::json!({
+            "rallies": rallies.iter().map(|r| [r.start_ms, r.end_ms]).collect::<Vec<_>>(),
+            "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
+            "wall_ms": t0.elapsed().as_millis() as u64,
+        });
+        return std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?).map_err(|e| format!("{out}: {e}"));
     }
     let (track, pose, out) = (
         track.ok_or("--track is required")?,

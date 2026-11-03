@@ -68,16 +68,18 @@ pub const SEGMENTER_VERSION: u32 = 7;
 pub enum Segmenter {
     V6,
     Student,
+    Teacher,
 }
 
 impl Segmenter {
-    pub const ALL: [Segmenter; 2] = [Segmenter::Student, Segmenter::V6];
+    pub const ALL: [Segmenter; 3] = [Segmenter::Student, Segmenter::Teacher, Segmenter::V6];
 
     /// The stable id stored in the DB and Analysis files. A NULL / absent id is `v6`.
     pub fn id(self) -> &'static str {
         match self {
             Segmenter::V6 => "v6",
             Segmenter::Student => "student",
+            Segmenter::Teacher => "teacher",
         }
     }
 
@@ -85,6 +87,7 @@ impl Segmenter {
         match self {
             Segmenter::V6 => SEGMENTER_VERSION,
             Segmenter::Student => crate::student::VERSION,
+            Segmenter::Teacher => crate::teacher::VERSION,
         }
     }
 

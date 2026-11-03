@@ -123,3 +123,31 @@ own `predict.py --eval_mode nonoverlap` runs them offline
 To re-vendor: run `scripts/export-tracknet-onnx.py --tracknet <checkout>` with a
 python that has torch, onnx and onnxruntime, record the new SHA-256s here, and
 keep `LICENSE-tracknetv3` in sync.
+
+## student-v1.json
+
+The learned **student** rally segmenter (ADR 0019, issues #100/#105), read by
+`src/student.rs`. Not a third-party model: trained in this repo by
+`scripts/student.py` (gradient-boosted trees, exported as plain JSON by
+`silver-ctx.export_trees`) on the three signals v6 already computes — motion energy,
+audio level + hit onsets, YOLOX person boxes (`signals-dump`) — with labels from the
+dev gold files plus teacher v3 silver; the gate-v2 test recordings were never used.
+Frozen as `eval/models/student-v1.json` (sha256 `72e88972…`); gate v2 GREEN (span
+precision 0.991, recall ≥ 3 s 0.962, edges ≤ 1 s 81.5 %). The file carries its
+feature layout (`signals`, `windows_s`); the app refuses a layout it does not compute.
+Parity: the Rust port reproduces `scripts/student.py` on all 18 corpus recordings
+(908/908 rallies identical).
+
+## teacher-v1.json
+
+The learned **teacher** rally segmenter (ADR 0019, #105), read by `src/teacher.rs`.
+Trained in this repo by `scripts/silver-ctx.py train --edges` (logistic-regression
+context model + logistic edge refiner, plain JSON) on the shuttle tracks the app itself
+computes (`tracknet-dump`, TrackNetV3 non-overlapping mode, see `tracknet_v3.onnx`) and
+the app's RTMPose-t player poses, with the gate-v2 test recordings held out. Copy kept
+as `eval/models/teacher-v1-app-tracks.json`. On the (already seen) gate-v2 test set:
+span precision 0.976, recall ≥ 3 s 0.971, edges ≤ 1 s 88 % (the blind result for the
+same recipe on offline tracks: 0.992 / 0.971 / 87 %). Parity: identical to Python on
+all 18 recordings given the same track and poses (971/971 rallies); the full in-app
+pipeline matches the offline run on the test recordings (123/127 rallies identical, all
+within 0.5 s).

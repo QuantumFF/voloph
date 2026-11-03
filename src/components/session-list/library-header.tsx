@@ -191,6 +191,12 @@ export function LibraryHeader({
                   Rarely invents rallies
                 </span>
               </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="teacher" className="flex-col items-start gap-0">
+                <span>Learned, high accuracy</span>
+                <span className="text-xs text-muted-foreground">
+                  Tracks the shuttle — slow without a GPU
+                </span>
+              </DropdownMenuRadioItem>
               <DropdownMenuRadioItem value="v6" className="flex-col items-start gap-0">
                 <span>Classic (v6)</span>
                 <span className="text-xs text-muted-foreground">
