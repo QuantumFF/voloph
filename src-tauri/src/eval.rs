@@ -472,7 +472,7 @@ fn export_gold(conn: &Connection, kind: &str, filter: &str, gold_dir: &Path) -> 
 
 /// A machine timeline to import as a recording's draft (`--import-draft`): the
 /// gold-file schema (silver, draft, …) plus optional per-rally confidences.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct ImportTimeline {
     file_size: i64,
     quick_hash: String,
@@ -486,6 +486,9 @@ struct ImportTimeline {
 /// what marks a rally hand-corrected, never the import.
 const IMPORT_CONFIDENCE: f64 = 0.75;
 const IMPORT_MAX_CONFIDENCE: f64 = 0.99;
+/// How far past the app's probed duration an imported timeline's last rally may
+/// run and still be trimmed to fit (a few frames of frame-rate rounding).
+const IMPORT_END_SLACK_MS: i64 = 1000;
 
 /// `--import-draft DIR`: replace the DB timeline of each recording matching
 /// `filter` with the machine timeline in `dir` that has the same identity (file
@@ -546,6 +549,15 @@ fn import_draft(conn: &mut Connection, kind: &str, filter: &str, dir: &Path) -> 
                 r.rel_path, r.segment_state
             );
             continue;
+        }
+        // Machine timelines are timed from their own frame count, which can run a
+        // few frames past the app's probed duration (variable-frame-rate sources).
+        // Trim an overrun of up to IMPORT_END_SLACK_MS; anything larger is an error.
+        let mut t = (*t).clone();
+        if let (Some(d), Some(last)) = (r.duration_ms, t.rallies.last_mut()) {
+            if last[1] > d && last[1] - d <= IMPORT_END_SLACK_MS && last[0] < d {
+                last[1] = d;
+            }
         }
         gold::validate(&t.rallies, r.duration_ms).map_err(|e| format!("{}: {e}", src.display()))?;
         let conf: Vec<f64> = match &t.confidence {
@@ -4115,6 +4127,14 @@ mod tests {
         );
         // The other recording is untouched.
         assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
+        // A last rally a few frames past the probed duration is trimmed to fit.
+        std::fs::write(
+            src.join("IMG_1.MOV.aaaa.silver.json"),
+            r#"{"file_size":100,"quick_hash":"aaaa","rallies":[[58000,60400]]}"#,
+        )
+        .unwrap();
+        import_draft(&mut conn, "local", "IMG_1", &src).unwrap();
+        assert_eq!(rows(&conn, 1), vec![(58000, 60000, IMPORT_CONFIDENCE)]);
         // A filter with no timeline in the dir changes nothing; a bad filter is an error.
         import_draft(&mut conn, "local", "IMG_2", &src).unwrap();
         assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
