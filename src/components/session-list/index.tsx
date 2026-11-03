@@ -55,6 +55,8 @@ export function SessionList({
     scanning,
     refreshing,
     reanalyzingAll,
+    segmenter,
+    handleSegmenter,
     confirmAction,
     setConfirmAction,
     error,
@@ -142,6 +144,8 @@ export function SessionList({
         scanning={scanning}
         refreshing={refreshing}
         reanalyzingAll={reanalyzingAll}
+        segmenter={segmenter}
+        onSegmenter={(id) => void handleSegmenter(id)}
         onBrowse={onBrowse}
         onSwitch={(kind) => void handleSwitch(kind)}
         onRefresh={() => void handleRefresh()}

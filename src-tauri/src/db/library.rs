@@ -81,6 +81,40 @@ pub fn set_active_kind(conn: &Connection, kind: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The segmenter a library's drafts are drawn with (ADR 0019): the stored per-library
+/// choice, or [`crate::segment::DEFAULT_SEGMENTER`]. Per device, like every `meta` key —
+/// members of a shared library each choose for themselves.
+pub fn library_segmenter(
+    conn: &Connection,
+    kind: &str,
+) -> rusqlite::Result<crate::segment::Segmenter> {
+    Ok(meta_get(conn, &format!("segmenter.{kind}"))?
+        .and_then(|id| crate::segment::Segmenter::from_id(&id))
+        .unwrap_or(crate::segment::DEFAULT_SEGMENTER))
+}
+
+/// The segmenter for recording `id`'s library (ADR 0019).
+pub fn recording_segmenter(
+    conn: &Connection,
+    id: i64,
+) -> rusqlite::Result<crate::segment::Segmenter> {
+    let kind: String =
+        conn.query_row("SELECT library FROM recordings WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })?;
+    library_segmenter(conn, &kind)
+}
+
+/// Store a library's segmenter choice (ADR 0019). Re-deriving the drafts it makes
+/// stale is the caller's job ([`super::resegment_stale_untouched`]).
+pub fn set_library_segmenter(
+    conn: &Connection,
+    kind: &str,
+    segmenter: crate::segment::Segmenter,
+) -> rusqlite::Result<()> {
+    meta_set(conn, &format!("segmenter.{kind}"), segmenter.id())
+}
+
 /// Read a per-device app-state value from `meta`, or `None` when unset.
 pub fn meta_get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {

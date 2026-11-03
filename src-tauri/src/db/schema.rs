@@ -52,6 +52,9 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
             -- an untouched recording whose version the active segmenter outranks is
             -- silently re-analyzed, a hand-touched one never is.
             segmenter_version INTEGER,
+            -- Which segmenter made the draft (ADR 0019): 'v6', 'student', ...
+            -- NULL is a pre-ADR-0019 draft, which v6 made.
+            segmenter_id TEXT,
             UNIQUE(library, path)
         );
         CREATE TABLE IF NOT EXISTS rallies (
@@ -188,6 +191,10 @@ pub fn open(db_path: &Path) -> rusqlite::Result<Connection> {
     // `recordings_old`, which the migration then dropped — leaving every
     // timeline/annotation write failing with "no such table: main.recordings_old".
     repair_dangling_recording_refs(&conn)?;
+    // Selectable segmenters (ADR 0019): which segmenter made each draft. Added after
+    // the typed-libraries rebuild above so that rebuild (which lists its columns) never
+    // drops it; existing drafts stay NULL, read as v6 — which made them.
+    let _ = conn.execute("ALTER TABLE recordings ADD COLUMN segmenter_id TEXT", []);
     Ok(conn)
 }
 

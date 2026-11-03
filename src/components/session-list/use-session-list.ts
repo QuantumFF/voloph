@@ -38,6 +38,9 @@ export function useSessionList(rescanOnMount: boolean) {
   const [scanning, setScanning] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [reanalyzingAll, setReanalyzingAll] = useState(false)
+  // Which segmenter draws the active library's drafts (ADR 0019): "student" (the
+  // learned default) or "v6" (the classic heuristic).
+  const [segmenter, setSegmenter] = useState<string>("student")
   // Which bulk action is awaiting confirmation in the dialog, if any.
   const [confirmAction, setConfirmAction] = useState<"reanalyze" | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -100,12 +103,13 @@ export function useSessionList(rescanOnMount: boolean) {
 
   const refresh = useCallback(async () => {
     try {
-      const [next, state, offers, label, bundles] = await Promise.all([
+      const [next, state, offers, label, bundles, seg] = await Promise.all([
         trackedInvoke<Session[]>("list_sessions"),
         trackedInvoke<[Library[], string]>("library_state"),
         trackedInvoke<CarryOffer[]>("carry_offers"),
         trackedInvoke<string | null>("sharer_label"),
         trackedInvoke<BundleOffer[]>("discover_bundles"),
+        trackedInvoke<string>("active_segmenter"),
       ])
       setSessions(next)
       setLibraries(state[0])
@@ -113,6 +117,7 @@ export function useSessionList(rescanOnMount: boolean) {
       setCarryOffers(offers)
       setSharerLabel(label ?? "")
       setBundleOffers(bundles)
+      setSegmenter(seg)
     } catch (e) {
       setError(String(e))
     }
@@ -419,6 +424,17 @@ export function useSessionList(rescanOnMount: boolean) {
     }
   }
 
+  // Switch the active library's segmenter (ADR 0019). Untouched recordings another
+  // segmenter drew are re-analyzed in the background; hand-edited ones keep their
+  // timelines, so no confirmation is needed.
+  function handleSegmenter(id: string) {
+    return guard(async () => {
+      await trackedInvoke<number>("set_active_segmenter", { segmenter: id })
+      setSegmenter(id)
+      await refresh()
+    })
+  }
+
   // Run whichever bulk action the confirmation dialog is open for, then close it.
   function handleConfirm() {
     if (confirmAction === "reanalyze") void runReanalyzeAll()
@@ -546,6 +562,8 @@ export function useSessionList(rescanOnMount: boolean) {
     scanning,
     refreshing,
     reanalyzingAll,
+    segmenter,
+    handleSegmenter,
     confirmAction,
     setConfirmAction,
     error,

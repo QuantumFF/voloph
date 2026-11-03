@@ -16,6 +16,8 @@ mod media_worker;
 pub mod pose;
 mod segment;
 mod staging;
+/// The learned student segmenter (issue #105): boosted trees on v6's cheap signals.
+mod student;
 
 // Embedded libmpv playback (ADR 0008, ADR 0014). Linux and Windows — it links
 // libmpv and drives the platform's native surface (GTK overlay / child HWND)
@@ -404,6 +406,29 @@ async fn rescan_library(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanRes
     Ok(result)
 }
 
+/// The segmenter the active library draws its drafts with (ADR 0019), as its id.
+#[tauri::command]
+async fn active_segmenter(db: State<'_, Db>) -> Result<String, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let kind = db::active_kind(&conn).map_err(|e| e.to_string())?;
+    Ok(db::library_segmenter(&conn, &kind).map_err(|e| e.to_string())?.id().to_string())
+}
+
+/// Switch the active library's segmenter (ADR 0019): untouched drafts another
+/// segmenter made are re-derived in the background; hand-touched recordings keep
+/// theirs. Returns how many recordings were queued.
+#[tauri::command]
+async fn set_active_segmenter(app: AppHandle, db: State<'_, Db>, segmenter: String) -> Result<usize, String> {
+    let segmenter = segment::Segmenter::from_id(&segmenter).ok_or_else(|| format!("unknown segmenter {segmenter}"))?;
+    let queued = {
+        let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+        let kind = db::active_kind(&conn).map_err(|e| e.to_string())?;
+        db::switch_segmenter(&mut conn, &kind, segmenter).map_err(|e| e.to_string())?
+    };
+    spawn_media_worker(&app);
+    Ok(queued)
+}
+
 /// Re-analyze every recording (ADR 0002) — the bulk counterpart of
 /// [`reanalyze_recording`], for re-segmenting the whole library after a segmenter
 /// change. Discards manual corrections, as a re-analyze does.
@@ -749,6 +774,8 @@ pub fn run() {
             reanalyze_recording,
             rescan_library,
             reanalyze_all,
+            active_segmenter,
+            set_active_segmenter,
             update_rally,
             add_rally,
             delete_rally,

@@ -54,6 +54,43 @@
 /// hard misses above budget — and was not shipped; see ADR 0018 / #96.)
 pub const SEGMENTER_VERSION: u32 = 6;
 
+/// Which segmenter draws a library's drafts (ADR 0019): the v6 heuristic in this
+/// module, or the learned student ([`crate::student`]). Each has its own version, and
+/// a draft records both, so switching re-derives exactly the untouched drafts another
+/// segmenter (or an older version) made, and a shared Analysis says who made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segmenter {
+    V6,
+    Student,
+}
+
+impl Segmenter {
+    pub const ALL: [Segmenter; 2] = [Segmenter::Student, Segmenter::V6];
+
+    /// The stable id stored in the DB and Analysis files. A NULL / absent id is `v6`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Segmenter::V6 => "v6",
+            Segmenter::Student => "student",
+        }
+    }
+
+    pub fn version(self) -> u32 {
+        match self {
+            Segmenter::V6 => SEGMENTER_VERSION,
+            Segmenter::Student => crate::student::VERSION,
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Segmenter> {
+        Segmenter::ALL.into_iter().find(|s| s.id() == id)
+    }
+}
+
+/// A library with no stored choice uses the student: it beat v6 on the rally-level
+/// gate (#100) at about v6's cost.
+pub const DEFAULT_SEGMENTER: Segmenter = Segmenter::Student;
+
 /// A detected rally interval over a recording, in milliseconds from its start,
 /// carrying a per-region confidence in `[0, 1]`. Low-confidence rallies surface
 /// as "uncertain regions" on the timeline during review (ADR 0002).

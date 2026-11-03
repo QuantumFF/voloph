@@ -235,16 +235,19 @@ struct CorpusRecording {
 /// whole recording, through the app's own extractors, as JSON. The student segmenter is
 /// trained on exactly these, so in the app it costs what v6 costs.
 ///
-/// Usage: `signals-dump --file PATH --out FILE.json`
+/// Usage: `signals-dump --file PATH --out FILE.json [--student TIMELINE.json]`
+/// (`--student` also runs the bundled student on the same in-memory signals — the
+/// parity check against `scripts/student.py`).
 pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
-    let (mut file, mut out) = (None, None);
+    let (mut file, mut out, mut student_out) = (None, None, None);
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--file" => file = Some(it.next().ok_or("--file needs a path")?),
             "--out" => out = Some(it.next().ok_or("--out needs a path")?),
+            "--student" => student_out = Some(it.next().ok_or("--student needs a path")?),
             "-h" | "--help" => {
-                println!("signals-dump --file PATH --out FILE.json");
+                println!("signals-dump --file PATH --out FILE.json [--student TIMELINE.json]");
                 return Ok(());
             }
             other => return Err(format!("unknown argument {other}")),
@@ -262,6 +265,25 @@ pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
         .ok_or("person detection failed")?;
     let t_detect = started.elapsed().as_secs_f64() - t_audio - t_motion;
     let footage = samples.len() as f64 / f64::from(media::SEGMENT_SAMPLE_RATE);
+    if let Some(path) = &student_out {
+        let model = crate::student::StudentModel::bundled()?;
+        let t0 = std::time::Instant::now();
+        let rallies = crate::student::segment(model, &crate::student::Inputs {
+            duration_ms: (footage * 1000.0).round() as i64,
+            motion_fps: f64::from(media::MOTION_FPS),
+            motion: &motion,
+            audio_frame_ms: audio.frame_ms,
+            audio_energy: &audio.energy,
+            audio_onset: &audio.onset,
+            detect: &detect,
+        });
+        let doc = serde_json::json!({
+            "rallies": rallies.iter().map(|r| [r.start_ms, r.end_ms]).collect::<Vec<_>>(),
+            "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
+            "student_ms": t0.elapsed().as_millis() as u64,
+        });
+        std::fs::write(path, serde_json::to_vec(&doc).map_err(|e| e.to_string())?).map_err(|e| format!("{path}: {e}"))?;
+    }
     let doc = serde_json::json!({
         "duration_ms": (footage * 1000.0).round() as i64,
         "motion": {"fps": media::MOTION_FPS, "energy": motion},
