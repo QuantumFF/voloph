@@ -433,6 +433,24 @@ pub fn extract_pose_window(
     detector: &mut detect::Detector,
     pose: &mut PoseEstimator,
 ) -> Result<PoseWindow, String> {
+    extract_pose_window_k(path, start_ms, dur_ms, fps, src_w, src_h, MAX_PLAYERS, detector, pose)
+}
+
+/// [`extract_pose_window`] keeping the `max_players` highest-scored person boxes per
+/// frame instead of [`MAX_PLAYERS`] (the `pose-dump` CLI keeps a few more so a
+/// downstream model can see spectators and other courts, and pick the players itself).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_pose_window_k(
+    path: &str,
+    start_ms: i64,
+    dur_ms: i64,
+    fps: u32,
+    src_w: u32,
+    src_h: u32,
+    max_players: usize,
+    detector: &mut detect::Detector,
+    pose: &mut PoseEstimator,
+) -> Result<PoseWindow, String> {
     // The pose pass decodes at *source* resolution (unlike detection, which lets
     // ffmpeg letterbox to a fixed square), so it needs the true decoded frame size.
     // `src_w`/`src_h` come from the caller's once-per-recording
@@ -473,7 +491,7 @@ pub fn extract_pose_window(
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            boxes.truncate(MAX_PLAYERS);
+            boxes.truncate(max_players);
 
             let mut players = Vec::with_capacity(boxes.len());
             for bbox in boxes {
@@ -503,6 +521,51 @@ pub fn extract_pose_window(
         fps: f64::from(fps),
         frames,
     })
+}
+
+/// Run the `pose-dump` dev CLI (issue #105): the app's own detector + pose model over
+/// a **whole** recording, written as one [`PoseWindow`] JSON — the teacher's pose
+/// features must come from the stack the app ships, not an offline stand-in.
+///
+/// Usage: `pose-dump --file PATH --out FILE.json [--fps N] [--players K]`
+/// (defaults: 5 fps, 4 people per frame). Prints wall-clock vs real-time.
+pub fn dump_cli(args: Vec<String>) -> Result<(), String> {
+    let (mut file, mut out, mut fps, mut players) = (None, None, 5u32, 4usize);
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let mut val = |name: &str| it.next().ok_or(format!("{name} needs a value"));
+        match a.as_str() {
+            "--file" => file = Some(val("--file")?),
+            "--out" => out = Some(val("--out")?),
+            "--fps" => fps = val("--fps")?.parse().map_err(|e| format!("--fps: {e}"))?,
+            "--players" => players = val("--players")?.parse().map_err(|e| format!("--players: {e}"))?,
+            "-h" | "--help" => {
+                println!("pose-dump --file PATH --out FILE.json [--fps N] [--players K]");
+                return Ok(());
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let file = file.ok_or("--file is required")?;
+    let out = out.ok_or("--out is required")?;
+    let (w, h) = probe_source_dimensions(&file).ok_or("could not probe the source frame size")?;
+    let mut detector = detect::Detector::load(&detect::vendored_model_path()?)?;
+    let mut pose = PoseEstimator::load(&vendored_pose_model_path()?)?;
+    let started = std::time::Instant::now();
+    // A day-long window: ffmpeg's `-t` stops at end of file.
+    let win = extract_pose_window_k(&file, 0, 86_400_000, fps, w, h, players, &mut detector, &mut pose)?;
+    let wall = started.elapsed().as_secs_f64();
+    let footage = win.frames.len() as f64 / f64::from(fps);
+    let tmp = format!("{out}.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&win).map_err(|e| e.to_string())?)
+        .and_then(|()| std::fs::rename(&tmp, &out))
+        .map_err(|e| format!("{out}: {e}"))?;
+    println!(
+        "{} frames ({footage:.0} s) in {wall:.0} s = {:.1}x real-time, {w}x{h} -> {out}",
+        win.frames.len(),
+        footage / wall.max(1e-9)
+    );
+    Ok(())
 }
 
 #[cfg(test)]
