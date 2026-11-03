@@ -79,6 +79,9 @@ POST = {"smooth": 5, "merge_ms": 3000, "min_ms": 1500}
 # precision 0.963, recall >= 3 s 0.905, edges <= 1 s 80 % (v6: 0.755 / 1.00 / 36 %).
 # DECLARED 2026-11-04, before any test gold existed: eval/models/silver-ctx-v3.json; its
 # test-set predictions are frozen in eval/test/gate2/v3/.
+# Gate v2 result (three test recordings, 146 rallies; Pixel dropped before scoring): GREEN —
+# span precision 0.992 (1.7 invented/h), recall >= 3 s 0.971, edges <= 1 s 87 %, above v6
+# (0.757, 56.2/h). Short rallies found 20/42. Test gold was verified from v3's drafts.
 VIDEO_EXT = {".mov", ".mp4", ".mkv", ".m4v"}
 
 
