@@ -292,7 +292,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             .filter
             .as_deref()
             .ok_or("--export-gold needs a RECORDING filter (exports are per recording, on purpose)")?;
-        return export_gold(&conn, &kind, filter, &gold_dir);
+        return export_gold(&conn, &kind, filter, &gold_dir, opts.allow_unconfirmed);
     }
     if let Some(dir) = &opts.import_draft {
         let filter = opts
@@ -406,11 +406,18 @@ fn library_recordings(conn: &Connection, kind: &str) -> rusqlite::Result<Vec<Rec
 /// writing its *current DB timeline* to a gold file in `gold_dir`. This is the only
 /// way a timeline becomes gold, so run it only after checking the whole recording —
 /// gaps included, since review skips them and a missed rally hides there.
+///
+/// Every rally must be **confirmed** (at [`db::CORRECTED_CONFIDENCE`], which any
+/// hand edit sets) — a leftover machine rally means the check missed it, so the
+/// whole export is refused before anything is written, naming each such rally.
+/// `allow_unconfirmed` overrides that for a recording whose rallies were checked
+/// but left unedited.
 fn export_gold(
     conn: &Connection,
     kind: &str,
     filter: &str,
     gold_dir: &Path,
+    allow_unconfirmed: bool,
 ) -> Result<(), String> {
     let rows: Vec<RecordingRow> = library_recordings(conn, kind)
         .map_err(|e| e.to_string())?
@@ -424,19 +431,32 @@ fn export_gold(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let mut files = Vec::new();
+    let mut unconfirmed = Vec::new();
     for r in rows {
         if r.segment_state != "ready" {
             println!("SKIP  {}  (not segmented: {})", r.rel_path, r.segment_state);
             continue;
         }
         let mut stmt = conn
-            .prepare("SELECT start_ms, end_ms FROM rallies WHERE recording_id = ?1 ORDER BY start_ms")
+            .prepare("SELECT start_ms, end_ms, confidence FROM rallies WHERE recording_id = ?1 ORDER BY start_ms")
             .map_err(|e| e.to_string())?;
-        let rallies = stmt
-            .query_map([r.id], |row| Ok([row.get::<_, i64>(0)?, row.get::<_, i64>(1)?]))
+        let timeline = stmt
+            .query_map([r.id], |row| Ok(([row.get::<_, i64>(0)?, row.get::<_, i64>(1)?], row.get::<_, f64>(2)?)))
             .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
             .map_err(|e| e.to_string())?;
-        let file = gold::GoldFile {
+        for ([s, e], c) in &timeline {
+            if *c < db::CORRECTED_CONFIDENCE {
+                unconfirmed.push(format!(
+                    "  {}  {:.1}–{:.1} s (confidence {c:.2})",
+                    r.rel_path,
+                    *s as f64 / 1000.0,
+                    *e as f64 / 1000.0
+                ));
+            }
+        }
+        let rallies = timeline.into_iter().map(|(iv, _)| iv).collect();
+        files.push(gold::GoldFile {
             format: gold::FORMAT,
             recording: r.rel_path.clone(),
             file_size: r.file_size,
@@ -444,9 +464,20 @@ fn export_gold(
             duration_ms: r.duration_ms,
             verified_unix: now,
             rallies,
-        };
-        let path = gold::save(gold_dir, &file).map_err(|e| format!("{}: {e}", r.rel_path))?;
-        println!("GOLD  {}  ({} rallies) → {}", r.rel_path, file.rallies.len(), path.display());
+        });
+    }
+    if !unconfirmed.is_empty() && !allow_unconfirmed {
+        return Err(format!(
+            "nothing exported: {} rall{} never confirmed by hand — check each, then export again \
+             (or pass --allow-unconfirmed if they were checked and are right as they stand):\n{}",
+            unconfirmed.len(),
+            if unconfirmed.len() == 1 { "y was" } else { "ies were" },
+            unconfirmed.join("\n")
+        ));
+    }
+    for file in files {
+        let path = gold::save(gold_dir, &file).map_err(|e| format!("{}: {e}", file.recording))?;
+        println!("GOLD  {}  ({} rallies) → {}", file.recording, file.rallies.len(), path.display());
     }
     Ok(())
 }
@@ -3653,6 +3684,7 @@ struct Options {
     scratch: Option<String>,
     gold: Option<String>,
     export_gold: bool,
+    allow_unconfirmed: bool,
     dump_draft: Option<String>,
     import_draft: Option<String>,
     root: Option<String>,
@@ -3678,6 +3710,7 @@ impl Options {
             scratch: None,
             gold: None,
             export_gold: false,
+            allow_unconfirmed: false,
             dump_draft: None,
             import_draft: None,
             root: None,
@@ -3696,6 +3729,7 @@ impl Options {
                 "--spans" => opts.spans = true,
                 "--serve" => opts.serve = true,
                 "--export-gold" => opts.export_gold = true,
+                "--allow-unconfirmed" => opts.allow_unconfirmed = true,
                 "--dump-draft" => {
                     opts.dump_draft = Some(it.next().ok_or("--dump-draft needs an output directory")?.clone());
                 }
@@ -3756,6 +3790,7 @@ fn print_usage() {
          --gold DIR             gold-file dir (default: <repo>/eval/gold)\n    \
          --export-gold          write the matching recordings' current DB timelines as gold\n    \
                                 files — run only once the whole recording is verified\n    \
+         --allow-unconfirmed    export even if some rallies were never hand-confirmed\n    \
          --import-draft DIR     replace the matching recordings' DB timelines with the\n    \
                                 same-identity timeline in DIR (silver/draft JSON) — the\n    \
                                 starting point for verifying a recording into gold\n    \
@@ -3860,6 +3895,39 @@ mod tests {
         import_draft(&mut conn, "local", "IMG_2", &src).unwrap();
         assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
         assert!(import_draft(&mut conn, "local", "NOPE", &src).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_gold_refuses_a_timeline_with_an_unconfirmed_rally() {
+        let dir = std::env::temp_dir().join(format!("voloph-export-gold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::open(&dir.join("t.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, capture_day, library) VALUES (1, '2026-06-21', 'local');
+             INSERT INTO recordings (id, session_id, path, library, file_size, quick_hash, capture_day,
+                                     segment_state, duration_ms)
+               VALUES (1, 1, 'a/IMG_1.MOV', 'local', 100, 'aaaa', '2026-06-21', 'ready', 60000),
+                      (2, 1, 'a/IMG_2.MOV', 'local', 200, 'bbbb', '2026-06-21', 'ready', 60000);
+             INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
+               VALUES (1, 0, 1000, 1.0), (1, 59500, 60000, 0.64), (2, 0, 1000, 1.0);",
+        )
+        .unwrap();
+        let gold_dir = dir.join("gold");
+        let written = || std::fs::read_dir(&gold_dir).map(|d| d.count()).unwrap_or(0);
+        // A leftover machine rally (never confirmed by hand) blocks the export, and the
+        // error names it so it can be found and checked.
+        let err = export_gold(&conn, "local", "IMG_", &gold_dir, false).unwrap_err();
+        assert!(err.contains("IMG_1") && err.contains("59.5"), "{err}");
+        // Nothing is written, not even the fully confirmed recording in the same run.
+        assert_eq!(written(), 0);
+        // A fully confirmed recording exports on its own.
+        export_gold(&conn, "local", "IMG_2", &gold_dir, false).unwrap();
+        assert_eq!(written(), 1);
+        // The override writes the timeline as it stands.
+        export_gold(&conn, "local", "IMG_1", &gold_dir, true).unwrap();
+        assert_eq!(written(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
