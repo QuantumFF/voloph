@@ -311,8 +311,46 @@ def fit(X, Y):
 
 
 def prob(model: dict, X: np.ndarray) -> np.ndarray:
-    z = ((X - np.array(model["mu"])) / np.array(model["sd"])) @ np.array(model["coef"]) + model["intercept"]
+    """P(rally) from a saved model: logistic regression ("coef") or a boosted tree
+    ensemble ("trees", see export_trees) — both plain JSON, so the app can evaluate them."""
+    if "trees" in model:
+        z = model["baseline"] + _trees_raw(model["trees"], X)
+    else:
+        z = ((X - np.array(model["mu"])) / np.array(model["sd"])) @ np.array(model["coef"]) + model["intercept"]
     return 1 / (1 + np.exp(-z))
+
+
+def _trees_raw(trees: list, X: np.ndarray) -> np.ndarray:
+    """Sum of leaf values over the ensemble. A node sends a row left when its feature is
+    <= the threshold (NaN follows `missing_left`), exactly like scikit-learn's HGB."""
+    out = np.zeros(len(X))
+    rows = np.arange(len(X))
+    for t in trees:
+        feat, thr = np.asarray(t["feature"]), np.asarray(t["threshold"])
+        left, right = np.asarray(t["left"]), np.asarray(t["right"])
+        leaf, val, mleft = np.asarray(t["leaf"]), np.asarray(t["value"]), np.asarray(t["missing_left"])
+        node = np.zeros(len(X), int)
+        while True:
+            active = ~leaf[node]
+            if not active.any():
+                break
+            x = X[rows, feat[node]]
+            go_left = np.where(np.isnan(x), mleft[node], x <= thr[node])
+            node = np.where(active, np.where(go_left, left[node], right[node]), node)
+        out += val[node]
+    return out
+
+
+def export_trees(clf) -> dict:
+    """A fitted HistGradientBoostingClassifier (binary) as plain JSON for prob()."""
+    trees = []
+    for (pred,) in clf._predictors:
+        nd = pred.nodes
+        trees.append({"feature": nd["feature_idx"].tolist(), "threshold": nd["num_threshold"].tolist(),
+                      "left": nd["left"].tolist(), "right": nd["right"].tolist(),
+                      "leaf": nd["is_leaf"].astype(bool).tolist(), "value": nd["value"].tolist(),
+                      "missing_left": nd["missing_go_to_left"].astype(bool).tolist()})
+    return {"baseline": float(np.ravel(clf._baseline_prediction)[0]), "trees": trees}
 
 
 def cmd_cv(a) -> None:
