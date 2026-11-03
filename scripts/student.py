@@ -12,6 +12,11 @@ plain JSON the app can evaluate.
 
 `dev` is leave-one-gold-recording-out over the dev gold files, scored with the gate-v2
 measures; the --holdout test recordings never reach training or development (#100).
+
+Student v1 (eval/models/student-v1.json, threshold 0.5), declared before scoring: dev
+0.980 / 0.905 / 79 %; gate v2 test (three recordings, 146 rallies): GREEN — span precision
+0.991 (1.7 invented/h), recall >= 3 s 0.962, edges <= 1 s 81.5 % (teacher v3: 0.992 / 0.971
+/ 87 %; v6: 0.757 / 0.990 / 32 %).
 """
 
 import argparse
