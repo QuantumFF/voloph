@@ -15,11 +15,11 @@
    "recording": "IMG_0045.MOV",
    "file_size": 1272601291,
    "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca"
-  },
-  {
-   "recording": "PXL_20260615_071725666.TS-006.mp4",
-   "file_size": 2982145755,
-   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31"
   }
- ]
+ ],
+ "dropped": {
+  "recording": "PXL_20260615_071725666.TS-006.mp4",
+  "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+  "why": "Owner's call on 2026-11-04 to save verification time, made before any test score was computed. It stays out of v3's training (v3 was trained with it held out); it is no longer scored."
+ }
 }
