@@ -1,0 +1,1210 @@
+{
+ "format": 1,
+ "question": "Is a rally (serve to point decided) in progress at the final frame? Warm-up/knock-up hitting is NOT a rally.",
+ "seed": 3,
+ "footage_hours": 4.43,
+ "label_order": [
+  76,
+  100,
+  137,
+  49,
+  11,
+  132,
+  13,
+  41,
+  9,
+  94,
+  139,
+  18,
+  54,
+  116,
+  98,
+  110,
+  62,
+  119,
+  74,
+  114,
+  70,
+  23,
+  35,
+  90,
+  83,
+  32,
+  77,
+  97,
+  45,
+  148,
+  149,
+  142,
+  120,
+  105,
+  27,
+  42,
+  127,
+  39,
+  134,
+  47,
+  56,
+  118,
+  130,
+  40,
+  146,
+  122,
+  89,
+  17,
+  128,
+  10,
+  92,
+  60,
+  7,
+  12,
+  147,
+  22,
+  3,
+  50,
+  51,
+  102,
+  121,
+  133,
+  63,
+  16,
+  123,
+  14,
+  78,
+  111,
+  68,
+  67,
+  2,
+  136,
+  38,
+  64,
+  129,
+  141,
+  107,
+  1,
+  6,
+  73,
+  103,
+  109,
+  104,
+  99,
+  5,
+  31,
+  15,
+  93,
+  75,
+  135,
+  29,
+  143,
+  138,
+  36,
+  124,
+  84,
+  96,
+  58,
+  95,
+  144,
+  28,
+  91,
+  131,
+  140,
+  65,
+  79,
+  106,
+  61,
+  0,
+  25,
+  19,
+  113,
+  4,
+  52,
+  72,
+  117,
+  125,
+  126,
+  81,
+  44,
+  59,
+  34,
+  108,
+  101,
+  66,
+  37,
+  53,
+  33,
+  88,
+  21,
+  87,
+  71,
+  46,
+  80,
+  48,
+  8,
+  30,
+  145,
+  69,
+  115,
+  55,
+  86,
+  20,
+  43,
+  112,
+  57,
+  85,
+  82,
+  26,
+  24
+ ],
+ "moments": [
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 186132,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 213174,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 322018,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 355685,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 430601,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 495269,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 501055,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 675873,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 703606,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 715466,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 954821,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 962667,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 1008256,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 1017281,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 1040954,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 1221840,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 171779,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 313053,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 921935,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 223547,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 225902,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 311802,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 420896,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 804974,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 962915,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 1180135,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 71498,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 159253,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 345692,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 397935,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 403137,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 414686,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 611148,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 741284,
+   "label": null
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 1146053,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 114073,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 217034,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 226871,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 227830,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 230688,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 363523,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 369003,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 410960,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 429296,
+   "label": null
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 527231,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 69931,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 385423,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 411769,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 591647,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 673837,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 686503,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 800411,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 810353,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 938044,
+   "label": null
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 1081862,
+   "label": null
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 163001,
+   "label": null
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 202930,
+   "label": null
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 278000,
+   "label": null
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 530649,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 6189,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 20852,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 154585,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 339411,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 404189,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 496527,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 559970,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 599265,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 656243,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 1115770,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 1141166,
+   "label": null
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 1144584,
+   "label": null
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 189873,
+   "label": null
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 206541,
+   "label": null
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 239012,
+   "label": null
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 571762,
+   "label": null
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 638180,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 130363,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 286027,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 288406,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 355980,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 457678,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 525445,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 538445,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 633702,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 658559,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 705190,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 705644,
+   "label": null
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 770661,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 31026,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 134530,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 198800,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 218805,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 287230,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 375669,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 390340,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 401293,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 477800,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 520171,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 586687,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 662896,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1095827,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1098007,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1170869,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1222424,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1265121,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1659845,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 64220,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 69160,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 137313,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 143375,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 166888,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 401842,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 447074,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 497941,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 766355,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 933325,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 988365,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 1436110,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 1441065,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 1486894,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 252686,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 329416,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 345346,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 605776,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 644636,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 711619,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 788921,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 824520,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 828729,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 903376,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 998954,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 999806,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 1032035,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 102208,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 221443,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 229256,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 488568,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 612621,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 717612,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 797203,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1082371,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1155823,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1176808,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1190201,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1384925,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1429798,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1574772,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1593484,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1667079,
+   "label": null
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1712358,
+   "label": null
+  }
+ ]
+}

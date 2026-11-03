@@ -12,7 +12,7 @@ Recordings are identified the way the app and gold files do it, by
 (file size, quick hash) where quick hash = sha256(size as u64 LE + first 64 KiB), so
 labels survive moving the recordings.
 
-    rally-audit.py sample --root DIR [--n 150] [--seed 1]   # draw moments
+    rally-audit.py sample --root DIR [--n 150] [--seed 1] [--exclude-gold DIR]
     rally-audit.py label  --root DIR                        # label them (mpv)
     rally-audit.py score  --root DIR --pred DIR             # score a timeline set
     rally-audit.py status                                   # progress
@@ -117,6 +117,11 @@ def cmd_sample(a) -> None:
     if a.file.exists() and not a.force:
         sys.exit(f"{a.file} exists — labels would be lost. Pass --force to redraw.")
     recs = scan(a.root)
+    if a.exclude_gold:
+        # A gold recording already has dense truth and usually trained the model under
+        # test, so moments there would be in-sample.
+        gold = {json.loads(g.read_text())["quick_hash"] for g in a.exclude_gold.glob("*.gold.json")}
+        recs = [r for r in recs if r["quick_hash"] not in gold]
     if not recs:
         sys.exit(f"no videos under {a.root}")
     usable = [max(0.0, r["duration_s"] - 2 * EDGE_MARGIN_S) for r in recs]
@@ -433,6 +438,8 @@ def main() -> None:
     s.add_argument("--n", type=int, default=150)
     s.add_argument("--seed", type=int, default=1)
     s.add_argument("--force", action="store_true")
+    s.add_argument("--exclude-gold", type=Path, metavar="DIR",
+                   help="skip recordings that have a gold file in DIR")
     s = sub.add_parser("label")
     s.add_argument("--root", type=Path, required=True)
     s = sub.add_parser("score")
