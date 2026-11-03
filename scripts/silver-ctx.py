@@ -38,6 +38,10 @@ GAP_RUN = 45  # 1.5 s with no shuttle = "the shuttle is gone"
 GAP_CAP = 900  # look at most 30 s for a gap
 PAD = 8 * FPS  # covers the widest window and the gap search horizon per side
 C_REG = 0.3
+# Span post-processing saved into each trained model: moving average over `smooth`
+# steps, then threshold, then join spans less than `merge_ms` apart and drop spans
+# shorter than `min_ms`. Chosen on the four gold recordings (dense, leave-one-out).
+POST = {"smooth": 5, "merge_ms": 3000, "min_ms": 1500}
 # Dev result (seed-1 audit, leave-one-recording-out, 2026-11-03): AUC 0.95, but the best
 # threshold only reaches precision = recall = 0.72, and the learning curve is flat from
 # 56 to 141 training moments; adding v6's output as a feature moved it to 0.75. The
@@ -48,6 +52,19 @@ C_REG = 0.3
 # DECLARED 2026-11-03, before any seed-2 label existed: eval/models/silver-ctx-pose-v1.json,
 # shuttle + pose, trained on all of seed 1, threshold 0.40 (max min(P, R) in CV). It is
 # judged once, on the seed-2 audit; changing it afterwards needs a fresh audit.
+# Seed-2 result: precision 0.773 / recall 0.723 — RED (v6: 0.38 precision).
+#
+# v2 (2026-11-04): pose from the app's own YOLOX + RTMPose-t (teacher-pose-app.py), plus
+# the four hand-verified gold files. Dev, leave-one-recording-out (audits on the 14
+# non-gold recordings / gold samples on the 4 gold ones): shuttle only 0.700 / 0.644;
+# + R-CNN pose 0.771 / 0.714 with gold; + app pose 0.771 / 0.727, with gold 0.819 /
+# 0.741. Gold helps once it spans the four setups, but saturates (1→4 gold recordings:
+# 0.800→0.819); regularization, gradient boosting and wider windows are all within
+# noise. 69% of gold-sample errors sit within 1.5 s of a rally edge. Smoothing the
+# per-step probability (POST below) cuts spurious spans on gold from 31 to 8 at
+# rally-time precision 0.79 / recall 0.73 (0.86 / 0.84 ignoring ±1 s of each edge);
+# v6 on the same gold: 0.33 / 0.91, 34 spurious.
+# DECLARED 2026-11-04, before any seed-3 label existed: eval/models/silver-ctx-v2.json.
 VIDEO_EXT = {".mov", ".mp4", ".mkv", ".m4v"}
 
 
@@ -287,7 +304,7 @@ def cmd_cv(a) -> None:
 def cmd_train(a) -> None:
     X, Y, G = audit_xy(a.audit, a.tracks, a.pose, gold=a.gold)
     m = fit(X, Y)
-    m.update({"pose": a.pose is not None, "threshold": a.threshold,
+    m.update({"pose": a.pose is not None, "threshold": a.threshold, "post": POST,
               "trained_on": [str(x) for x in a.audit] + ([str(a.gold)] if a.gold else []), "n": int(len(Y)),
               "n_rally": int(Y.sum()), "step_frames": STEP})
     a.model.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +334,17 @@ def spans(on: np.ndarray, n_frames: int) -> list[list[int]]:
     return out
 
 
+def tidy(rallies: list[list[int]], merge_ms: int, min_ms: int) -> list[list[int]]:
+    """Join spans less than `merge_ms` apart, then drop those shorter than `min_ms`."""
+    out: list[list[int]] = []
+    for s0, e0 in rallies:
+        if out and s0 - out[-1][1] < merge_ms:
+            out[-1][1] = e0
+        else:
+            out.append([s0, e0])
+    return [r for r in out if r[1] - r[0] >= min_ms]
+
+
 def cmd_predict(a) -> None:
     model = json.loads(a.model.read_text())
     ident = {}
@@ -342,7 +370,10 @@ def cmd_predict(a) -> None:
             continue
         X = all_features(tr, steps, pidx[h] if model.get("pose") else None)
         pr = prob(model, X)
-        rallies = spans(pr >= model["threshold"], n)
+        post = model.get("post", {})
+        if post.get("smooth", 1) > 1:
+            pr = np.convolve(pr, np.ones(post["smooth"]) / post["smooth"], "same")
+        rallies = tidy(spans(pr >= model["threshold"], n), post.get("merge_ms", 0), post.get("min_ms", 0))
         # Per-rally confidence for the app's review (amber below 0.5 = "check this"):
         # the mean model probability over the rally, rescaled so the threshold maps
         # to 0.5 — a rally the model only just called reads as uncertain.
@@ -356,7 +387,7 @@ def cmd_predict(a) -> None:
                "duration_ms": round(n * 1000 / FPS), "verified_unix": 0, "rallies": rallies,
                "confidence": conf,
                "source": {"teacher": "TrackNetV3", "rule": "silver-ctx", "model": str(a.model),
-                          "threshold": model["threshold"]}}
+                          "threshold": model["threshold"], "post": model.get("post", {})}}
         out = a.out / f"{Path(rel).name}.{qh[:12]}.silver.json"
         out.write_text(json.dumps(doc, indent=1) + "\n")
         print(f"SILVER {rel}  {len(rallies)} spans → {out}")
