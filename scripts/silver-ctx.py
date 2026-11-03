@@ -41,8 +41,13 @@ C_REG = 0.3
 # Dev result (seed-1 audit, leave-one-recording-out, 2026-11-03): AUC 0.95, but the best
 # threshold only reaches precision = recall = 0.72, and the learning curve is flat from
 # 56 to 141 training moments; adding v6's output as a feature moved it to 0.75. The
-# shuttle track alone caps out below the #100 gate (0.80 floor), so no threshold is
-# declared and no seed-2 score has been taken.
+# shuttle track alone caps out below the #100 gate (0.80 floor).
+#
+# With player features from teacher-pose.py (--pose) the same CV reaches precision
+# 0.871 / recall 0.844 at threshold 0.40 (player features alone: 0.53).
+# DECLARED 2026-11-03, before any seed-2 label existed: eval/models/silver-ctx-pose-v1.json,
+# shuttle + pose, trained on all of seed 1, threshold 0.40 (max min(P, R) in CV). It is
+# judged once, on the seed-2 audit; changing it afterwards needs a fresh audit.
 VIDEO_EXT = {".mov", ".mp4", ".mkv", ".m4v"}
 
 
@@ -136,13 +141,82 @@ def features(tr: dict, frames: np.ndarray) -> np.ndarray:
     return np.stack(cols, 1)
 
 
+PERSON_MIN = 0.7  # pose teacher: people counted
+MOVE_STILL = 0.3  # body-heights/s below which a player is "standing still"
+# COCO keypoints: 5/6 shoulders, 9/10 wrists.
+L_SH, R_SH, L_WR, R_WR = 5, 6, 9, 10
+
+
+def load_pose(npz: Path) -> dict:
+    """Per pose frame: speeds of each matched person (body-heights/s), arm-raised
+    flag, people count. People are matched frame to frame by nearest box centre."""
+    d = np.load(npz)
+    fps = int(d["fps"])
+    boxes, scores, kps = d["boxes"], d["scores"], d["kps"]
+    F, K = scores.shape
+    ok = scores >= PERSON_MIN
+    cx = (boxes[..., 0] + boxes[..., 2]) / 2
+    cy = (boxes[..., 1] + boxes[..., 3]) / 2
+    bh = np.maximum(boxes[..., 3] - boxes[..., 1], 1)
+    speed = np.full((F, K), np.nan)
+    for f in range(1, F):
+        prev = np.where(ok[f - 1])[0]
+        if not len(prev):
+            continue
+        for k in np.where(ok[f])[0]:
+            dist = np.hypot(cx[f - 1, prev] - cx[f, k], cy[f - 1, prev] - cy[f, k])
+            j = prev[np.argmin(dist)]
+            speed[f, k] = dist.min() / ((bh[f, k] + bh[f - 1, j]) / 2) * fps
+    wr_y = np.minimum(kps[..., L_WR, 1], kps[..., R_WR, 1])
+    sh_y = np.minimum(kps[..., L_SH, 1], kps[..., R_SH, 1])
+    raised = ok & (wr_y < sh_y)
+    with np.errstate(all="ignore"):
+        import warnings
+        warnings.simplefilter("ignore", RuntimeWarning)
+        srt = -np.sort(-np.nan_to_num(speed, nan=-1), axis=1)  # fastest first
+        fast1 = np.where(srt[:, 0] >= 0, srt[:, 0], 0)
+        fast2 = np.where(srt[:, 1] >= 0, srt[:, 1], 0)
+        slow = np.nanmin(np.where(ok, speed, np.nan), axis=1)
+    return {"fps": fps, "n": ok.sum(1).astype(float), "fast1": fast1, "fast2": fast2,
+            "still": np.nan_to_num(slow, nan=1.0) < MOVE_STILL, "raised": raised.any(1).astype(float)}
+
+
+def pose_features(po: dict, t_ms: np.ndarray) -> np.ndarray:
+    fps = po["fps"]
+    pad = 8 * fps
+    sw = np.lib.stride_tricks.sliding_window_view
+    P = {k: np.concatenate([np.zeros(pad), po[k].astype(float), np.zeros(pad)])
+         for k in ("n", "fast1", "fast2", "still", "raised")}
+    f = np.clip(t_ms * fps // 1000, 0, len(po["n"]) - 1) + pad
+    cols = []
+    for a, b in WINDOWS_S:
+        L = (b - a) * fps
+        s = f + a * fps
+        for k in ("n", "fast1", "fast2", "still", "raised"):
+            cols.append(sw(P[k], L)[s].mean(1))
+        cols.append(sw(P["fast1"], L)[s].max(1))
+    return np.stack(cols, 1)
+
+
+def pose_index(pose: Path | None) -> dict:
+    return {p.name.split(".")[-3]: p for p in pose.glob("*.pose.npz")} if pose else {}
+
+
+def all_features(tr: dict, frames: np.ndarray, pose_npz: Path | None, shuttle: bool = True) -> np.ndarray:
+    parts = [features(tr, frames)] if shuttle else []
+    if pose_npz is not None:
+        parts.append(pose_features(load_pose(pose_npz), frames * 1000 // FPS))
+    return np.hstack(parts)
+
+
 def track_index(tracks: Path) -> dict:
     return {p.name.split(".")[-3]: p for p in tracks.glob("*.ball.csv")}
 
 
-def audit_xy(audit: Path, tracks: Path):
+def audit_xy(audit: Path, tracks: Path, pose: Path | None = None, shuttle: bool = True):
     moms = json.loads(audit.read_text())["moments"]
     idx = track_index(tracks)
+    pidx = pose_index(pose)
     by_rec: dict[str, list] = {}
     for m in moms:
         if m.get("label") in ("rally", "no_rally"):
@@ -151,7 +225,9 @@ def audit_xy(audit: Path, tracks: Path):
     for h, ms in by_rec.items():
         tr = load_track(idx[h])
         fr = np.array([m["t_ms"] * FPS // 1000 for m in ms])
-        X.append(features(tr, fr))
+        if pose is not None and h not in pidx:
+            raise SystemExit(f"no pose file for {ms[0]['recording']} in {pose}")
+        X.append(all_features(tr, fr, pidx.get(h), shuttle))
         Y += [m["label"] == "rally" for m in ms]
         G += [h] * len(ms)
     return np.vstack(X), np.array(Y), np.array(G)
@@ -172,7 +248,7 @@ def prob(model: dict, X: np.ndarray) -> np.ndarray:
 
 
 def cmd_cv(a) -> None:
-    X, Y, G = audit_xy(a.audit, a.tracks)
+    X, Y, G = audit_xy(a.audit, a.tracks, a.pose, not a.no_shuttle)
     p = np.zeros(len(Y))
     for g in sorted(set(G)):
         tr = G != g
@@ -190,9 +266,9 @@ def cmd_cv(a) -> None:
 
 
 def cmd_train(a) -> None:
-    X, Y, G = audit_xy(a.audit, a.tracks)
+    X, Y, G = audit_xy(a.audit, a.tracks, a.pose)
     m = fit(X, Y)
-    m.update({"threshold": a.threshold, "trained_on": str(a.audit), "n": int(len(Y)),
+    m.update({"pose": a.pose is not None, "threshold": a.threshold, "trained_on": str(a.audit), "n": int(len(Y)),
               "n_rally": int(Y.sum()), "step_frames": STEP})
     a.model.parent.mkdir(parents=True, exist_ok=True)
     a.model.write_text(json.dumps(m, indent=1) + "\n")
@@ -229,6 +305,9 @@ def cmd_predict(a) -> None:
             size = v.stat().st_size
             qh = quick_hash(v, size)
             ident[qh[:12]] = (str(v.relative_to(a.root)), size, qh)
+    pidx = pose_index(a.pose)
+    if model.get("pose") and a.pose is None:
+        raise SystemExit("this model uses pose features: pass --pose DIR")
     a.out.mkdir(parents=True, exist_ok=True)
     for h, csv_path in sorted(track_index(a.tracks).items()):
         if h not in ident:
@@ -238,7 +317,11 @@ def cmd_predict(a) -> None:
         tr = load_track(csv_path)
         n = len(tr["det"])
         steps = np.arange(0, n, STEP)
-        on = prob(model, features(tr, steps)) >= model["threshold"]
+        if model.get("pose") and h not in pidx:
+            print(f"skip  {rel} (no pose file)")
+            continue
+        X = all_features(tr, steps, pidx[h] if model.get("pose") else None)
+        on = prob(model, X) >= model["threshold"]
         rallies = spans(on, n)
         doc = {"format": 1, "recording": rel, "file_size": size, "quick_hash": qh,
                "duration_ms": round(n * 1000 / FPS), "verified_unix": 0, "rallies": rallies,
@@ -255,15 +338,19 @@ def main() -> None:
     s = sub.add_parser("cv")
     s.add_argument("--audit", type=Path, required=True)
     s.add_argument("--tracks", type=Path, required=True)
+    s.add_argument("--pose", type=Path, help="teacher-pose.py output: add player features")
+    s.add_argument("--no-shuttle", action="store_true", help="player features only (diagnostic)")
     s = sub.add_parser("train")
     s.add_argument("--audit", type=Path, required=True)
     s.add_argument("--tracks", type=Path, required=True)
+    s.add_argument("--pose", type=Path)
     s.add_argument("--model", type=Path, required=True)
     s.add_argument("--threshold", type=float, required=True)
     s = sub.add_parser("predict")
     s.add_argument("--tracks", type=Path, required=True)
     s.add_argument("--root", type=Path, required=True)
     s.add_argument("--model", type=Path, required=True)
+    s.add_argument("--pose", type=Path)
     s.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
     {"cv": cmd_cv, "train": cmd_train, "predict": cmd_predict}[a.cmd](a)
