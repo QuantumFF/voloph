@@ -74,3 +74,52 @@ the v6 build clears the kill criterion.
 To re-vendor: `scripts/fetch-pose-model.sh` downloads the bundle, verifies the
 bundle SHA, extracts `end2end.onnx` to `models/rtmpose_t.onnx`, and verifies its
 SHA. Keep this README and `LICENSE-rtmpose` in sync with any new weights.
+
+## `tracknet_v3.onnx` and `inpaintnet_v3.onnx` (ADR 0019, issue #105)
+
+The **teacher** rally segmenter (ADR 0019) starts from a per-frame shuttlecock
+track: TrackNetV3's two networks, run by `src/tracknet.rs` exactly as TrackNetV3's
+own `predict.py --eval_mode nonoverlap` runs them offline
+(`scripts/teacher-tracknet.py`).
+
+- **Models:** TrackNetV3 (Chen & Wang, "TrackNetV3: Enhancing ShuttleCock Tracking
+  with Augmentations and Trajectory Rectification", 2023). *TrackNet* is a U-Net
+  heatmap tracker (~11.3M params, `seq_len 8`, `bg_mode 'concat'`); *InpaintNet* a
+  small 1-D conv net (`seq_len 16`) that fills gaps in the predicted trajectory.
+- **License:** **MIT** — see `LICENSE-tracknetv3` in this directory (verbatim copy
+  of the TrackNetV3 repository's LICENSE, which explicitly covers the *pretrained
+  model checkpoints*).
+- **Source project:** https://github.com/qaz812345/TrackNetV3, commit `6eda442`
+  (`6eda442ada1740573f200f836d93edc9a541ee86`).
+- **Checkpoints:** `ckpts/TrackNet_best.pt` (SHA-256
+  `df867641a02712b021f04548ff4b1208ddfdb47f629ab2094ceb978667e83b1a`) and
+  `ckpts/InpaintNet_best.pt` (SHA-256
+  `5749b66b8002f3ad9e0af841604004706fc796df30599e6bf01952696009688c`), from the
+  checkpoint zip linked in the project README.
+- **Export:** `scripts/export-tracknet-onnx.py` (torch 2.11, legacy TorchScript
+  exporter, opset 17, dynamic batch); it checks each file with ONNX Runtime against
+  torch on random input (max abs difference ~1e-6).
+- **`tracknet_v3.onnx` SHA-256:** `dd80c50e3c2d068ef507925a78ec7e5fe5409a3324d93530b69781e243fae1e7`
+- **`inpaintnet_v3.onnx` SHA-256:** `40aa41beaf3d15aed95ea31673f540db28f210a1828d8e221384a285ff8283ee`
+
+### Input / output contract (implemented in `src/tracknet.rs`)
+
+- **TrackNet input `x`:** `N x 27 x 288 x 512` float32 (NCHW). 27 channels = the
+  background frame then 8 consecutive frames, **RGB** each, in that order
+  (`[bg_R, bg_G, bg_B, f0_R, f0_G, f0_B, …, f7_B]`), every value `u8 / 255`
+  (no mean/std). The background is the per-pixel median of every frame in the
+  120 s chunk, truncated to `u8`. Frames are the recording at 30 fps scaled to
+  512x288.
+- **TrackNet output `y`:** `N x 8 x 288 x 512` float32 sigmoid heatmaps, one per
+  input frame. A frame's point is the centre of the bounding box of the largest
+  (by box area) 8-connected blob of `y > 0.5`, or "not visible" when none.
+- **InpaintNet inputs:** `x` `N x 16 x 2` float32 — 16 consecutive points as
+  `(x / 512, y / 288)` (an invisible frame is `(0, 0)`); `m` `N x 16 x 1` float32 —
+  1 for frames to inpaint (TrackNetV3's `generate_inpaint_mask`), else 0.
+- **InpaintNet output `y`:** `N x 16 x 2` float32 sigmoid coordinates in the same
+  normalization. Used only where `m = 1`; a point under `COOR_TH` (≈ 0.0851) on
+  both axes means "not visible".
+
+To re-vendor: run `scripts/export-tracknet-onnx.py --tracknet <checkout>` with a
+python that has torch, onnx and onnxruntime, record the new SHA-256s here, and
+keep `LICENSE-tracknetv3` in sync.

@@ -22,6 +22,9 @@ mod learned;
 mod student;
 /// The learned teacher segmenter (issue #105): TrackNet shuttle track + player pose.
 mod teacher;
+/// TrackNetV3 shuttle tracking (ADR 0019, issue #105): the teacher segmenter's
+/// first stage. Public so the `tracknet-dump` dev CLI can drive it.
+pub mod tracknet;
 
 // Embedded libmpv playback (ADR 0008, ADR 0014). Linux and Windows — it links
 // libmpv and drives the platform's native surface (GTK overlay / child HWND)
