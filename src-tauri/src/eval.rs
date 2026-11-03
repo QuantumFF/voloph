@@ -231,6 +231,61 @@ struct CorpusRecording {
     has_gold: bool,
 }
 
+/// The `signals-dump` dev CLI (issue #105): the three cheap signals v6 already computes —
+/// motion energy, audio energy + hit onsets, and the person-detector boxes — for one
+/// whole recording, through the app's own extractors, as JSON. The student segmenter is
+/// trained on exactly these, so in the app it costs what v6 costs.
+///
+/// Usage: `signals-dump --file PATH --out FILE.json`
+pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
+    let (mut file, mut out) = (None, None);
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--file" => file = Some(it.next().ok_or("--file needs a path")?),
+            "--out" => out = Some(it.next().ok_or("--out needs a path")?),
+            "-h" | "--help" => {
+                println!("signals-dump --file PATH --out FILE.json");
+                return Ok(());
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let file = file.ok_or("--file is required")?;
+    let out = out.ok_or("--out is required")?;
+    let started = std::time::Instant::now();
+    let samples = media::extract_pcm(&file)?;
+    let audio = segment::audio_frames(
+        &samples,
+        media::SEGMENT_SAMPLE_RATE,
+        &segment::Params::default(),
+    );
+    let t_audio = started.elapsed().as_secs_f64();
+    let motion = media::extract_motion(&file, |_| {})?;
+    let t_motion = started.elapsed().as_secs_f64() - t_audio;
+    let detect = crate::detect::detections_or_none(&file, |e| eprintln!("detector: {e}"))
+        .ok_or("person detection failed")?;
+    let t_detect = started.elapsed().as_secs_f64() - t_audio - t_motion;
+    let footage = samples.len() as f64 / f64::from(media::SEGMENT_SAMPLE_RATE);
+    let doc = serde_json::json!({
+        "duration_ms": (footage * 1000.0).round() as i64,
+        "motion": {"fps": media::MOTION_FPS, "energy": motion},
+        "audio": audio,
+        "detect": detect,
+        "timing_s": {"audio": t_audio, "motion": t_motion, "detect": t_detect},
+    });
+    let tmp = format!("{out}.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
+        .and_then(|()| std::fs::rename(&tmp, &out))
+        .map_err(|e| format!("{out}: {e}"))?;
+    println!(
+        "{footage:.0} s footage: audio {t_audio:.0} s, motion {t_motion:.0} s, detect {t_detect:.0} s \
+         = {:.1}x real-time -> {out}",
+        footage / started.elapsed().as_secs_f64().max(1e-9)
+    );
+    Ok(())
+}
+
 /// Run the eval harness. `args` is the process arguments **after** the program name.
 ///
 /// Usage: `eval-harness [--db PATH] [--library local|shared] [--sweep] [RECORDING]`
