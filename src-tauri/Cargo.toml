@@ -39,6 +39,11 @@ name = "pose-dump"
 path = "src/bin/pose-dump.rs"
 required-features = ["dev-tools"]
 
+[[bin]]
+name = "signals-dump"
+path = "src/bin/signals-dump.rs"
+required-features = ["dev-tools"]
+
 # Gates the dev CLIs above. Tauri bundles every built binary into the installers,
 # so without the gate a release ships both dev tools (~47 MB) and links each with
 # full LTO. Run them with `--features dev-tools`.

@@ -569,6 +569,33 @@ fn block_grid(num_frames: usize, sample_rate: u32, p: &Params) -> BlockGrid {
 /// adaptive baseline and the absolute floor), then per-block onset counts on the
 /// [`BlockGrid`]. Returns the counts with the grid they index.
 fn onset_block_counts(samples: &[f32], sample_rate: u32, p: &Params) -> (Vec<usize>, BlockGrid) {
+    let AudioFrames { energy, onset, .. } = audio_frames(samples, sample_rate, p);
+
+    // 3. Block grid (from the audio frames). Per block, count onsets.
+    let grid = block_grid(energy.len(), sample_rate, p);
+    let block_onsets: Vec<usize> = onset
+        .chunks(grid.frames_per_block)
+        .map(|chunk| chunk.iter().filter(|&&o| o).count())
+        .collect();
+    (block_onsets, grid)
+}
+
+/// The per-frame audio signals behind the onset counts — energy and onset flags on
+/// non-overlapping frames of [`Params::frame`] samples — exposed so a learned
+/// segmenter (the student, issue #105) can read exactly what v6 reads.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AudioFrames {
+    /// Length of one frame in ms.
+    pub frame_ms: f64,
+    /// Mean-square energy per frame.
+    pub energy: Vec<f64>,
+    /// Whether each frame is a hit onset (sharp rise over the adaptive baseline).
+    pub onset: Vec<bool>,
+}
+
+/// Steps 1–2 of the onset path, shared by [`onset_block_counts`]: per-frame energy,
+/// then per-frame onset flags.
+pub fn audio_frames(samples: &[f32], sample_rate: u32, p: &Params) -> AudioFrames {
     let sr = sample_rate as f64;
 
     // 1. Per-frame audio energy (mean square), non-overlapping frames.
@@ -604,14 +631,7 @@ fn onset_block_counts(samples: &[f32], sample_rate: u32, p: &Params) -> (Vec<usi
             window_sum -= energy[i - baseline_frames];
         }
     }
-
-    // 3. Block grid (from the audio frames). Per block, count onsets.
-    let grid = block_grid(energy.len(), sample_rate, p);
-    let block_onsets: Vec<usize> = onset
-        .chunks(grid.frames_per_block)
-        .map(|chunk| chunk.iter().filter(|&&o| o).count())
-        .collect();
-    (block_onsets, grid)
+    AudioFrames { frame_ms, energy, onset }
 }
 
 /// The per-block shuttle-hit **onset counts** behind the confidence modulator —
