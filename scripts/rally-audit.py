@@ -18,6 +18,9 @@ labels survive moving the recordings.
     rally-audit.py status                                   # progress
     rally-audit.py fix N  --root DIR                        # re-answer moment #N
     rally-audit.py list                                     # every answer, numbered
+    rally-audit.py recheck-draw N [N ...]                   # blind recheck: N's + random controls
+    rally-audit.py recheck --root DIR                       # answer it (originals hidden)
+    rally-audit.py recheck-report                           # what changed
     rally-audit.py reset                                    # clear labels, keep moments
 
 Labels live in eval/audit/moments.json (override with --file). `label` saves after
@@ -186,27 +189,36 @@ def play(path: Path, t: float, top: str, keyfile: str, env: dict) -> int:
             return code
 
 
-def cmd_label(a) -> None:
+def cmd_label(a, field: str = "label", order_key: str = "label_order") -> None:
     """Label unlabelled moments in label_order. Every moment has a fixed display
     number (#1..#N, its place in label_order). `b` steps back through earlier
-    answers (most recent first) to re-answer them; `fix N` re-asks just #N."""
+    answers (most recent first) to re-answer them; `fix N` re-asks just #N.
+
+    With field="recheck" it runs the blind recheck instead: only the moments in
+    recheck_order, answers stored separately, original answers never shown, and
+    clips numbered by recheck position so the #N can't jog memory."""
     data = load(a.file)
     env = gui_env()
     where = locate(a.root)
     moments = data["moments"]
-    order = data["label_order"]
-    num = {i: k + 1 for k, i in enumerate(order)}
+    order = data[order_key]
+    blind = field != "label"
+    seq_key = "seq" if not blind else f"{field}_seq"
+    if blind:
+        num = {i: k + 1 for k, i in enumerate(order)}
+    else:
+        num = {i: k + 1 for k, i in enumerate(data["label_order"])}
     # `seq` records the order answers were first given, so `b` walks back in time.
     # Labels from before seq existed were given in label_order, so number them so.
     for i in order:
-        if moments[i]["label"] is not None and "seq" not in moments[i]:
-            moments[i]["seq"] = num[i]
-    seq = max((m.get("seq", 0) for m in moments), default=0)
+        if moments[i].get(field) is not None and seq_key not in moments[i]:
+            moments[i][seq_key] = num[i]
+    seq = max((m.get(seq_key, 0) for m in moments), default=0)
 
     def answered_before(limit):
-        c = [i for i in order if moments[i]["label"] is not None
-             and (limit is None or moments[i]["seq"] < limit)]
-        return max(c, key=lambda i: moments[i]["seq"]) if c else None
+        c = [i for i in order if moments[i].get(field) is not None
+             and (limit is None or moments[i][seq_key] < limit)]
+        return max(c, key=lambda i: moments[i][seq_key]) if c else None
 
     fix_only = getattr(a, "fix", None)
     if fix_only is not None:
@@ -223,11 +235,11 @@ def cmd_label(a) -> None:
         keyfile = kf.name
     try:
         while True:
-            done = sum(m["label"] is not None for m in moments)
+            done = sum(moments[j].get(field) is not None for j in order)
             if revisit is not None:
                 i = revisit
             else:
-                todo = [i for i in order if moments[i]["label"] is None]
+                todo = [i for i in order if moments[i].get(field) is None]
                 if not todo:
                     print(f"all {done} moments labelled → {a.file}")
                     return
@@ -236,19 +248,20 @@ def cmd_label(a) -> None:
             path = where.get((m["file_size"], m["quick_hash"]))
             if path is None:
                 sys.exit(f"{m['recording']} not found under {a.root}")
-            top = f"#{num[i]}   ({done}/{len(moments)} done)   rally at the LAST frame?\n{HELP}"
+            tag = "recheck " if blind else "#"
+            top = f"{tag}{num[i]}   ({done}/{len(order)} done)   rally at the LAST frame?\n{HELP}"
             if revisit is not None:
-                top += f"\n>>> FIXING #{num[i]} — you answered {SHOW[m['label']] if m['label'] else 'nothing'}"
+                top += f"\n>>> FIXING {tag}{num[i]} — you answered {SHOW[m[field]] if m.get(field) else 'nothing'}"
             else:
                 prev = answered_before(None)
                 if prev is not None:
-                    top += f"\nprevious #{num[prev]}: {SHOW[moments[prev]['label']]}   (b = go back & fix)"
+                    top += f"\nprevious {tag}{num[prev]}: {SHOW[moments[prev][field]]}   (b = go back & fix)"
             code = play(path, m["t_ms"] / 1000, top, keyfile, env)
 
             if code == EXIT_BACK:
                 if fix_only is not None:
                     continue  # fixing one moment: b just replays it
-                limit = m.get("seq") if revisit is not None and m["label"] is not None else None
+                limit = m.get(seq_key) if revisit is not None and m.get(field) is not None else None
                 target = answered_before(limit)
                 if target is None:
                     print("  (nothing earlier to go back to)")
@@ -261,16 +274,19 @@ def cmd_label(a) -> None:
                     # (no display, bad file) and must not look like a clean stop.
                     print(f"mpv exited with code {code} without an answer "
                           "(window closed, or mpv failed — see any error above)")
-                print(f"stopped — {done}/{len(moments)} labelled, saved to {a.file}")
+                print(f"stopped — {done}/{len(order)} labelled, saved to {a.file}")
                 return
-            old = m["label"]
-            m["label"] = EXIT_LABEL[code]
-            if "seq" not in m:
+            old = m.get(field)
+            m[field] = EXIT_LABEL[code]
+            if seq_key not in m:
                 seq += 1
-                m["seq"] = seq
+                m[seq_key] = seq
             save(a.file, data)
-            change = f"   (was {old})" if old is not None and old != m["label"] else ""
-            print(f"  #{num[i]:<4} {m['recording']} @ {m['t_ms'] / 1000:7.1f}s  → {m['label']}{change}")
+            change = f"   (was {old})" if old is not None and old != m[field] else ""
+            if blind:  # don't print the recording/time: it could jog memory of #N
+                print(f"  recheck {num[i]:<3} → {m[field]}{change}")
+            else:
+                print(f"  #{num[i]:<4} {m['recording']} @ {m['t_ms'] / 1000:7.1f}s  → {m['label']}{change}")
             if fix_only is not None:
                 return
             revisit = None
@@ -280,6 +296,53 @@ def cmd_label(a) -> None:
 
 def cmd_fix(a) -> None:
     cmd_label(a)
+
+
+def cmd_recheck_draw(a) -> None:
+    """Set up a blind recheck: the given #numbers plus an equal number of random
+    controls from the other answered moments, shuffled together. Rechecking only
+    the moments a model disputes would bias every correction toward that model;
+    the controls measure how often answers change anyway."""
+    data = load(a.file)
+    order = data["label_order"]
+    if data.get("recheck_order") and not a.force:
+        sys.exit("a recheck is already set up — finish it (recheck) or pass --force to redraw")
+    picked = []
+    for n in a.numbers:
+        if not 1 <= n <= len(order):
+            sys.exit(f"#{n} is out of range 1..{len(order)}")
+        picked.append(order[n - 1])
+    rng = random.Random(a.seed)
+    pool = [i for i in order if i not in picked and data["moments"][i]["label"] is not None]
+    controls = rng.sample(pool, min(len(picked), len(pool)))
+    rorder = picked + controls
+    rng.shuffle(rorder)
+    for m in data["moments"]:
+        m.pop("recheck", None)
+        m.pop("recheck_seq", None)
+    data["recheck_order"] = rorder
+    data["recheck_disputed"] = picked
+    save(a.file, data)
+    print(f"recheck set up: {len(picked)} disputed + {len(controls)} controls, shuffled")
+
+
+def cmd_recheck(a) -> None:
+    cmd_label(a, field="recheck", order_key="recheck_order")
+
+
+def cmd_recheck_report(a) -> None:
+    data = load(a.file)
+    num = {i: k + 1 for k, i in enumerate(data["label_order"])}
+    disputed = set(data.get("recheck_disputed", []))
+    ms = data["moments"]
+    for name, group in (("disputed", [i for i in data["recheck_order"] if i in disputed]),
+                        ("controls", [i for i in data["recheck_order"] if i not in disputed])):
+        done = [i for i in group if ms[i].get("recheck") is not None]
+        flips = [i for i in done if ms[i]["recheck"] != ms[i]["label"]]
+        print(f"{name}: {len(flips)}/{len(done)} answers changed")
+        for i in flips:
+            print(f"  #{num[i]:<4} {ms[i]['label']} → {ms[i]['recheck']}   "
+                  f"{ms[i]['recording']} @ {ms[i]['t_ms'] / 1000:.1f}s")
 
 
 def cmd_list(a) -> None:
@@ -379,10 +442,18 @@ def main() -> None:
     s.add_argument("fix", type=int, metavar="NUMBER")
     s.add_argument("--root", type=Path, required=True)
     sub.add_parser("list", help="show every answer, numbered, in the order given")
+    s = sub.add_parser("recheck-draw", help="set up a blind recheck of #numbers + random controls")
+    s.add_argument("numbers", type=int, nargs="+")
+    s.add_argument("--seed", type=int, default=2)
+    s.add_argument("--force", action="store_true")
+    s = sub.add_parser("recheck", help="run the blind recheck (original answers hidden)")
+    s.add_argument("--root", type=Path, required=True)
+    sub.add_parser("recheck-report", help="which answers changed on recheck")
     sub.add_parser("status")
     sub.add_parser("reset", help="clear all labels, keep the moments")
     a = ap.parse_args()
     {"sample": cmd_sample, "label": cmd_label, "fix": cmd_fix, "list": cmd_list,
+     "recheck-draw": cmd_recheck_draw, "recheck": cmd_recheck, "recheck-report": cmd_recheck_report,
      "score": cmd_score, "status": cmd_status, "reset": cmd_reset}[a.cmd](a)
 
 

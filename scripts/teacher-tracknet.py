@@ -88,7 +88,8 @@ def stitch(csvs: list[Path], out: Path, duration_s: float) -> int:
     contiguous re-encode, so that is exact. The total is checked against the
     recording's duration so a dropped or duplicated chunk can never mis-time it."""
     tmp = out.with_suffix(".csv.tmp")
-    base = 0
+    expected = duration_s * FPS
+    base = written = 0
     with open(tmp, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["frame", "t_ms", "visible", "x", "y"])
@@ -96,14 +97,20 @@ def stitch(csvs: list[Path], out: Path, duration_s: float) -> int:
             rows = list(csv.DictReader(open(c)))
             for r in rows:
                 fr = base + int(r["Frame"])
+                if fr >= expected:
+                    continue  # tail padding past the recording's end (see below)
                 w.writerow([fr, round(fr * 1000 / FPS), r["Visibility"], r["X"], r["Y"]])
+                written += 1
             base += len(rows)
-    expected = duration_s * FPS
-    if abs(base - expected) > FPS:  # more than 1 s off: something is wrong
+    # Variable-frame-rate sources (IMG_0046: 12494 real frames, avg 29.86 fps) come
+    # out of the fps filter a little long — the excess is padding at the END
+    # (verified frame-exact against the source at 3/100/200/300/410 s), so it is
+    # trimmed above. Short output, or a long tail, means something real is wrong.
+    if base < expected - FPS or base > expected + 3 * FPS:
         tmp.unlink()
         sys.exit(f"{out.name}: stitched {base} frames, expected ~{expected:.0f} from duration")
     os.replace(tmp, out)
-    return base
+    return written
 
 
 def duration_s(path: Path) -> float:
