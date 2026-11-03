@@ -82,6 +82,10 @@ POST = {"smooth": 5, "merge_ms": 3000, "min_ms": 1500}
 # Gate v2 result (three test recordings, 146 rallies; Pixel dropped before scoring): GREEN —
 # span precision 0.992 (1.7 invented/h), recall >= 3 s 0.971, edges <= 1 s 87 %, above v6
 # (0.757, 56.2/h). Short rallies found 20/42. Test gold was verified from v3's drafts.
+# In-app cost check (#105): TrackNet's non-overlapping mode (teacher-tracknet.py --eval-mode
+# nonoverlap, 8x cheaper) gives near-identical tracks; the v3 recipe retrained on them scores
+# 0.968 / 0.952 / 86 % on the same test set (frozen v3 on them: 0.974 / 0.913 / 87 %) — still
+# green on every measure (comparison only, the test set was already seen).
 VIDEO_EXT = {".mov", ".mp4", ".mkv", ".m4v"}
 
 
