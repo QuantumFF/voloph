@@ -213,14 +213,33 @@ def track_index(tracks: Path) -> dict:
     return {p.name.split(".")[-3]: p for p in tracks.glob("*.ball.csv")}
 
 
-def audit_xy(audit: Path, tracks: Path, pose: Path | None = None, shuttle: bool = True):
-    moms = json.loads(audit.read_text())["moments"]
+GOLD_STEP_MS = 4000  # gold is sampled every 4 s: dense neighbours add little
+
+
+def audit_xy(audits, tracks: Path, pose: Path | None = None, shuttle: bool = True,
+             gold: Path | None = None):
+    """Labelled points from moment audits (one or several files) and, optionally,
+    gold files sampled every GOLD_STEP_MS. A recording with gold contributes only
+    its gold samples (the audit moments in it are the same truth, coarser)."""
+    if isinstance(audits, Path):
+        audits = [audits]
     idx = track_index(tracks)
     pidx = pose_index(pose)
     by_rec: dict[str, list] = {}
-    for m in moms:
-        if m.get("label") in ("rally", "no_rally"):
-            by_rec.setdefault(m["quick_hash"][:12], []).append(m)
+    gold_recs = set()
+    for g in sorted(gold.glob("*.gold.json")) if gold else []:
+        d = json.loads(g.read_text())
+        h = d["quick_hash"][:12]
+        gold_recs.add(h)
+        R = d["rallies"]
+        for t in range(GOLD_STEP_MS // 2, d["duration_ms"], GOLD_STEP_MS):
+            lab = "rally" if any(s0 <= t < e0 for s0, e0 in R) else "no_rally"
+            by_rec.setdefault(h, []).append({"t_ms": t, "label": lab, "recording": d["recording"]})
+    for audit in audits:
+        for m in json.loads(Path(audit).read_text())["moments"]:
+            h = m["quick_hash"][:12]
+            if m.get("label") in ("rally", "no_rally") and h not in gold_recs:
+                by_rec.setdefault(h, []).append(m)
     X, Y, G = [], [], []
     for h, ms in by_rec.items():
         tr = load_track(idx[h])
@@ -248,7 +267,7 @@ def prob(model: dict, X: np.ndarray) -> np.ndarray:
 
 
 def cmd_cv(a) -> None:
-    X, Y, G = audit_xy(a.audit, a.tracks, a.pose, not a.no_shuttle)
+    X, Y, G = audit_xy(a.audit, a.tracks, a.pose, not a.no_shuttle, a.gold)
     p = np.zeros(len(Y))
     for g in sorted(set(G)):
         tr = G != g
@@ -266,9 +285,10 @@ def cmd_cv(a) -> None:
 
 
 def cmd_train(a) -> None:
-    X, Y, G = audit_xy(a.audit, a.tracks, a.pose)
+    X, Y, G = audit_xy(a.audit, a.tracks, a.pose, gold=a.gold)
     m = fit(X, Y)
-    m.update({"pose": a.pose is not None, "threshold": a.threshold, "trained_on": str(a.audit), "n": int(len(Y)),
+    m.update({"pose": a.pose is not None, "threshold": a.threshold,
+              "trained_on": [str(x) for x in a.audit] + ([str(a.gold)] if a.gold else []), "n": int(len(Y)),
               "n_rally": int(Y.sum()), "step_frames": STEP})
     a.model.parent.mkdir(parents=True, exist_ok=True)
     a.model.write_text(json.dumps(m, indent=1) + "\n")
@@ -346,12 +366,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("cv")
-    s.add_argument("--audit", type=Path, required=True)
+    s.add_argument("--audit", type=Path, nargs="+", required=True)
+    s.add_argument("--gold", type=Path, help="gold-file dir: add its recordings, sampled every 4 s")
     s.add_argument("--tracks", type=Path, required=True)
     s.add_argument("--pose", type=Path, help="teacher-pose.py output: add player features")
     s.add_argument("--no-shuttle", action="store_true", help="player features only (diagnostic)")
     s = sub.add_parser("train")
-    s.add_argument("--audit", type=Path, required=True)
+    s.add_argument("--audit", type=Path, nargs="+", required=True)
+    s.add_argument("--gold", type=Path)
     s.add_argument("--tracks", type=Path, required=True)
     s.add_argument("--pose", type=Path)
     s.add_argument("--model", type=Path, required=True)
