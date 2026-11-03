@@ -7,8 +7,15 @@ import {
   type AnalysisProgress,
 } from "./analysis-progress"
 
-function tick(over: Partial<AnalysisProgress> & { recording_id: number }): AnalysisProgress {
-  return { processed_ms: 30_000, total_ms: 120_000, elapsed_ms: 20_000, ...over }
+function tick(
+  over: Partial<AnalysisProgress> & { recording_id: number }
+): AnalysisProgress {
+  return {
+    processed_ms: 30_000,
+    total_ms: 120_000,
+    elapsed_ms: 20_000,
+    ...over,
+  }
 }
 
 describe("estimateRemainingMs", () => {

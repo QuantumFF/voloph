@@ -93,5 +93,7 @@ export function emitDebugEvent(detail: DebugEvent) {
     return
   }
 
-  window.dispatchEvent(new CustomEvent<DebugEvent>(DEBUG_EVENT_NAME, { detail }))
+  window.dispatchEvent(
+    new CustomEvent<DebugEvent>(DEBUG_EVENT_NAME, { detail })
+  )
 }

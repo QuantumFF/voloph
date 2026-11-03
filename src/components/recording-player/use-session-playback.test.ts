@@ -78,7 +78,13 @@ const fileLoaded = () => act(() => harness.emit("mpv:file-loaded"))
 const RALLIES = [
   { id: 1, start_ms: 20_000, end_ms: 35_000, confidence: 0.9, flagged: false },
   { id: 2, start_ms: 60_000, end_ms: 75_000, confidence: 0.9, flagged: false },
-  { id: 3, start_ms: 255_000, end_ms: 270_000, confidence: 0.9, flagged: false },
+  {
+    id: 3,
+    start_ms: 255_000,
+    end_ms: 270_000,
+    confidence: 0.9,
+    flagged: false,
+  },
 ]
 
 const TIMELINE: Timeline = {

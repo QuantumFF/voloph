@@ -173,7 +173,10 @@ impl Detector {
             .first()
             .map(|i| i.name.clone())
             .ok_or("model has no inputs")?;
-        Ok(Detector { session, input_name })
+        Ok(Detector {
+            session,
+            input_name,
+        })
     }
 
     /// Infer on one already-letterboxed `MODEL_SIZE` BGR frame and map the decoded
@@ -324,7 +327,11 @@ fn decode(data: &[f32], n: usize, cols: usize, score_floor: f32) -> Vec<PixelBox
 /// survives). Collapses the several overlapping anchors YOLOX fires on one person into
 /// one box.
 fn nms(mut boxes: Vec<PixelBox>) -> Vec<PixelBox> {
-    boxes.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    boxes.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut kept: Vec<PixelBox> = Vec::new();
     for b in boxes {
         if kept.iter().all(|k| iou(k, &b) <= NMS_IOU_THRESHOLD) {
@@ -389,7 +396,10 @@ impl Letterbox {
     /// outside `[0, src)` lands in the pad region. Used by the pose pass's in-Rust
     /// letterbox (issue #95).
     pub(crate) fn model_px_to_source(self, mx: f32, my: f32) -> (f32, f32) {
-        ((mx - self.pad_x) / self.scale, (my - self.pad_y) / self.scale)
+        (
+            (mx - self.pad_x) / self.scale,
+            (my - self.pad_y) / self.scale,
+        )
     }
 
     /// Map one model-space pixel box back into source-frame-normalized coordinates,
@@ -469,9 +479,14 @@ pub(crate) fn vendored_model_file(model_file: &str, label: &str) -> Result<PathB
 fn probe_dimensions(path: &str) -> Option<(u32, u32)> {
     let output = Command::new(sidecar_path("ffprobe"))
         .args([
-            "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=s=x:p=0",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
             path,
         ])
         .stdin(Stdio::null())
@@ -542,8 +557,7 @@ pub fn extract_detections_at(
     );
     let mut child = Command::new(sidecar_path("ffmpeg"))
         .args([
-            "-v", "error", "-nostats", "-i", path,
-            "-an", // detection is video-only
+            "-v", "error", "-nostats", "-i", path, "-an", // detection is video-only
             "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
         ])
         .stdin(Stdio::null())
@@ -674,22 +688,29 @@ fn resolve_from_db(opts: &DumpOptions) -> Result<(String, Option<i64>), String> 
             db_path.display()
         ));
     }
-    let conn =
-        crate::db::open(&db_path).map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
+    let conn = crate::db::open(&db_path)
+        .map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
     let kind = match &opts.library {
         Some(k) => k.clone(),
         None => crate::db::active_kind(&conn).map_err(|e| e.to_string())?,
     };
     let library = crate::db::library_path_of(&conn, &kind)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("the '{kind}' library is not designated in {}", db_path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "the '{kind}' library is not designated in {}",
+                db_path.display()
+            )
+        })?;
 
     let rows: Vec<(String, Option<i64>)> = {
         let mut stmt = conn
             .prepare("SELECT path, duration_ms FROM recordings WHERE library = ?1 ORDER BY path")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([&kind], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))
+            .query_map([&kind], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
             .map_err(|e| e.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| e.to_string())?;
@@ -718,7 +739,9 @@ fn print_track(track: &DetectionTrack, limit: Option<usize>) {
         track.samples.len(),
         track.fps
     );
-    let shown = limit.unwrap_or(track.samples.len()).min(track.samples.len());
+    let shown = limit
+        .unwrap_or(track.samples.len())
+        .min(track.samples.len());
     for (i, boxes) in track.samples.iter().take(shown).enumerate() {
         let t = i as f64 / track.fps;
         if boxes.is_empty() {
@@ -735,7 +758,10 @@ fn print_track(track: &DetectionTrack, limit: Option<usize>) {
         println!();
     }
     if shown < track.samples.len() {
-        println!("  … {} more samples (pass --limit 0 or a larger N to see all)", track.samples.len() - shown);
+        println!(
+            "  … {} more samples (pass --limit 0 or a larger N to see all)",
+            track.samples.len() - shown
+        );
     }
 }
 
@@ -803,7 +829,9 @@ impl DumpOptions {
                 }
                 "--limit" => {
                     let n = it.next().ok_or("--limit needs a number")?;
-                    let n: usize = n.parse().map_err(|_| format!("--limit not a number: {n}"))?;
+                    let n: usize = n
+                        .parse()
+                        .map_err(|_| format!("--limit not a number: {n}"))?;
                     // 0 means "print all".
                     o.limit = if n == 0 { None } else { Some(n) };
                 }
@@ -838,9 +866,11 @@ fn print_dump_usage() {
 fn default_db_path() -> Result<PathBuf, String> {
     const IDENTIFIER: &str = "com.quantumff.voloph";
     #[cfg(target_os = "linux")]
-    let root = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-    });
+    let root = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+        });
     #[cfg(target_os = "macos")]
     let root = std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join("Library").join("Application Support"));
@@ -952,14 +982,14 @@ mod tests {
         data[1] = 0.5;
         data[4] = 1.0;
         data[5] = 0.9; // score 0.9
-        // Anchor 1 (stride-8 cell (1,0)): sub-threshold box decoding to exactly
-        // anchor 0's box (raw cx −0.5 cancels the grid offset) — NMS bait that the
-        // confident box must suppress, not the other way around.
+                       // Anchor 1 (stride-8 cell (1,0)): sub-threshold box decoding to exactly
+                       // anchor 0's box (raw cx −0.5 cancels the grid offset) — NMS bait that the
+                       // confident box must suppress, not the other way around.
         data[cols] = -0.5;
         data[cols + 1] = 0.5;
         data[cols + 4] = 0.8;
         data[cols + 5] = 0.25; // score 0.2
-        // A far-away sub-threshold box that survives NMS at the low floor.
+                               // A far-away sub-threshold box that survives NMS at the low floor.
         let far = 30 * cols;
         data[far] = 0.5;
         data[far + 1] = 0.5;
@@ -994,9 +1024,27 @@ mod tests {
     /// a disjoint box.
     #[test]
     fn nms_suppresses_overlaps_keeps_disjoint() {
-        let a = PixelBox { x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0, score: 0.9 };
-        let a2 = PixelBox { x1: 1.0, y1: 1.0, x2: 11.0, y2: 11.0, score: 0.8 }; // ~IoU 0.68
-        let far = PixelBox { x1: 100.0, y1: 100.0, x2: 110.0, y2: 110.0, score: 0.7 };
+        let a = PixelBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+            score: 0.9,
+        };
+        let a2 = PixelBox {
+            x1: 1.0,
+            y1: 1.0,
+            x2: 11.0,
+            y2: 11.0,
+            score: 0.8,
+        }; // ~IoU 0.68
+        let far = PixelBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 110.0,
+            y2: 110.0,
+            score: 0.7,
+        };
         let kept = nms(vec![a2, far, a]);
         assert_eq!(kept.len(), 2, "one overlap suppressed, disjoint kept");
         // Highest score of the overlapping pair survives.
@@ -1006,8 +1054,20 @@ mod tests {
     /// IoU of a box with itself is 1; disjoint boxes are 0.
     #[test]
     fn iou_bounds() {
-        let a = PixelBox { x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0, score: 1.0 };
-        let far = PixelBox { x1: 20.0, y1: 20.0, x2: 30.0, y2: 30.0, score: 1.0 };
+        let a = PixelBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+            score: 1.0,
+        };
+        let far = PixelBox {
+            x1: 20.0,
+            y1: 20.0,
+            x2: 30.0,
+            y2: 30.0,
+            score: 1.0,
+        };
         assert!((iou(&a, &a) - 1.0).abs() < 1e-6);
         assert_eq!(iou(&a, &far), 0.0);
     }
@@ -1020,7 +1080,13 @@ mod tests {
         assert!((lb.scale - 1.0).abs() < 1e-6);
         assert_eq!(lb.pad_x, 0.0);
         assert_eq!(lb.pad_y, 0.0);
-        let b = PixelBox { x1: 0.0, y1: 0.0, x2: 208.0, y2: 416.0, score: 0.5 };
+        let b = PixelBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 208.0,
+            y2: 416.0,
+            score: 0.5,
+        };
         let n = lb.to_source_norm(&b).unwrap();
         assert!((n.x - 0.0).abs() < 1e-6);
         assert!((n.w - 0.5).abs() < 1e-6, "{n:?}"); // 208/416
@@ -1040,7 +1106,13 @@ mod tests {
         // A box exactly filling the scaled content region maps to the whole source.
         let content_top = lb.pad_y;
         let content_bottom = 416.0 - lb.pad_y;
-        let b = PixelBox { x1: 0.0, y1: content_top, x2: 416.0, y2: content_bottom, score: 0.6 };
+        let b = PixelBox {
+            x1: 0.0,
+            y1: content_top,
+            x2: 416.0,
+            y2: content_bottom,
+            score: 0.6,
+        };
         let n = lb.to_source_norm(&b).unwrap();
         assert!((n.x - 0.0).abs() < 1e-4, "{n:?}");
         assert!((n.y - 0.0).abs() < 1e-4, "{n:?}");

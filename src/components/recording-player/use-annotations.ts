@@ -23,9 +23,7 @@ export function useAnnotations(recordings: PlaylistRecording[]) {
 
   const load = useCallback((path: string) => {
     trackedInvoke<Annotation[]>("recording_annotations", { path })
-      .then((result) =>
-        setAnnotations((prev) => ({ ...prev, [path]: result }))
-      )
+      .then((result) => setAnnotations((prev) => ({ ...prev, [path]: result })))
       .catch(() => {})
   }, [])
 
@@ -57,7 +55,13 @@ export function useAnnotations(recordings: PlaylistRecording[]) {
       aspect: string | null,
       note: string | null
     ) => {
-      void trackedInvoke("update_annotation", { path, id, verdict, aspect, note })
+      void trackedInvoke("update_annotation", {
+        path,
+        id,
+        verdict,
+        aspect,
+        note,
+      })
         .then(() => load(path))
         .catch(() => {})
     },

@@ -79,10 +79,7 @@ const MOTION_HEIGHT: u32 = 54;
 /// (issue #81) — video decode is the long pole of analysis, so tracking it tracks
 /// the wall clock well. The frames stream from ffmpeg's stdout rather than being
 /// buffered whole, so progress ticks live instead of jumping straight to done.
-pub fn extract_motion(
-    path: &str,
-    mut on_progress: impl FnMut(i64),
-) -> Result<Vec<f64>, String> {
+pub fn extract_motion(path: &str, mut on_progress: impl FnMut(i64)) -> Result<Vec<f64>, String> {
     let vf = format!("fps={MOTION_FPS},scale={MOTION_WIDTH}:{MOTION_HEIGHT},format=gray");
     let mut child = Command::new(sidecar_path("ffmpeg"))
         .args([
@@ -217,7 +214,10 @@ pub fn probe_duration_ms(path: &str) -> Option<i64> {
     if !output.status.success() {
         return None;
     }
-    let seconds: f64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    let seconds: f64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
     if seconds <= 0.0 {
         return None;
     }

@@ -330,9 +330,17 @@ describe("buildSessionAnnotations", () => {
       "b.mp4": timeline(8000, [rally(2, 500, 1500)]),
     })
     const marks = buildSessionAnnotations(session, {
-      "b.mp4": [{ id: 3, time_ms: 700, verdict: "mistake", aspect: null, note: null }],
+      "b.mp4": [
+        { id: 3, time_ms: 700, verdict: "mistake", aspect: null, note: null },
+      ],
       "a.mp4": [
-        { id: 2, time_ms: 1500, verdict: "good", aspect: "selection", note: "clean" },
+        {
+          id: 2,
+          time_ms: 1500,
+          verdict: "good",
+          aspect: "selection",
+          note: "clean",
+        },
       ],
     })
     // Ordered by global time: a's at 1500, b's lifted by a's 10000 → 10700.
@@ -358,8 +366,12 @@ describe("buildSessionAnnotations", () => {
     })
     // a isn't placed (no duration) → b isn't either; both drop out.
     const marks = buildSessionAnnotations(session, {
-      "a.mp4": [{ id: 1, time_ms: 100, verdict: "good", aspect: null, note: null }],
-      "b.mp4": [{ id: 2, time_ms: 100, verdict: "bad", aspect: null, note: null }],
+      "a.mp4": [
+        { id: 1, time_ms: 100, verdict: "good", aspect: null, note: null },
+      ],
+      "b.mp4": [
+        { id: 2, time_ms: 100, verdict: "bad", aspect: null, note: null },
+      ],
     })
     expect(marks).toEqual([])
   })
@@ -397,34 +409,70 @@ describe("adjustRallyEdit", () => {
     expect(plan).toEqual({
       kind: "ops",
       ops: [
-        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1200, endMs: 1800 },
+        {
+          command: "update_rally",
+          path: "b.mp4",
+          rallyId: 7,
+          startMs: 1200,
+          endMs: 1800,
+        },
       ],
     })
   })
 
   it("orders flipped drag endpoints (start past end)", () => {
-    const plan = adjustRallyEdit(sessionRally(7, 1000, 2000), 11800, 11200, 10000, 8000)
+    const plan = adjustRallyEdit(
+      sessionRally(7, 1000, 2000),
+      11800,
+      11200,
+      10000,
+      8000
+    )
     expect(plan).toEqual({
       kind: "ops",
       ops: [
-        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1200, endMs: 1800 },
+        {
+          command: "update_rally",
+          path: "b.mp4",
+          rallyId: 7,
+          startMs: 1200,
+          endMs: 1800,
+        },
       ],
     })
   })
 
   it("clamps to the recording's bounds", () => {
-    const plan = adjustRallyEdit(sessionRally(7, 1000, 2000), 9000, 99999, 10000, 8000)
+    const plan = adjustRallyEdit(
+      sessionRally(7, 1000, 2000),
+      9000,
+      99999,
+      10000,
+      8000
+    )
     expect(plan).toEqual({
       kind: "ops",
       ops: [
-        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 0, endMs: 8000 },
+        {
+          command: "update_rally",
+          path: "b.mp4",
+          rallyId: 7,
+          startMs: 0,
+          endMs: 8000,
+        },
       ],
     })
   })
 
   it("rejects a zero-or-negative-length result", () => {
     // Both endpoints clamp to 0 (before the recording start) → empty rally.
-    const plan = adjustRallyEdit(sessionRally(7, 1000, 2000), 9000, 9500, 10000, 8000)
+    const plan = adjustRallyEdit(
+      sessionRally(7, 1000, 2000),
+      9000,
+      9500,
+      10000,
+      8000
+    )
     expect(plan).toEqual({ kind: "reject" })
   })
 })
@@ -434,7 +482,9 @@ describe("addAtPlayheadEdit", () => {
     const plan = addAtPlayheadEdit("b.mp4", 5000, 8000, 2000)
     expect(plan).toEqual({
       kind: "ops",
-      ops: [{ command: "add_rally", path: "b.mp4", startMs: 3000, endMs: 7000 }],
+      ops: [
+        { command: "add_rally", path: "b.mp4", startMs: 3000, endMs: 7000 },
+      ],
     })
   })
 
@@ -447,10 +497,17 @@ describe("addAtPlayheadEdit", () => {
   })
 
   it("leaves the end uncapped when the duration is unknown (Infinity)", () => {
-    const plan = addAtPlayheadEdit("b.mp4", 5000, Number.POSITIVE_INFINITY, 2000)
+    const plan = addAtPlayheadEdit(
+      "b.mp4",
+      5000,
+      Number.POSITIVE_INFINITY,
+      2000
+    )
     expect(plan).toEqual({
       kind: "ops",
-      ops: [{ command: "add_rally", path: "b.mp4", startMs: 3000, endMs: 7000 }],
+      ops: [
+        { command: "add_rally", path: "b.mp4", startMs: 3000, endMs: 7000 },
+      ],
     })
   })
 })
@@ -462,7 +519,13 @@ describe("splitRallyEdit", () => {
     expect(plan).toEqual({
       kind: "ops",
       ops: [
-        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1000, endMs: 1500 },
+        {
+          command: "update_rally",
+          path: "b.mp4",
+          rallyId: 7,
+          startMs: 1000,
+          endMs: 1500,
+        },
         { command: "add_rally", path: "b.mp4", startMs: 1500, endMs: 2000 },
       ],
     })
@@ -487,7 +550,13 @@ describe("mergeRallyEdit", () => {
     expect(plan).toEqual({
       kind: "ops",
       ops: [
-        { command: "update_rally", path: "b.mp4", rallyId: 7, startMs: 1000, endMs: 3000 },
+        {
+          command: "update_rally",
+          path: "b.mp4",
+          rallyId: 7,
+          startMs: 1000,
+          endMs: 3000,
+        },
         { command: "delete_rally", path: "b.mp4", rallyId: 8 },
       ],
     })
