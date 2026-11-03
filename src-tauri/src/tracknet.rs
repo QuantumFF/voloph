@@ -120,10 +120,13 @@ pub struct ShuttleTrack {
 }
 
 /// The two loaded networks. Built like [`crate::detect::Detector`]: the GPU execution
-/// providers for this OS are tried ahead of CPU, falling back silently.
+/// providers for this OS are tried ahead of CPU, falling back silently — and, unlike a
+/// bare `ort` fallback, also when a GPU provider *registers* but cannot create the
+/// session (CUDA libraries installed, no usable device).
 pub struct ShuttleTracker {
     tracknet: Session,
     inpaintnet: Session,
+    provider: String,
 }
 
 impl ShuttleTracker {
@@ -137,10 +140,36 @@ impl ShuttleTracker {
     /// Load the two models from explicit paths. `gpu` false builds CPU-only sessions
     /// (the dev CLI's `--cpu`, for timing the fallback path on a GPU machine).
     pub fn load(tracknet: &Path, inpaintnet: &Path, gpu: bool) -> Result<ShuttleTracker, String> {
+        if gpu {
+            let built = build_session(tracknet, true)
+                .and_then(|t| Ok((t, build_session(inpaintnet, true)?)));
+            match built {
+                Ok((tracknet, inpaintnet)) => {
+                    return Ok(ShuttleTracker {
+                        tracknet,
+                        inpaintnet,
+                        provider: probe_execution_provider(),
+                    })
+                }
+                Err(e) => log::warn!("shuttle tracker: GPU session failed, using CPU: {e}"),
+            }
+        }
         Ok(ShuttleTracker {
-            tracknet: build_session(tracknet, gpu)?,
-            inpaintnet: build_session(inpaintnet, gpu)?,
+            tracknet: build_session(tracknet, false)?,
+            inpaintnet: build_session(inpaintnet, false)?,
+            provider: if gpu {
+                "CPU (GPU session failed)"
+            } else {
+                "CPU (forced)"
+            }
+            .to_string(),
         })
+    }
+
+    /// The execution provider the sessions run on, for diagnostics: a GPU provider's
+    /// name, or `CPU` with the reason when no GPU provider took.
+    pub fn provider(&self) -> &str {
+        &self.provider
     }
 
     /// TrackNet on `n` windows of `IN_CH x HEIGHT x WIDTH` input, padded to
@@ -750,13 +779,9 @@ pub fn dump_cli(args: Vec<String>) -> Result<(), String> {
             crate::detect::vendored_model_file("inpaintnet_v3.onnx", "InpaintNet")?,
         ),
     };
-    let provider = if cpu {
-        "CPU (forced)".to_string()
-    } else {
-        probe_execution_provider()
-    };
-    eprintln!("execution provider: {provider}");
     let mut tracker = ShuttleTracker::load(&tn, &ip, !cpu)?;
+    let provider = tracker.provider().to_string();
+    eprintln!("execution provider: {provider}");
     let started = std::time::Instant::now();
     let track = track_recording_chunked(&file, &mut tracker, first_chunk, |_| {})?;
     let wall = started.elapsed().as_secs_f64();
