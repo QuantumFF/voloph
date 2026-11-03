@@ -34,9 +34,14 @@
 //! Chunks are stitched and trimmed to the probed duration as the script's `stitch()`
 //! does (the fps filter can pad a variable-frame-rate source's tail).
 //!
-//! **Deviation by design.** Offline, ffmpeg re-encoded each chunk to libx264 (crf 18)
-//! and OpenCV decoded that proxy; the app never re-encodes, so its pixels differ from
-//! the offline run's by the proxy's compression noise.
+//! **Deviations from the offline run, by design.** Offline, ffmpeg re-encoded each
+//! chunk to libx264 (crf 18) and OpenCV decoded that proxy; the app never re-encodes,
+//! so its pixels differ by the proxy's compression noise — and, for 10-bit (HLG)
+//! sources, by OpenCV's mis-decode of the 10-bit H.264 proxies (G/B ~33 levels off),
+//! which the app does not reproduce. The offline segment muxer also cut its first
+//! chunk at frame 3850, not 3600 (see [`track_recording_chunked`]); the app uses the
+//! regular 3600-frame layout. Nonoverlap TrackNet is sensitive to where its 8-frame
+//! windows fall, so the two tracks agree on visibility but not frame-for-frame.
 //!
 //! **Memory.** The median needs every frame of a chunk before the chunk's first window
 //! can run, so up to one chunk of frames (3600 x 442 KB ≈ 1.6 GB) is held at once. The
@@ -77,9 +82,10 @@ const SEQ_LEN: usize = 8;
 const IN_CH: usize = (SEQ_LEN + 1) * 3;
 /// InpaintNet window (its checkpoint's `seq_len`).
 const INPAINT_LEN: usize = 16;
-/// TrackNet windows per inference call. Kept modest — one window's activations are
-/// ~0.3 GB on the GPU — and every call is padded to this size so the CUDA EP never
-/// re-tunes its convolutions for a ragged last batch.
+/// TrackNet windows per inference call. Kept modest — the full-resolution U-Net
+/// activations of one window run to hundreds of MB, and the GPU may be shared — and
+/// every call is padded to this size so the CUDA EP never re-tunes its convolutions
+/// for a ragged last batch.
 const TRACKNET_BATCH: usize = 4;
 /// InpaintNet windows per call (a chunk is 225 windows of 16 tiny vectors).
 const INPAINT_BATCH: usize = 64;
@@ -222,8 +228,9 @@ fn build_session(model: &Path, gpu: bool) -> Result<Session, String> {
 
 /// Which execution provider a GPU-enabled session gets on this machine: the name of
 /// the first GPU provider that registers (probed on a throwaway builder with
-/// `error_on_failure`), else `"CPU"`. Diagnostic only — the real sessions keep `ort`'s
-/// silent fallback.
+/// `error_on_failure`), else `"CPU"` with each GPU provider's registration error (e.g.
+/// a missing CUDA 12 runtime). Diagnostic only — the real sessions keep `ort`'s silent
+/// fallback.
 pub fn probe_execution_provider() -> String {
     let mut why = Vec::new();
     for ep in crate::detect::gpu_execution_providers() {
