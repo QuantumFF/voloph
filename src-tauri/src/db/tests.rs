@@ -2842,7 +2842,8 @@ fn switching_segmenter_rederives_only_untouched_drafts_made_by_another() {
         super::save_rallies(&mut conn, i, 60000, &one_rally(), &[], Segmenter::V6).unwrap();
     }
     super::save_rallies(&mut conn, ic, 60000, &one_rally(), &[], Segmenter::Student).unwrap();
-    assert_eq!(segmenter_stamp(&conn, ia), (Some("v6".into()), Some(6), "ready".into()));
+    let v6 = Some(i64::from(crate::segment::SEGMENTER_VERSION));
+    assert_eq!(segmenter_stamp(&conn, ia), (Some("v6".into()), v6, "ready".into()));
     // b is hand-touched: a corrected rally.
     conn.execute("UPDATE rallies SET confidence = 1.0 WHERE recording_id = ?1", [ib]).unwrap();
 
@@ -2852,7 +2853,7 @@ fn switching_segmenter_rederives_only_untouched_drafts_made_by_another() {
     // a (untouched, v6) goes back to the worker; b keeps its hand-corrected v6 draft;
     // c was already the student's.
     assert_eq!(segmenter_stamp(&conn, ia), (None, None, "unknown".into()));
-    assert_eq!(segmenter_stamp(&conn, ib), (Some("v6".into()), Some(6), "ready".into()));
+    assert_eq!(segmenter_stamp(&conn, ib), (Some("v6".into()), v6, "ready".into()));
     assert_eq!(
         segmenter_stamp(&conn, ic),
         (Some("student".into()), Some(i64::from(crate::student::VERSION)), "ready".into())

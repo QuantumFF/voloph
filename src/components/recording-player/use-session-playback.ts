@@ -9,12 +9,15 @@ import {
   gapSkipAction,
   nextRallyMs,
   nextUncertainMs,
+  NO_PADDING,
+  playIntervals,
   prevRallyAction,
   resumeEntersFreePlay,
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
   seekTickSettled,
+  type Padding,
   type PlaylistRecording,
   type Resume,
   type SessionModel,
@@ -53,6 +56,7 @@ export function useSessionPlayback({
   timelines,
   session,
   segmentOffset,
+  padding = NO_PADDING,
 }: {
   recordings: PlaylistRecording[]
   /** Index of the recording to open first. */
@@ -68,6 +72,12 @@ export function useSessionPlayback({
   session: SessionModel
   /** Offset of a recording on the session axis (0 if it isn't placed yet). */
   segmentOffset: (recordingIndex: number) => number
+  /**
+   * Lead-in/tail around each strict rally (issue #104): gap-skip, looping,
+   * resume and rally navigation all run on the padded play intervals. Defaults to
+   * none (the stored edges); the player passes the stored setting.
+   */
+  padding?: Padding
 }) {
   // Gap-free playback is the default (the North Star), but a manual playhead move
   // opts out: dragging into a gap, or clicking an empty part of the session
@@ -139,10 +149,17 @@ export function useSessionPlayback({
   const atFirstRecording = index <= 0
   const atLastRecording = index >= recordings.length - 1
 
-  // Rallies for the current recording, ascending by start (sorted in segment.rs).
-  // The empty list when there's no timeline means the recording plays straight
-  // through until its draft arrives.
-  const rallies = useMemo(() => timeline?.rallies ?? [], [timeline])
+  // The current recording's play intervals: its rallies (ascending by start, sorted
+  // in segment.rs) widened by the presentation padding and merged where they now
+  // overlap (#104). The empty list when there's no timeline means the recording
+  // plays straight through until its draft arrives.
+  const rallies = useMemo(
+    () =>
+      timeline
+        ? playIntervals(timeline.rallies, padding, timeline.duration_ms)
+        : [],
+    [timeline, padding]
+  )
 
   // Session-global playhead: the current recording's offset plus the local time.
   // Null until the current recording is placed (its predecessors are segmented).
@@ -399,7 +416,9 @@ export function useSessionPlayback({
       if (!seg) return
       const localMs = clamp(target - seg.offsetMs, 0, seg.durationMs ?? target)
       freePlayRef.current = !session.rallies.some(
-        (r) => target >= r.globalStart && target < r.globalEnd
+        (r) =>
+          target >= r.globalStart - padding.lead_ms &&
+          target < r.globalEnd + padding.tail_ms
       )
       if (seg.index === index) {
         seekTo(localMs)
@@ -407,7 +426,7 @@ export function useSessionPlayback({
         goToRecording(seg.index, { atMs: localMs })
       }
     },
-    [session, index, seekTo, goToRecording]
+    [session, index, seekTo, goToRecording, padding]
   )
 
   // Manual rally-to-rally navigation, across recording boundaries. A jump is an
@@ -446,8 +465,8 @@ export function useSessionPlayback({
   // Jump to the next uncertain region across the whole session (ADR 0002).
   const goToUncertain = useCallback(() => {
     const target = nextUncertainMs(session.rallies, globalPlayheadMs ?? 0)
-    if (target != null) seekSession(target)
-  }, [session, globalPlayheadMs, seekSession])
+    if (target != null) seekSession(target - padding.lead_ms)
+  }, [session, globalPlayheadMs, seekSession, padding])
 
   const toggleLoop = useCallback(() => setLooping((l) => !l), [])
 

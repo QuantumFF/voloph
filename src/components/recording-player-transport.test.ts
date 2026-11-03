@@ -604,3 +604,38 @@ describe("stripScrollTarget", () => {
     expect(stripScrollTarget(102, 100, 800, 5000)).toBe(102)
   })
 })
+
+describe("playIntervals (presentation padding, #104)", () => {
+  const r = (id: number, start_ms: number, end_ms: number) => ({
+    id,
+    start_ms,
+    end_ms,
+    confidence: 0.9,
+    flagged: false,
+  })
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+
+  it("widens each strict rally by the lead-in and tail", async () => {
+    const { playIntervals } = await import("./recording-player-transport")
+    expect(playIntervals([r(1, 5000, 6000)], pad)).toEqual([r(1, 4000, 7500)])
+  })
+
+  it("clamps to the recording and merges rallies the padding makes overlap", async () => {
+    const { playIntervals } = await import("./recording-player-transport")
+    const got = playIntervals(
+      [r(1, 500, 3000), r(2, 8000, 9000), r(3, 11000, 12000), r(4, 19000, 19500)],
+      pad,
+      20000
+    )
+    expect(got.map((x) => [x.id, x.start_ms, x.end_ms])).toEqual([
+      [1, 0, 4500],
+      [2, 7000, 13500],
+      [4, 18000, 20000],
+    ])
+  })
+
+  it("leaves the stored edges alone with no padding", async () => {
+    const { playIntervals, NO_PADDING } = await import("./recording-player-transport")
+    expect(playIntervals([r(1, 5000, 6000)], NO_PADDING)).toEqual([r(1, 5000, 6000)])
+  })
+})

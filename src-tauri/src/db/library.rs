@@ -115,6 +115,49 @@ pub fn set_library_segmenter(
     meta_set(conn, &format!("segmenter.{kind}"), segmenter.id())
 }
 
+/// Presentation padding (issue #104): stored rallies are strict (serve contact →
+/// shuttle down); playback and export widen each by a lead-in and a tail so the
+/// viewer sees the serve setup and the point land. One setting drives both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Padding {
+    pub lead_ms: i64,
+    pub tail_ms: i64,
+}
+
+pub const DEFAULT_PADDING: Padding = Padding {
+    lead_ms: 1000,
+    tail_ms: 1500,
+};
+/// Upper bound on either side, so a corrupted setting cannot swallow the gaps.
+const MAX_PADDING_MS: i64 = 10_000;
+
+/// The playback/export padding: the stored setting, or [`DEFAULT_PADDING`].
+pub fn playback_padding(conn: &Connection) -> rusqlite::Result<Padding> {
+    let get = |key: &str, default: i64| -> rusqlite::Result<i64> {
+        Ok(meta_get(conn, key)?
+            .and_then(|v| v.parse::<i64>().ok())
+            .map_or(default, |v| v.clamp(0, MAX_PADDING_MS)))
+    };
+    Ok(Padding {
+        lead_ms: get("padding.lead_ms", DEFAULT_PADDING.lead_ms)?,
+        tail_ms: get("padding.tail_ms", DEFAULT_PADDING.tail_ms)?,
+    })
+}
+
+/// Store the playback/export padding (clamped to 0–10 s per side).
+pub fn set_playback_padding(conn: &Connection, p: Padding) -> rusqlite::Result<()> {
+    meta_set(
+        conn,
+        "padding.lead_ms",
+        &p.lead_ms.clamp(0, MAX_PADDING_MS).to_string(),
+    )?;
+    meta_set(
+        conn,
+        "padding.tail_ms",
+        &p.tail_ms.clamp(0, MAX_PADDING_MS).to_string(),
+    )
+}
+
 /// Read a per-device app-state value from `meta`, or `None` when unset.
 pub fn meta_get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {

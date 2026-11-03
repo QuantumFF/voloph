@@ -1,0 +1,11 @@
+# Rallies are stored strict; padding is applied at playback and export
+
+A rally's stored interval is now **strict**: from serve contact to the moment the point is decided — the shuttle touching the floor, or hitting the net without crossing. Until now v6 widened every rally by 1.2 s before saving (`Params::pad_ms`), so the DB, Analysis files (ADR 0013), bundles and the timeline carried padded intervals, while the gold files (#99/#100) and the learned segmenters (ADR 0019) are strict. Two meanings of "rally boundary" made the eval score padded drafts against strict truth and let hand edits land in whichever convention the user happened to use (#104).
+
+**Padding is a presentation setting.** Playback (gap-free review, looping, rally navigation, resume, the moment browser's jump) and export (condensed recordings and sessions, reels) widen each strict rally by a lead-in and a tail — one setting, `db::Padding` in the per-device `meta` table, default **1.0 s before and 1.5 s after**, clamped to the recording, with rallies the padding makes overlap merged for playback and export only. The timeline draws and edits the strict edges, so a correction always moves a strict edge.
+
+**v6 becomes strict at `SEGMENTER_VERSION` 7** (`pad_ms` defaults to 0, kept as a tuning knob). Untouched v6 drafts re-derive on the bump through the existing stale path (in a library still using v6; ADR 0019). **Hand-touched recordings keep their edges as drawn** — they are not un-padded. Their edges were placed by a person against whatever the draft showed; subtracting 1.2 s would put words in their mouth, and the worst case of leaving them is a little extra lead-in and tail on recordings already reviewed. Gold files, the main hand-touched set, are strict already.
+
+Inclusion bias (ADR 0002) is unchanged in spirit and now lives where the viewer meets it: a strict edge that lands a little late or early is still covered by the padding on screen and in the export.
+
+Rejected: **keeping padded storage and stripping it for the eval** — the DB would keep two conventions forever and every consumer would need to know which segmenter padded; **padding in the segmenter per segmenter** — a user preference would then require re-analysis to change; **un-padding hand-touched recordings** — mutates human review state on a guess.

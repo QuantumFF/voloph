@@ -102,6 +102,49 @@ export interface Rally {
   flagged: boolean
 }
 
+/**
+ * Presentation padding (issue #104): stored rallies are strict — serve contact to
+ * the shuttle going down — and playback widens each by a lead-in and a tail so the
+ * serve setup and the landing are watched. Mirrors `db::Padding`; export applies
+ * the same setting in Rust.
+ */
+export interface Padding {
+  lead_ms: number
+  tail_ms: number
+}
+
+/** No widening: the strict rallies exactly as stored. */
+export const NO_PADDING: Padding = { lead_ms: 0, tail_ms: 0 }
+
+/** The app's default, until the stored setting loads — `db::DEFAULT_PADDING`. */
+export const DEFAULT_PADDING: Padding = { lead_ms: 1000, tail_ms: 1500 }
+
+/**
+ * The intervals playback actually plays: each strict rally widened by `pad`,
+ * clamped to the recording, and merged where the padding makes neighbours
+ * overlap. Input and output are start-ascending. A merged interval keeps the first
+ * rally's id/confidence/flag — navigation reads only the edges.
+ */
+export function playIntervals(
+  rallies: Rally[],
+  pad: Padding,
+  durationMs: number | null = null
+): Rally[] {
+  const out: Rally[] = []
+  for (const r of rallies) {
+    const start = Math.max(0, r.start_ms - pad.lead_ms)
+    const padded = r.end_ms + pad.tail_ms
+    const end = durationMs != null ? Math.min(durationMs, padded) : padded
+    const last = out[out.length - 1]
+    if (last && start <= last.end_ms) {
+      out[out.length - 1] = { ...last, end_ms: Math.max(last.end_ms, end) }
+    } else {
+      out.push({ ...r, start_ms: start, end_ms: end })
+    }
+  }
+  return out
+}
+
 /** Result of the `recording_timeline` command (see `src-tauri/src/db.rs`). */
 export interface Timeline {
   segment_state: "unknown" | "ready" | "failed"

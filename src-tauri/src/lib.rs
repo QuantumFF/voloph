@@ -406,6 +406,20 @@ async fn rescan_library(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanRes
     Ok(result)
 }
 
+/// The lead-in and tail playback and export add around each strict rally (#104).
+#[tauri::command]
+async fn playback_padding(db: State<'_, Db>) -> Result<db::Padding, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::playback_padding(&conn).map_err(|e| e.to_string())
+}
+
+/// Store the playback/export padding (#104).
+#[tauri::command]
+async fn set_playback_padding(db: State<'_, Db>, padding: db::Padding) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::set_playback_padding(&conn, padding).map_err(|e| e.to_string())
+}
+
 /// The segmenter the active library draws its drafts with (ADR 0019), as its id.
 #[tauri::command]
 async fn active_segmenter(db: State<'_, Db>) -> Result<String, String> {
@@ -594,20 +608,23 @@ async fn filter_moments(
 /// export cuts, keeping only the selected `rally_ids` (`None` keeps every rally).
 /// Timeline order is already start_ms-ascending, so the cuts come out in timeline
 /// order — appending each recording's cuts in turn yields capture-then-timeline
-/// order across a whole session.
+/// order across a whole session. Each strict rally is widened by the presentation
+/// padding (issue #104), clamped to the recording, and overlapping cuts merged.
 fn selected_cuts(
-    rallies: &[db::TimelineRally],
+    timeline: &db::Timeline,
     src: usize,
     rally_ids: &Option<Vec<i64>>,
+    pad: db::Padding,
 ) -> Vec<export::Cut> {
-    rallies
+    let strict: Vec<(i64, i64)> = timeline
+        .rallies
         .iter()
         .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
-        .map(|r| export::Cut {
-            src,
-            start_ms: r.start_ms,
-            end_ms: r.end_ms,
-        })
+        .map(|r| (r.start_ms, r.end_ms))
+        .collect();
+    export::pad_intervals(&strict, pad, timeline.duration_ms)
+        .into_iter()
+        .map(|(start_ms, end_ms)| export::Cut { src, start_ms, end_ms })
         .collect()
 }
 
@@ -625,13 +642,14 @@ async fn export_rallies(
     output: String,
     rally_ids: Option<Vec<i64>>,
 ) -> Result<(), String> {
-    let timeline = {
+    let (timeline, pad) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        db::recording_timeline(&conn, &path)
+        let timeline = db::recording_timeline(&conn, &path)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "recording is not registered".to_string())?
+            .ok_or_else(|| "recording is not registered".to_string())?;
+        (timeline, db::playback_padding(&conn).map_err(|e| e.to_string())?)
     };
-    let cuts = selected_cuts(&timeline.rallies, 0, &rally_ids);
+    let cuts = selected_cuts(&timeline, 0, &rally_ids, pad);
     export::export(&app, &[&path], &output, &cuts)
 }
 
@@ -654,12 +672,13 @@ async fn export_session(
 ) -> Result<(), String> {
     let cuts: Vec<export::Cut> = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let pad = db::playback_padding(&conn).map_err(|e| e.to_string())?;
         let mut cuts = Vec::new();
         for (src, path) in paths.iter().enumerate() {
             let timeline = db::recording_timeline(&conn, path)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("recording is not registered: {path}"))?;
-            cuts.extend(selected_cuts(&timeline.rallies, src, &rally_ids));
+            cuts.extend(selected_cuts(&timeline, src, &rally_ids, pad));
         }
         cuts
     };
@@ -776,6 +795,8 @@ pub fn run() {
             reanalyze_all,
             active_segmenter,
             set_active_segmenter,
+            playback_padding,
+            set_playback_padding,
             update_rally,
             add_rally,
             delete_rally,

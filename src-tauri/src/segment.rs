@@ -52,7 +52,13 @@
 /// recordings on this bump. (The motion-envelope end-edge placement scoped into #96
 /// was measured RED against its acceptance bar — it cut boundary median but raised
 /// hard misses above budget — and was not shipped; see ADR 0018 / #96.)
-pub const SEGMENTER_VERSION: u32 = 6;
+///
+/// v7 (issue #104, ADR 0020): rallies are stored **strict** — `pad_ms` defaults to 0,
+/// so v6's 1.2 s lead-in/tail is no longer baked into the draft. Padding is now a
+/// presentation setting applied by playback and export to every segmenter's strict
+/// rallies alike. Untouched v6 drafts re-derive on this bump; hand-touched ones keep
+/// the edges a person drew.
+pub const SEGMENTER_VERSION: u32 = 7;
 
 /// Which segmenter draws a library's drafts (ADR 0019): the v6 heuristic in this
 /// module, or the learned student ([`crate::student`]). Each has its own version, and
@@ -316,8 +322,9 @@ pub struct Params {
     pub bridge_gap_ms: i64,
     /// Discard a motion run shorter than this (ms) — too brief to be a rally.
     pub min_rally_ms: i64,
-    /// Extend every rally edge by this much (ms) so the serve and the final shot
-    /// are not clipped (inclusion bias). Overlaps created by padding are merged.
+    /// Extend every rally edge by this much (ms). 0 since v7 (issue #104): stored
+    /// rallies are strict and padding is applied at playback/export
+    /// (`db::Padding`). Kept for tuning experiments; overlaps it creates are merged.
     pub pad_ms: i64,
 }
 
@@ -339,7 +346,7 @@ impl Default for Params {
             block_ms: 500,
             bridge_gap_ms: 2900,
             min_rally_ms: 1500,
-            pad_ms: 1200,
+            pad_ms: 0,
         }
     }
 }
@@ -892,12 +899,8 @@ pub fn occupancy_firing(occ: &OccupancyTrack, p: &Params) -> Vec<OccupancySample
     let mut out = Vec::with_capacity(occ.samples.len());
     let mut prev_centers: Vec<(f64, f64)> = Vec::new();
     for s in filtered_samples(occ, p) {
-        let fired =
-            s.size_structure && centers_moved(&prev_centers, &s.centers, p.occupancy_static_frac);
-        out.push(OccupancySample {
-            live: s.live,
-            fired,
-        });
+        let fired = s.size_structure && centers_moved(&prev_centers, &s.centers, p.occupancy_static_frac);
+        out.push(OccupancySample { live: s.live, fired });
         prev_centers = s.centers;
     }
     out
@@ -964,9 +967,9 @@ fn filtered_samples(occ: &OccupancyTrack, p: &Params) -> Vec<FilteredSample> {
     let static_positions = static_furniture_positions(occ, p.occupancy_static_frac);
     let is_furniture = |b: &DetBox| {
         let (cx, cy) = b.center();
-        static_positions.iter().any(|&(sx, sy)| {
-            (cx - sx).abs() <= p.occupancy_static_frac && (cy - sy).abs() <= p.occupancy_static_frac
-        })
+        static_positions
+            .iter()
+            .any(|&(sx, sy)| (cx - sx).abs() <= p.occupancy_static_frac && (cy - sy).abs() <= p.occupancy_static_frac)
     };
 
     // 2. Plausibility cap from the median surviving-box area — one near-camera
@@ -1076,9 +1079,7 @@ fn static_furniture_positions(occ: &OccupancyTrack, frac: f64) -> Vec<(f64, f64)
     let persistence = (occ.samples.len() / 4).max(3);
     clusters
         .into_iter()
-        .filter(|c| {
-            c.count >= persistence && (c.maxx - c.minx) <= frac && (c.maxy - c.miny) <= frac
-        })
+        .filter(|c| c.count >= persistence && (c.maxx - c.minx) <= frac && (c.maxy - c.miny) <= frac)
         .map(|c| ((c.minx + c.maxx) / 2.0, (c.miny + c.maxy) / 2.0))
         .collect()
 }
@@ -1197,6 +1198,11 @@ fn merge_overlaps(rallies: Vec<Rally>) -> Vec<Rally> {
 mod tests {
     use super::*;
 
+    /// Since v7 rallies are strict (#104); a viewer sees them widened by the default
+    /// presentation padding, which is what inclusion bias is now measured against.
+    const LEAD: i64 = crate::db::DEFAULT_PADDING.lead_ms;
+    const TAIL: i64 = crate::db::DEFAULT_PADDING.tail_ms;
+
     const SR: u32 = 16_000;
     const FPS: f64 = 5.0;
 
@@ -1246,14 +1252,14 @@ mod tests {
         let rallies = segment(&audio, SR, &motion, None).rallies;
         assert_eq!(rallies.len(), 2, "expected two rallies, got {rallies:?}");
 
-        // Motion edges + padding place the boundaries; inclusion bias means we
-        // never start late or end early.
-        assert!(rallies[0].start_ms <= 5000, "rally 0 start {rallies:?}");
+        // Motion edges place the (strict, since v7) boundaries; inclusion bias now
+        // lives in presentation padding — the default lead-in covers any late start.
+        assert!(rallies[0].start_ms <= 5000 + LEAD, "rally 0 start {rallies:?}");
         assert!(
             (13_000..=16_500).contains(&rallies[0].end_ms),
             "rally 0 end {rallies:?}"
         );
-        assert!(rallies[1].start_ms <= 22_000, "rally 1 start {rallies:?}");
+        assert!(rallies[1].start_ms <= 22_000 + LEAD, "rally 1 start {rallies:?}");
         assert!(
             (30_000..=33_500).contains(&rallies[1].end_ms),
             "rally 1 end {rallies:?}"
@@ -1518,15 +1524,11 @@ mod tests {
         let motion = synth_motion(20.0, &[]); // motion never fires
         let occ = synth_occupancy(20.0, |i, t| active_rally_sample(i, t, 4.0, 16.0));
         let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
-        assert_eq!(
-            rallies.len(),
-            1,
-            "occupancy should propose a rally: {rallies:?}"
-        );
-        // Occupancy places the (unedged-by-motion) span roughly over [4,16); padding
-        // widens it. Never starts late / ends early (inclusion bias).
-        assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
-        assert!(rallies[0].end_ms >= 16_000, "end {rallies:?}");
+        assert_eq!(rallies.len(), 1, "occupancy should propose a rally: {rallies:?}");
+        // Occupancy places the (unedged-by-motion) span roughly over [4,16). Any late
+        // start / early end stays within the default presentation padding (#104).
+        assert!(rallies[0].start_ms <= 4_000 + LEAD, "start {rallies:?}");
+        assert!(rallies[0].end_ms >= 16_000 - TAIL, "end {rallies:?}");
     }
 
     #[test]
@@ -1616,7 +1618,10 @@ mod tests {
         let motion = synth_motion(20.0, &[]);
         let occ = synth_occupancy(20.0, |i, _t| {
             let drift = i as f64 * 0.005; // per-sample step ≪ occupancy_static_frac
-            vec![dbox(0.3 + drift, 0.60, 0.02), dbox(0.7 - drift, 0.65, 0.10)]
+            vec![
+                dbox(0.3 + drift, 0.60, 0.02),
+                dbox(0.7 - drift, 0.65, 0.10),
+            ]
         });
         let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
         assert!(
@@ -1669,8 +1674,8 @@ mod tests {
             1,
             "detector flicker must not shatter the rally: {rallies:?}"
         );
-        assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
-        assert!(rallies[0].end_ms >= 20_000, "end {rallies:?}");
+        assert!(rallies[0].start_ms <= 4_000 + LEAD, "start {rallies:?}");
+        assert!(rallies[0].end_ms >= 20_000 - TAIL, "end {rallies:?}");
     }
 
     #[test]
@@ -1721,8 +1726,8 @@ mod tests {
             1,
             "a deep retreat must not shatter or end the rally: {rallies:?}"
         );
-        assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
-        assert!(rallies[0].end_ms >= 20_000, "end {rallies:?}");
+        assert!(rallies[0].start_ms <= 4_000 + LEAD, "start {rallies:?}");
+        assert!(rallies[0].end_ms >= 20_000 - TAIL, "end {rallies:?}");
     }
 
     // --- Occupancy kinematics (issue #93) -------------------------------------
@@ -1754,24 +1759,16 @@ mod tests {
                 k.size_structure && k.max_step.is_some_and(|d| d > p.occupancy_static_frac);
             assert_eq!(f.fired, recovered, "shipped {f:?} vs kinematics {k:?}");
         }
-        assert!(
-            kin.iter().any(|k| k.size_structure),
-            "fixture must exercise structure"
-        );
+        assert!(kin.iter().any(|k| k.size_structure), "fixture must exercise structure");
     }
 
     #[test]
     fn kinematics_report_the_step_magnitude() {
         // A lone box stepping exactly 0.1 in x each sample: max_step must report
         // that magnitude (no second box to confuse the nearest-match).
-        let occ = synth_occupancy(20.0, |i, _t| {
-            vec![dbox(0.2 + (i % 2) as f64 * 0.1, 0.5, 0.02)]
-        });
+        let occ = synth_occupancy(20.0, |i, _t| vec![dbox(0.2 + (i % 2) as f64 * 0.1, 0.5, 0.02)]);
         let kin = occupancy_kinematics(&occ, &Params::default());
-        assert_eq!(
-            kin[0].max_step, None,
-            "first sample has no previous centers"
-        );
+        assert_eq!(kin[0].max_step, None, "first sample has no previous centers");
         for k in &kin[1..] {
             let step = k.max_step.expect("box present in consecutive samples");
             assert!((step - 0.1).abs() < 1e-9, "{k:?}");
@@ -1838,10 +1835,7 @@ mod tests {
         let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
         let motion = synth_motion(20.0, &[(4.0, 16.0)]);
         let with_none = segment(&audio, SR, &motion, None).rallies;
-        let empty = OccupancyTrack {
-            fps: DET_FPS,
-            samples: vec![],
-        };
+        let empty = OccupancyTrack { fps: DET_FPS, samples: vec![] };
         let with_empty = segment(&audio, SR, &motion, Some(&empty)).rallies;
         assert_eq!(with_none.len(), 1, "motion still proposes: {with_none:?}");
         // An empty track is the same as no track — a failed detector changes nothing.
