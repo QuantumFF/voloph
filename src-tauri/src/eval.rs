@@ -276,7 +276,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             db_path.display()
         ));
     }
-    let conn = db::open(&db_path).map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
+    let mut conn = db::open(&db_path).map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
 
     let kind = match opts.library {
         Some(k) => k,
@@ -293,6 +293,13 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             .as_deref()
             .ok_or("--export-gold needs a RECORDING filter (exports are per recording, on purpose)")?;
         return export_gold(&conn, &kind, filter, &gold_dir);
+    }
+    if let Some(dir) = &opts.import_draft {
+        let filter = opts
+            .filter
+            .as_deref()
+            .ok_or("--import-draft needs a RECORDING filter (imports are per recording, on purpose)")?;
+        return import_draft(&mut conn, &kind, filter, Path::new(dir));
     }
 
     let mut recordings = gather_corpus(&conn, &kind, &library, &gold_dir)?;
@@ -440,6 +447,94 @@ fn export_gold(
         };
         let path = gold::save(gold_dir, &file).map_err(|e| format!("{}: {e}", r.rel_path))?;
         println!("GOLD  {}  ({} rallies) → {}", r.rel_path, file.rallies.len(), path.display());
+    }
+    Ok(())
+}
+
+/// A machine timeline to import as a recording's draft (`--import-draft`): the
+/// gold-file schema (silver, draft, …) plus optional per-rally confidences.
+#[derive(serde::Deserialize)]
+struct ImportTimeline {
+    file_size: i64,
+    quick_hash: String,
+    rallies: Vec<[i64; 2]>,
+    #[serde(default)]
+    confidence: Option<Vec<f64>>,
+}
+
+/// Confidence for an imported rally that carries none. Imports are machine output,
+/// so they always stay strictly below [`db::CORRECTED_CONFIDENCE`]: a later edit is
+/// what marks a rally hand-corrected, never the import.
+const IMPORT_CONFIDENCE: f64 = 0.75;
+const IMPORT_MAX_CONFIDENCE: f64 = 0.99;
+
+/// `--import-draft DIR`: replace the DB timeline of each recording matching
+/// `filter` with the machine timeline in `dir` that has the same identity (file
+/// size + quick hash), as the starting point for hand-verifying it into gold. The
+/// recording stays `ready` at its segmenter version, so the app shows the import
+/// and never re-segments over it on its own. Flags on the replaced rallies are
+/// dropped; annotations (pinned to time, not rallies) are kept.
+fn import_draft(
+    conn: &mut Connection,
+    kind: &str,
+    filter: &str,
+    dir: &Path,
+) -> Result<(), String> {
+    let mut timelines: Vec<(PathBuf, ImportTimeline)> = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().is_some_and(|x| x == "json") {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let t: ImportTimeline =
+                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            timelines.push((path, t));
+        }
+    }
+    let rows: Vec<RecordingRow> = library_recordings(conn, kind)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.rel_path.contains(filter))
+        .collect();
+    if rows.is_empty() {
+        return Err(format!("no recording in the '{kind}' library matched \"{filter}\""));
+    }
+    for r in rows {
+        let found: Vec<_> = timelines
+            .iter()
+            .filter(|(_, t)| t.file_size == r.file_size && t.quick_hash == r.quick_hash)
+            .collect();
+        let (src, t) = match found.as_slice() {
+            [] => {
+                println!("SKIP  {}  (no timeline for it in {})", r.rel_path, dir.display());
+                continue;
+            }
+            [one] => *one,
+            _ => return Err(format!("{}: several timelines in {} match it", r.rel_path, dir.display())),
+        };
+        if r.segment_state != "ready" {
+            println!("SKIP  {}  (not segmented yet: {})", r.rel_path, r.segment_state);
+            continue;
+        }
+        gold::validate(&t.rallies, r.duration_ms).map_err(|e| format!("{}: {e}", src.display()))?;
+        let conf: Vec<f64> = match &t.confidence {
+            Some(c) if c.len() == t.rallies.len() => {
+                c.iter().map(|&x| x.clamp(0.0, IMPORT_MAX_CONFIDENCE)).collect()
+            }
+            Some(_) => return Err(format!("{}: confidence and rallies differ in length", src.display())),
+            None => vec![IMPORT_CONFIDENCE; t.rallies.len()],
+        };
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [r.id])
+            .map_err(|e| e.to_string())?;
+        for (&[s, e], c) in t.rallies.iter().zip(&conf) {
+            tx.execute(
+                "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![r.id, s, e, c],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        println!("DRAFT {}  ({} rallies) ← {}", r.rel_path, t.rallies.len(), src.display());
     }
     Ok(())
 }
@@ -3547,6 +3642,7 @@ struct Options {
     gold: Option<String>,
     export_gold: bool,
     dump_draft: Option<String>,
+    import_draft: Option<String>,
     root: Option<String>,
     help: bool,
 }
@@ -3571,6 +3667,7 @@ impl Options {
             gold: None,
             export_gold: false,
             dump_draft: None,
+            import_draft: None,
             root: None,
             help: false,
         };
@@ -3589,6 +3686,9 @@ impl Options {
                 "--export-gold" => opts.export_gold = true,
                 "--dump-draft" => {
                     opts.dump_draft = Some(it.next().ok_or("--dump-draft needs an output directory")?.clone());
+                }
+                "--import-draft" => {
+                    opts.import_draft = Some(it.next().ok_or("--import-draft needs a directory")?.clone());
                 }
                 "--root" => {
                     opts.root = Some(it.next().ok_or("--root needs a directory")?.clone());
@@ -3627,7 +3727,8 @@ fn print_usage() {
     println!(
         "eval-harness — referee the segmenter against hand-corrected timelines (ADR 0015)\n\n\
          USAGE:\n    eval-harness [--db PATH] [--library local|shared] [--gold DIR] [--sweep] [RECORDING]\n    \
-         eval-harness --export-gold RECORDING\n\n\
+         eval-harness --export-gold RECORDING\n    \
+         eval-harness --import-draft DIR RECORDING\n\n\
          OPTIONS:\n    \
          --db PATH              metadata DB to read (default: the app's own DB)\n    \
          --library local|shared which library to score (default: the active one)\n    \
@@ -3643,6 +3744,9 @@ fn print_usage() {
          --gold DIR             gold-file dir (default: <repo>/eval/gold)\n    \
          --export-gold          write the matching recordings' current DB timelines as gold\n    \
                                 files — run only once the whole recording is verified\n    \
+         --import-draft DIR     replace the matching recordings' DB timelines with the\n    \
+                                same-identity timeline in DIR (silver/draft JSON) — the\n    \
+                                starting point for verifying a recording into gold\n    \
          --dump-draft OUT --root DIR  segment every video under DIR (no DB) and write the\n    \
                                 drafts as OUT/*.draft.json (gold-file schema)\n    \
          RECORDING              path substring; score only matching recordings\n    \
@@ -3693,6 +3797,51 @@ mod tests {
 
     /// One hour, so a single false positive reads as exactly `1.0 / hour`.
     const ONE_HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn import_draft_replaces_only_the_matching_recordings_timeline() {
+        let dir = std::env::temp_dir().join(format!("voloph-import-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conn = db::open(&dir.join("t.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, capture_day, library) VALUES (1, '2026-06-21', 'local');
+             INSERT INTO recordings (id, session_id, path, library, file_size, quick_hash, capture_day,
+                                     segment_state, duration_ms)
+               VALUES (1, 1, 'a/IMG_1.MOV', 'local', 100, 'aaaa', '2026-06-21', 'ready', 60000),
+                      (2, 1, 'a/IMG_2.MOV', 'local', 200, 'bbbb', '2026-06-21', 'ready', 60000);
+             INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
+               VALUES (1, 0, 1000, 1.0), (2, 0, 1000, 1.0);",
+        )
+        .unwrap();
+        let src = dir.join("timelines");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("IMG_1.MOV.aaaa.silver.json"),
+            r#"{"file_size":100,"quick_hash":"aaaa","rallies":[[2000,5000],[9000,12000]],"confidence":[0.3,1.0]}"#,
+        )
+        .unwrap();
+        import_draft(&mut conn, "local", "IMG_1", &src).unwrap();
+        let rows = |conn: &Connection, id: i64| -> Vec<(i64, i64, f64)> {
+            let mut st = conn
+                .prepare("SELECT start_ms, end_ms, confidence FROM rallies WHERE recording_id = ?1 ORDER BY start_ms")
+                .unwrap();
+            st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        // The import replaces the old draft, and a machine import never reaches the
+        // hand-corrected sentinel even when the file claims 1.0.
+        assert_eq!(rows(&conn, 1), vec![(2000, 5000, 0.3), (9000, 12000, IMPORT_MAX_CONFIDENCE)]);
+        // The other recording is untouched.
+        assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
+        // A filter with no timeline in the dir changes nothing; a bad filter is an error.
+        import_draft(&mut conn, "local", "IMG_2", &src).unwrap();
+        assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
+        assert!(import_draft(&mut conn, "local", "NOPE", &src).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_perfect_draft_scores_zero_on_every_axis() {

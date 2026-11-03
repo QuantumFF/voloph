@@ -321,10 +321,20 @@ def cmd_predict(a) -> None:
             print(f"skip  {rel} (no pose file)")
             continue
         X = all_features(tr, steps, pidx[h] if model.get("pose") else None)
-        on = prob(model, X) >= model["threshold"]
-        rallies = spans(on, n)
+        pr = prob(model, X)
+        rallies = spans(pr >= model["threshold"], n)
+        # Per-rally confidence for the app's review (amber below 0.5 = "check this"):
+        # the mean model probability over the rally, rescaled so the threshold maps
+        # to 0.5 — a rally the model only just called reads as uncertain.
+        t_ms = steps * 1000 / FPS
+        thr = model["threshold"]
+        conf = []
+        for s0, e0 in rallies:
+            m = float(pr[(t_ms >= s0) & (t_ms < e0)].mean())
+            conf.append(round(0.5 + 0.5 * (m - thr) / (1 - thr) if m >= thr else 0.5 * m / thr, 3))
         doc = {"format": 1, "recording": rel, "file_size": size, "quick_hash": qh,
                "duration_ms": round(n * 1000 / FPS), "verified_unix": 0, "rallies": rallies,
+               "confidence": conf,
                "source": {"teacher": "TrackNetV3", "rule": "silver-ctx", "model": str(a.model),
                           "threshold": model["threshold"]}}
         out = a.out / f"{Path(rel).name}.{qh[:12]}.silver.json"
