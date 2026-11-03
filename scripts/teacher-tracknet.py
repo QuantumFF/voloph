@@ -75,6 +75,7 @@ def run_tracknet(chunk: Path, a) -> Path:
         "--tracknet_file", "ckpts/TrackNet_best.pt",
         "--inpaintnet_file", "ckpts/InpaintNet_best.pt",
         "--save_dir", str(chunk.parent),
+        "--eval_mode", a.eval_mode,
     ], cwd=tn, env=env, capture_output=True, text=True)
     if r.returncode != 0 or not csv_path.exists():
         sys.exit(f"TrackNet failed on {chunk}:\n{r.stderr[-2000:]}")
@@ -127,6 +128,9 @@ def main() -> None:
     ap.add_argument("--python", type=Path, required=True)
     ap.add_argument("--work", type=Path, default=Path.home() / ".cache" / "voloph-teacher" / "work")
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--eval-mode", default="weight", choices=["weight", "average", "nonoverlap"],
+                    help="TrackNet's temporal ensemble: weight/average run one 8-frame window per "
+                         "frame; nonoverlap one per 8 frames (8x cheaper — what an app could afford)")
     ap.add_argument("--filter", default=None)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)

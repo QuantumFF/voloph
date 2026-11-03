@@ -65,6 +65,11 @@ POST = {"smooth": 5, "merge_ms": 3000, "min_ms": 1500}
 # rally-time precision 0.79 / recall 0.73 (0.86 / 0.84 ignoring ±1 s of each edge);
 # v6 on the same gold: 0.33 / 0.91, 34 spurious.
 # DECLARED 2026-11-04, before any seed-3 label existed: eval/models/silver-ctx-v2.json.
+# Seed-3 result (150 moments, 14 non-gold recordings): precision 0.838 (31/37) / recall
+# 0.738 (31/42) — RED on recall (v6: 0.368 / 0.929; accuracy 0.883 vs 0.517). Of the 11
+# missed moments, 6 are within 1 s of a predicted edge and 4 are whole missed rallies;
+# 5 of the 6 false ones are within 1.2 s of an edge. Padding spans only trades
+# precision for recall on gold (min(P, R) never rises above the unpadded 0.735).
 VIDEO_EXT = {".mov", ".mp4", ".mkv", ".m4v"}
 
 
