@@ -16,8 +16,12 @@ mod media_worker;
 pub mod pose;
 mod segment;
 mod staging;
+/// Shared pieces of the learned segmenters (ADR 0019).
+mod learned;
 /// The learned student segmenter (issue #105): boosted trees on v6's cheap signals.
 mod student;
+/// The learned teacher segmenter (issue #105): TrackNet shuttle track + player pose.
+mod teacher;
 
 // Embedded libmpv playback (ADR 0008, ADR 0014). Linux and Windows — it links
 // libmpv and drives the platform's native surface (GTK overlay / child HWND)

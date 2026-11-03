@@ -230,6 +230,55 @@ struct CorpusRecording {
     has_gold: bool,
 }
 
+/// The `teacher-run` dev CLI (issue #105): run the bundled teacher on a shuttle-track
+/// CSV (`frame,t_ms,visible,x,y` at 512x288, teacher-tracknet.py's format) and pose
+/// arrays (`teacher::PoseArrays` as JSON) and write its timeline — the parity check
+/// against `scripts/silver-ctx.py` on identical inputs.
+///
+/// Usage: `teacher-run --track CSV --pose POSE.json --out TIMELINE.json`
+pub fn teacher_run_cli(args: Vec<String>) -> Result<(), String> {
+    let (mut track, mut pose, mut out) = (None, None, None);
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--track" => track = Some(it.next().ok_or("--track needs a path")?),
+            "--pose" => pose = Some(it.next().ok_or("--pose needs a path")?),
+            "--out" => out = Some(it.next().ok_or("--out needs a path")?),
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let (track, pose, out) = (
+        track.ok_or("--track is required")?,
+        pose.ok_or("--pose is required")?,
+        out.ok_or("--out is required")?,
+    );
+    let csv = std::fs::read_to_string(&track).map_err(|e| format!("{track}: {e}"))?;
+    let frames: Vec<crate::teacher::ShuttleFrame> = csv
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let c: Vec<&str> = l.split(',').collect();
+            let num = |i: usize| -> Result<i64, String> {
+                let v: f64 = c.get(i).ok_or("short row")?.trim().parse().map_err(|e| format!("{l}: {e}"))?;
+                Ok(v as i64)
+            };
+            Ok(crate::teacher::ShuttleFrame { visible: num(2)? > 0, x: num(3)?, y: num(4)? })
+        })
+        .collect::<Result<_, String>>()?;
+    let pose: crate::teacher::PoseArrays =
+        serde_json::from_slice(&std::fs::read(&pose).map_err(|e| format!("{pose}: {e}"))?).map_err(|e| e.to_string())?;
+    let model = crate::teacher::TeacherModel::bundled()?;
+    let t0 = std::time::Instant::now();
+    let rallies = crate::teacher::segment(model, &frames, &pose);
+    let doc = serde_json::json!({
+        "rallies": rallies.iter().map(|r| [r.start_ms, r.end_ms]).collect::<Vec<_>>(),
+        "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
+        "teacher_ms": t0.elapsed().as_millis() as u64,
+    });
+    std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?).map_err(|e| format!("{out}: {e}"))
+}
+
 /// The `signals-dump` dev CLI (issue #105): the three cheap signals v6 already computes —
 /// motion energy, audio energy + hit onsets, and the person-detector boxes — for one
 /// whole recording, through the app's own extractors, as JSON. The student segmenter is
