@@ -70,6 +70,15 @@ POST = {"smooth": 5, "merge_ms": 3000, "min_ms": 1500}
 # missed moments, 6 are within 1 s of a predicted edge and 4 are whole missed rallies;
 # 5 of the 6 false ones are within 1.2 s of an edge. Padding spans only trades
 # precision for recall on gold (min(P, R) never rises above the unpadded 0.735).
+#
+# Gate v2 (rally-level, #100, approved 2026-11-04 after seed 3): span precision, recall on
+# rallies >= 3 s, edges within 1 s — scored by scripts/gate2.py on the four held-out
+# recordings in eval/test/gate2-holdout.json, verified into gold from v6 drafts.
+# v3 = v2 + the edge refiner (--edges), trained on seed-1/2/3 audits and the four dev gold
+# files with every test recording excluded (--holdout). Dev (gold, leave-one-out): span
+# precision 0.963, recall >= 3 s 0.905, edges <= 1 s 80 % (v6: 0.755 / 1.00 / 36 %).
+# DECLARED 2026-11-04, before any test gold existed: eval/models/silver-ctx-v3.json; its
+# test-set predictions are frozen in eval/test/gate2/v3/.
 VIDEO_EXT = {".mov", ".mp4", ".mkv", ".m4v"}
 
 
@@ -238,20 +247,31 @@ def track_index(tracks: Path) -> dict:
 GOLD_STEP_MS = 4000  # gold is sampled every 4 s: dense neighbours add little
 
 
+def holdout_hashes(path: Path | None) -> set[str]:
+    """12-char quick hashes of a test set's recordings (eval/test/*-holdout.json),
+    which training must never see."""
+    if path is None:
+        return set()
+    return {r["quick_hash"][:12] for r in json.loads(path.read_text())["recordings"]}
+
+
 def audit_xy(audits, tracks: Path, pose: Path | None = None, shuttle: bool = True,
-             gold: Path | None = None):
+             gold: Path | None = None, exclude: set[str] = frozenset()):
     """Labelled points from moment audits (one or several files) and, optionally,
     gold files sampled every GOLD_STEP_MS. A recording with gold contributes only
-    its gold samples (the audit moments in it are the same truth, coarser)."""
+    its gold samples (the audit moments in it are the same truth, coarser).
+    Recordings in `exclude` (a held-out test set) contribute nothing."""
     if isinstance(audits, Path):
         audits = [audits]
     idx = track_index(tracks)
     pidx = pose_index(pose)
     by_rec: dict[str, list] = {}
-    gold_recs = set()
+    gold_recs = set(exclude)
     for g in sorted(gold.glob("*.gold.json")) if gold else []:
         d = json.loads(g.read_text())
         h = d["quick_hash"][:12]
+        if h in exclude:
+            continue
         gold_recs.add(h)
         R = d["rallies"]
         for t in range(GOLD_STEP_MS // 2, d["duration_ms"], GOLD_STEP_MS):
@@ -306,15 +326,106 @@ def cmd_cv(a) -> None:
     print(f"max min(precision, recall): thr {best[0]} → {best[1]:.3f}")
 
 
+# Edge refiner (v3). The context model above works on 0.5 s steps smoothed over 2.5 s,
+# so its edges are ~0.9 s off on average — a lot when gold rallies average 4.4 s. A
+# second, fine-grained model says "in a rally?" every 0.1 s from local shuttle and
+# player signals (EDGE_OFFS bins of EDGE_BIN frames around the frame), trained on
+# frames within 3 s of gold edges; each predicted edge then moves to the change point
+# within EDGE_WIN frames that best fits those per-frame probabilities.
+EDGE_BIN = 6  # 0.2 s
+EDGE_OFFS = range(-8, 8)  # -1.6 .. +1.6 s
+EDGE_PAD = 60
+EDGE_WIN = 60  # search ±2 s around each predicted edge
+EDGE_C = 1.0
+
+
+def edge_signals(tr: dict, po: dict) -> np.ndarray:
+    """(n, 8) per-frame signals at 30 fps: shuttle seen, moving, speed, height, hit;
+    fastest and second-fastest player, someone standing still (pose upsampled)."""
+    n = len(tr["det"])
+
+    def up(v):
+        x = np.repeat(np.asarray(v, float), FPS // po["fps"])
+        return np.pad(x, (0, max(0, n - len(x))))[:n]
+
+    return np.stack([tr["det"].astype(float), (tr["sp"] > 2).astype(float), np.minimum(tr["sp"], 30) / 30,
+                     np.where(tr["det"], tr["y"] / 288, 0), _flips(tr["vy"]),
+                     np.minimum(up(po["fast1"]), 5) / 5, np.minimum(up(po["fast2"]), 5) / 5, up(po["still"])], 1)
+
+
+def edge_features(sig: np.ndarray, frames: np.ndarray) -> np.ndarray:
+    s = np.vstack([np.zeros((EDGE_PAD, sig.shape[1])), sig, np.zeros((EDGE_PAD, sig.shape[1]))])
+    c = np.vstack([np.zeros((1, s.shape[1])), np.cumsum(s, 0)])
+    cols = []
+    for o in EDGE_OFFS:
+        lo = np.clip(frames + EDGE_PAD + o * EDGE_BIN, 0, len(s))
+        hi = np.clip(lo + EDGE_BIN, 0, len(s))
+        cols.append((c[hi] - c[lo]) / EDGE_BIN)
+    return np.hstack(cols)
+
+
+def edge_xy(gold: Path, tracks: Path, pose: Path, exclude: set[str]):
+    idx, pidx = track_index(tracks), pose_index(pose)
+    X, Y = [], []
+    for g in sorted(gold.glob("*.gold.json")):
+        d = json.loads(g.read_text())
+        h = d["quick_hash"][:12]
+        if h in exclude:
+            continue
+        tr = load_track(idx[h])
+        n = len(tr["det"])
+        sig = edge_signals(tr, load_pose(pidx[h]))
+        R = [(s0 * FPS // 1000, e0 * FPS // 1000) for s0, e0 in d["rallies"]]
+        fr = np.array(sorted({f for s0, e0 in R for t in (s0, e0) for f in range(t - 90, t + 91, 3) if 0 <= f < n}))
+        X.append(edge_features(sig, fr))
+        Y += [any(s0 <= f < e0 for s0, e0 in R) for f in fr]
+    return np.vstack(X), np.array(Y)
+
+
+def refine_edges(edge: dict, sig: np.ndarray, rallies: list[list[int]]) -> list[list[int]]:
+    n = len(sig)
+    out = []
+    for s0, e0 in rallies:
+        new = []
+        for t, is_start in ((s0, True), (e0, False)):
+            f0 = t * FPS // 1000
+            fr = np.arange(max(0, f0 - EDGE_WIN - 45), min(n, f0 + EDGE_WIN + 45), 3)
+            q = np.clip(prob(edge, edge_features(sig, fr)), 1e-3, 1 - 1e-3)
+            li, lo = np.log(q), np.log(1 - q)
+            best = None
+            for k in range(len(fr)):
+                if abs(fr[k] - f0) > EDGE_WIN:
+                    continue
+                ll = lo[:k].sum() + li[k:].sum() if is_start else li[:k].sum() + lo[k:].sum()
+                if best is None or ll > best[0]:
+                    best = (ll, fr[k])
+            new.append(int(best[1] * 1000 / FPS) if best else t)
+        if new[1] - new[0] >= 500:
+            out.append(new)
+    return out
+
+
 def cmd_train(a) -> None:
-    X, Y, G = audit_xy(a.audit, a.tracks, a.pose, gold=a.gold)
+    exclude = holdout_hashes(a.holdout)
+    X, Y, G = audit_xy(a.audit, a.tracks, a.pose, gold=a.gold, exclude=exclude)
     m = fit(X, Y)
     m.update({"pose": a.pose is not None, "threshold": a.threshold, "post": POST,
               "trained_on": [str(x) for x in a.audit] + ([str(a.gold)] if a.gold else []), "n": int(len(Y)),
-              "n_rally": int(Y.sum()), "step_frames": STEP})
+              "n_rally": int(Y.sum()), "step_frames": STEP,
+              "held_out": str(a.holdout) if a.holdout else None})
+    if a.edges:
+        if not (a.gold and a.pose):
+            raise SystemExit("--edges needs --gold and --pose")
+        from sklearn.linear_model import LogisticRegression
+        Xe, Ye = edge_xy(a.gold, a.tracks, a.pose, exclude)
+        mu, sd = Xe.mean(0), Xe.std(0) + 1e-6
+        clf = LogisticRegression(C=EDGE_C, max_iter=5000).fit((Xe - mu) / sd, Ye)
+        m["edge"] = {"mu": mu.tolist(), "sd": sd.tolist(), "coef": clf.coef_[0].tolist(),
+                     "intercept": float(clf.intercept_[0]), "n": int(len(Ye))}
     a.model.parent.mkdir(parents=True, exist_ok=True)
     a.model.write_text(json.dumps(m, indent=1) + "\n")
-    print(f"trained on {len(Y)} moments ({Y.sum()} rally) → {a.model}  threshold {a.threshold}")
+    print(f"trained on {len(Y)} moments ({Y.sum()} rally){' + edge refiner' if a.edges else ''}"
+          f"{f', {len(exclude)} recordings held out' if exclude else ''} → {a.model}  threshold {a.threshold}")
 
 
 def spans(on: np.ndarray, n_frames: int) -> list[list[int]]:
@@ -379,6 +490,10 @@ def cmd_predict(a) -> None:
         if post.get("smooth", 1) > 1:
             pr = np.convolve(pr, np.ones(post["smooth"]) / post["smooth"], "same")
         rallies = tidy(spans(pr >= model["threshold"], n), post.get("merge_ms", 0), post.get("min_ms", 0))
+        if model.get("edge"):
+            sig = edge_signals(tr, load_pose(pidx[h]))
+            rallies = [r for r in refine_edges(model["edge"], sig, rallies)
+                       if r[1] - r[0] >= post.get("min_ms", 0)]
         # Per-rally confidence for the app's review (amber below 0.5 = "check this"):
         # the mean model probability over the rally, rescaled so the threshold maps
         # to 0.5 — a rally the model only just called reads as uncertain.
@@ -414,6 +529,8 @@ def main() -> None:
     s.add_argument("--pose", type=Path)
     s.add_argument("--model", type=Path, required=True)
     s.add_argument("--threshold", type=float, required=True)
+    s.add_argument("--holdout", type=Path, help="test-set file: its recordings never reach training")
+    s.add_argument("--edges", action="store_true", help="also train the edge refiner (needs --gold, --pose)")
     s = sub.add_parser("predict")
     s.add_argument("--tracks", type=Path, required=True)
     s.add_argument("--root", type=Path, required=True)
