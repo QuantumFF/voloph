@@ -162,7 +162,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 42688,
    "label": "no_rally",
-   "seq": 7
+   "seq": 7,
+   "recheck": "no_rally",
+   "recheck_seq": 1
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -170,7 +172,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 107166,
    "label": "no_rally",
-   "seq": 110
+   "seq": 110,
+   "recheck": "no_rally",
+   "recheck_seq": 17
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -178,7 +182,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 265554,
    "label": "no_rally",
-   "seq": 80
+   "seq": 80,
+   "recheck": "no_rally",
+   "recheck_seq": 7
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -186,7 +192,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 303683,
    "label": "no_rally",
-   "seq": 24
+   "seq": 24,
+   "recheck": "no_rally",
+   "recheck_seq": 35
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -202,7 +210,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 427946,
    "label": "no_rally",
-   "seq": 150
+   "seq": 150,
+   "recheck": "no_rally",
+   "recheck_seq": 39
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -218,7 +228,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 505619,
    "label": "no_rally",
-   "seq": 134
+   "seq": 134,
+   "recheck": "no_rally",
+   "recheck_seq": 2
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -226,7 +238,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 512285,
    "label": "no_rally",
-   "seq": 56
+   "seq": 56,
+   "recheck": "no_rally",
+   "recheck_seq": 15
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -258,7 +272,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 622848,
    "label": "no_rally",
-   "seq": 93
+   "seq": 93,
+   "recheck": "no_rally",
+   "recheck_seq": 9
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -266,7 +282,9 @@
    "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
    "t_ms": 783216,
    "label": "no_rally",
-   "seq": 85
+   "seq": 85,
+   "recheck": "no_rally",
+   "recheck_seq": 31
   },
   {
    "recording": "21-06-2026/IMG_5930.MOV",
@@ -290,7 +308,9 @@
    "quick_hash": "e321eb44d343b0de29557d8972e43727bba995c031916bd28cf9a0c63d501ad5",
    "t_ms": 261881,
    "label": "no_rally",
-   "seq": 111
+   "seq": 111,
+   "recheck": "no_rally",
+   "recheck_seq": 24
   },
   {
    "recording": "21-06-2026/IMG_5931.MOV",
@@ -314,7 +334,9 @@
    "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
    "t_ms": 71348,
    "label": "no_rally",
-   "seq": 23
+   "seq": 23,
+   "recheck": "no_rally",
+   "recheck_seq": 13
   },
   {
    "recording": "21-06-2026/IMG_5933.MOV",
@@ -330,7 +352,9 @@
    "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
    "t_ms": 516504,
    "label": "no_rally",
-   "seq": 102
+   "seq": 102,
+   "recheck": "no_rally",
+   "recheck_seq": 11
   },
   {
    "recording": "21-06-2026/IMG_5934.MOV",
@@ -338,7 +362,9 @@
    "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
    "t_ms": 38608,
    "label": "no_rally",
-   "seq": 16
+   "seq": 16,
+   "recheck": "no_rally",
+   "recheck_seq": 10
   },
   {
    "recording": "21-06-2026/IMG_5934.MOV",
@@ -354,7 +380,9 @@
    "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
    "t_ms": 230511,
    "label": "no_rally",
-   "seq": 87
+   "seq": 87,
+   "recheck": "unsure",
+   "recheck_seq": 6
   },
   {
    "recording": "21-06-2026/IMG_5934.MOV",
@@ -370,7 +398,9 @@
    "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
    "t_ms": 353309,
    "label": "no_rally",
-   "seq": 92
+   "seq": 92,
+   "recheck": "no_rally",
+   "recheck_seq": 40
   },
   {
    "recording": "21-06-2026/IMG_5934.MOV",
@@ -426,7 +456,9 @@
    "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
    "t_ms": 1149297,
    "label": "no_rally",
-   "seq": 8
+   "seq": 8,
+   "recheck": "no_rally",
+   "recheck_seq": 38
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -442,7 +474,9 @@
    "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
    "t_ms": 89599,
    "label": "no_rally",
-   "seq": 36
+   "seq": 36,
+   "recheck": "no_rally",
+   "recheck_seq": 14
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -450,7 +484,9 @@
    "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
    "t_ms": 112174,
    "label": "no_rally",
-   "seq": 77
+   "seq": 77,
+   "recheck": "no_rally",
+   "recheck_seq": 22
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -458,7 +494,9 @@
    "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
    "t_ms": 135610,
    "label": "no_rally",
-   "seq": 146
+   "seq": 146,
+   "recheck": "no_rally",
+   "recheck_seq": 36
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -466,7 +504,9 @@
    "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
    "t_ms": 151864,
    "label": "no_rally",
-   "seq": 117
+   "seq": 117,
+   "recheck": "no_rally",
+   "recheck_seq": 37
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -474,7 +514,9 @@
    "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
    "t_ms": 324652,
    "label": "no_rally",
-   "seq": 123
+   "seq": 123,
+   "recheck": "no_rally",
+   "recheck_seq": 30
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -498,7 +540,9 @@
    "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
    "t_ms": 549311,
    "label": "no_rally",
-   "seq": 19
+   "seq": 19,
+   "recheck": "no_rally",
+   "recheck_seq": 25
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -514,7 +558,9 @@
    "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
    "t_ms": 864632,
    "label": "rally",
-   "seq": 94
+   "seq": 94,
+   "recheck": "rally",
+   "recheck_seq": 21
   },
   {
    "recording": "21-06-2026/IMG_5935.MOV",
@@ -530,7 +576,9 @@
    "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
    "t_ms": 236401,
    "label": "no_rally",
-   "seq": 59
+   "seq": 59,
+   "recheck": "no_rally",
+   "recheck_seq": 19
   },
   {
    "recording": "IMG_0045.MOV",
@@ -538,7 +586,9 @@
    "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
    "t_ms": 569848,
    "label": "no_rally",
-   "seq": 39
+   "seq": 39,
+   "recheck": "no_rally",
+   "recheck_seq": 18
   },
   {
    "recording": "IMG_0046.MOV",
@@ -546,7 +596,9 @@
    "quick_hash": "58b5435671136c288cb46722bd379359f82c8d589bbb80956495e33066b97f72",
    "t_ms": 131134,
    "label": "no_rally",
-   "seq": 96
+   "seq": 96,
+   "recheck": "no_rally",
+   "recheck_seq": 33
   },
   {
    "recording": "IMG_0046.MOV",
@@ -562,7 +614,9 @@
    "quick_hash": "58b5435671136c288cb46722bd379359f82c8d589bbb80956495e33066b97f72",
    "t_ms": 370622,
    "label": "no_rally",
-   "seq": 18
+   "seq": 18,
+   "recheck": "no_rally",
+   "recheck_seq": 26
   },
   {
    "recording": "IMG_5916.MOV",
@@ -586,7 +640,9 @@
    "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
    "t_ms": 592066,
    "label": "no_rally",
-   "seq": 114
+   "seq": 114,
+   "recheck": "no_rally",
+   "recheck_seq": 41
   },
   {
    "recording": "IMG_5916.MOV",
@@ -682,7 +738,9 @@
    "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
    "t_ms": 40835,
    "label": "no_rally",
-   "seq": 98
+   "seq": 98,
+   "recheck": "no_rally",
+   "recheck_seq": 32
   },
   {
    "recording": "IMG_5918.MOV",
@@ -690,7 +748,9 @@
    "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
    "t_ms": 114275,
    "label": "no_rally",
-   "seq": 30
+   "seq": 30,
+   "recheck": "no_rally",
+   "recheck_seq": 16
   },
   {
    "recording": "IMG_5918.MOV",
@@ -834,7 +894,9 @@
    "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
    "t_ms": 919751,
    "label": "rally",
-   "seq": 52
+   "seq": 52,
+   "recheck": "rally",
+   "recheck_seq": 4
   },
   {
    "recording": "IMG_5919.MOV",
@@ -906,7 +968,9 @@
    "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
    "t_ms": 664388,
    "label": "no_rally",
-   "seq": 65
+   "seq": 65,
+   "recheck": "no_rally",
+   "recheck_seq": 27
   },
   {
    "recording": "IMG_5921.MOV",
@@ -922,7 +986,9 @@
    "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
    "t_ms": 160468,
    "label": "rally",
-   "seq": 116
+   "seq": 116,
+   "recheck": "rally",
+   "recheck_seq": 20
   },
   {
    "recording": "IMG_5921.MOV",
@@ -962,7 +1028,9 @@
    "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
    "t_ms": 803066,
    "label": "no_rally",
-   "seq": 28
+   "seq": 28,
+   "recheck": "no_rally",
+   "recheck_seq": 3
   },
   {
    "recording": "PXL_20260615_060612369.TS-004.mp4",
@@ -1114,7 +1182,9 @@
    "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
    "t_ms": 716980,
    "label": "no_rally",
-   "seq": 12
+   "seq": 12,
+   "recheck": "no_rally",
+   "recheck_seq": 29
   },
   {
    "recording": "PXL_20260615_064720510.TS-003.mp4",
@@ -1122,7 +1192,9 @@
    "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
    "t_ms": 807676,
    "label": "rally",
-   "seq": 10
+   "seq": 10,
+   "recheck": "rally",
+   "recheck_seq": 34
   },
   {
    "recording": "PXL_20260615_064720510.TS-003.mp4",
@@ -1130,7 +1202,9 @@
    "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
    "t_ms": 957534,
    "label": "no_rally",
-   "seq": 120
+   "seq": 120,
+   "recheck": "no_rally",
+   "recheck_seq": 12
   },
   {
    "recording": "PXL_20260615_064720510.TS-003.mp4",
@@ -1178,7 +1252,9 @@
    "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
    "t_ms": 1376075,
    "label": "no_rally",
-   "seq": 112
+   "seq": 112,
+   "recheck": "no_rally",
+   "recheck_seq": 23
   },
   {
    "recording": "PXL_20260615_064720510.TS-003.mp4",
@@ -1258,7 +1334,9 @@
    "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
    "t_ms": 588617,
    "label": "no_rally",
-   "seq": 49
+   "seq": 49,
+   "recheck": "no_rally",
+   "recheck_seq": 5
   },
   {
    "recording": "PXL_20260615_071725666.TS-006.mp4",
@@ -1274,7 +1352,9 @@
    "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
    "t_ms": 877973,
    "label": "rally",
-   "seq": 140
+   "seq": 140,
+   "recheck": "rally",
+   "recheck_seq": 8
   },
   {
    "recording": "PXL_20260615_071725666.TS-006.mp4",
@@ -1282,7 +1362,9 @@
    "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
    "t_ms": 1122045,
    "label": "no_rally",
-   "seq": 131
+   "seq": 131,
+   "recheck": "no_rally",
+   "recheck_seq": 28
   },
   {
    "recording": "PXL_20260615_071725666.TS-006.mp4",
@@ -1298,7 +1380,9 @@
    "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
    "t_ms": 598518,
    "label": "no_rally",
-   "seq": 75
+   "seq": 75,
+   "recheck": "no_rally",
+   "recheck_seq": 42
   },
   {
    "recording": "PXL_20260615_073731514.TS-010.mp4",
@@ -1356,5 +1440,72 @@
    "label": "no_rally",
    "seq": 57
   }
+ ],
+ "recheck_order": [
+  0,
+  7,
+  100,
+  84,
+  137,
+  24,
+  2,
+  139,
+  12,
+  22,
+  21,
+  121,
+  19,
+  35,
+  8,
+  66,
+  1,
+  47,
+  46,
+  95,
+  44,
+  36,
+  127,
+  16,
+  42,
+  50,
+  93,
+  140,
+  119,
+  39,
+  13,
+  65,
+  48,
+  120,
+  3,
+  37,
+  38,
+  33,
+  5,
+  26,
+  53,
+  142
+ ],
+ "recheck_disputed": [
+  0,
+  3,
+  8,
+  12,
+  13,
+  16,
+  19,
+  21,
+  22,
+  24,
+  26,
+  33,
+  35,
+  36,
+  37,
+  38,
+  39,
+  42,
+  46,
+  47,
+  48
  ]
 }
