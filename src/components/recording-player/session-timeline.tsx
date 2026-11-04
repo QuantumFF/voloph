@@ -2,21 +2,28 @@
 
 import {
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type Dispatch,
   type SetStateAction,
 } from "react"
-import { fileName, formatClock } from "@/lib/format"
+import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react"
+
+import { fileName, formatClock, formatTimecode } from "@/lib/format"
 import {
   UNCERTAIN_CONFIDENCE,
   clamp,
   editAffordances,
   rallyKey,
+  paddedPlayIntervals,
+  rallyLeadInMs,
   stripScrollTarget,
+  type Padding,
   type SessionAnnotation,
   type SessionModel,
   type SessionRally,
@@ -28,12 +35,25 @@ import {
 } from "./constants"
 import { RallyBlock, type DragState } from "./rally-block"
 import { EditToolbar, TimelineNav } from "./timeline-toolbar"
+import { rulerScale, rulerTicks } from "./timeline-ruler"
 
 /** How much each Alt+scroll notch over the timeline zooms. */
 const ALT_SCROLL_ZOOM_FACTOR = 1.15
 
+/**
+ * The share of the strip's width at each side that counts as "near the edge"
+ * for follow: a playhead inside it gets recentred.
+ */
+const FOLLOW_MARGIN = 0.15
+
 /** How close a dragged rally edge must be to magnetically land on the playhead. */
 const PLAYHEAD_SNAP_THRESHOLD_MS = 250
+
+/**
+ * How far past each side of the visible window ruler ticks are rendered, as a
+ * fraction of its width, so a quick scroll doesn't reveal a bare ruler.
+ */
+const RULER_OVERSCAN = 0.5
 
 /** Imperative surface of the timeline strip the player drives (jump-to-playhead). */
 export interface SessionTimelineHandle {
@@ -46,9 +66,18 @@ export interface SessionTimelineHandle {
  * pixels-per-second scale. Each recording's audio waveform fills its span with
  * detected rallies drawn as blocks over it, gaps the empty space between them
  * (ADR 0001), low-confidence rallies styled as uncertain regions (ADR 0002), and
- * faint dividers marking recording boundaries. The playhead tracks the session
- * position and auto-scrolls into view. Clicking the strip seeks the session
- * (crossing recordings as needed); a rally block seeks to its start.
+ * recordings marked off by solid dividers, alternating shading and a numbered
+ * label at each one's start. A time ruler across the top labels the
+ * session clock, with gridlines down through the strip at each label. The
+ * playhead (red, with a timecode badge on the ruler) tracks the session
+ * position and auto-scrolls into view; when you've scrolled it out of view an
+ * edge chip points the way back. Each play interval — rallies padded by the
+ * lead-in and tail (#104), merged where they touch — is an outlined box with
+ * the stored rallies inset inside; clicking a rally jumps to its padded
+ * lead-in, and clicking a box's padding to the box's start, like `[`/`]`;
+ * clicking the ruler seeks to that exact point, inside a rally or not (a hover cursor
+ * shows the time it would land on); clicking a gap seeks there. Seeks cross
+ * recordings as needed.
  *
  * In correction mode (issue #7) each edit is resolved against the recording that
  * owns the rally: drag an edge to adjust, split at the playhead, merge with the
@@ -61,6 +90,8 @@ export const SessionTimeline = forwardRef<
     /** Verdict annotations lifted onto the session axis, drawn as markers. */
     annotations: SessionAnnotation[]
     globalPlayheadMs: number | null
+    /** Playback padding (#104), drawn around each rally and used by its click. */
+    padding: Padding
     /**
      * Zoom and playhead-follow are owned by the player (the status bar drives
      * them from outside the strip); the strip's wheel/scroll handlers mutate
@@ -95,6 +126,7 @@ export const SessionTimeline = forwardRef<
     session,
     annotations,
     globalPlayheadMs,
+    padding,
     pxPerSec,
     setPxPerSec,
     following,
@@ -125,6 +157,16 @@ export const SessionTimeline = forwardRef<
   // ahead; the jump-to-playhead control re-arms it. This ref guards our own
   // programmatic scrollLeft writes so they don't read back as a manual scroll.
   const programmaticScrollRef = useRef(false)
+  // The strip's visible window (content px), so the ruler renders only the
+  // ticks in view and the playhead chip knows when the playhead is off-screen.
+  const [viewport, setViewport] = useState({ left: 0, width: 0 })
+  // The hover cursor is moved imperatively — re-rendering the strip (and its
+  // waveform) on every pointer move would be wasted work.
+  const hoverLineRef = useRef<HTMLDivElement>(null)
+  const hoverLabelRef = useRef<HTMLSpanElement>(null)
+  // An edge drag released off its rally still fires a click on the strip;
+  // swallow that one so finishing a drag doesn't also move the playhead.
+  const suppressClickRef = useRef(false)
 
   const totalMs = session.totalMs
   const totalPx = (totalMs / 1000) * pxPerSec
@@ -195,6 +237,10 @@ export const SessionTimeline = forwardRef<
         }
       })
     const up = () => {
+      suppressClickRef.current = true
+      setTimeout(() => {
+        suppressClickRef.current = false
+      }, 0)
       setDrag((d) => {
         if (d) {
           const rally = session.rallies.find((r) => rallyKey(r) === d.key)
@@ -215,6 +261,32 @@ export const SessionTimeline = forwardRef<
     }
   }, [drag, session, xToMs, snapToPlayhead, onAdjustRally])
 
+  // Cursor-anchored zoom. A wheel notch can't scroll the strip itself: the
+  // strip hasn't re-rendered at the new width yet, so the browser would clamp
+  // the scroll to the old width (zooming in near the end), and a fast burst of
+  // notches would each read a `scrollLeft` that belongs to a stale zoom — the
+  // view jumping away from the cursor. Instead a notch records *which moment*
+  // sits under the cursor and the zoom it asks for; the layout effect below
+  // puts that moment back under the cursor once the strip has the new width.
+  // `renderedPxRef` is the zoom the DOM currently shows (so `scrollLeft` reads
+  // against it), `targetPxRef` the latest zoom asked for (so notches compound).
+  const renderedPxRef = useRef(pxPerSec)
+  const targetPxRef = useRef(pxPerSec)
+  const zoomAnchorRef = useRef<{ ms: number; viewportX: number } | null>(null)
+  const playheadRef = useRef(globalPlayheadMs)
+  useLayoutEffect(() => {
+    playheadRef.current = globalPlayheadMs
+  }, [globalPlayheadMs])
+  useLayoutEffect(() => {
+    renderedPxRef.current = pxPerSec
+    targetPxRef.current = pxPerSec
+    const anchor = zoomAnchorRef.current
+    zoomAnchorRef.current = null
+    if (anchor) {
+      scrollStripTo((anchor.ms / 1000) * pxPerSec - anchor.viewportX)
+    }
+  }, [pxPerSec, scrollStripTo])
+
   // The wheel over the strip: Alt+scroll zooms centered on the cursor; a plain
   // scroll pans the strip horizontally (so a vertical mouse wheel scrubs the
   // timeline without having to grab the scrollbar). Re-attaches when the strip
@@ -225,20 +297,30 @@ export const SessionTimeline = forwardRef<
     const onWheel = (e: WheelEvent) => {
       if (e.altKey) {
         e.preventDefault()
+        if (e.deltaY === 0) return
         const factor =
           e.deltaY < 0 ? ALT_SCROLL_ZOOM_FACTOR : 1 / ALT_SCROLL_ZOOM_FACTOR
-        const rect = el.getBoundingClientRect()
-        const cursorContentPx = e.clientX - rect.left + el.scrollLeft
-        setPxPerSec((p) => {
-          const nextPx = clamp(
-            p * factor,
-            SESSION_PX_PER_SEC_MIN,
-            SESSION_PX_PER_SEC_MAX
-          )
-          const scale = nextPx / p
-          scrollStripTo(cursorContentPx * scale - (e.clientX - rect.left))
-          return nextPx
-        })
+        const nextPx = clamp(
+          targetPxRef.current * factor,
+          SESSION_PX_PER_SEC_MIN,
+          SESSION_PX_PER_SEC_MAX
+        )
+        if (nextPx === targetPxRef.current) return
+        const viewportX = e.clientX - el.getBoundingClientRect().left
+        // The moment under the cursor, read against what's on screen.
+        const ms = ((el.scrollLeft + viewportX) / renderedPxRef.current) * 1000
+        zoomAnchorRef.current = { ms, viewportX }
+        targetPxRef.current = nextPx
+        // Zooming around the cursor is looking somewhere on purpose: if it
+        // pushes the playhead out of the followed band, stop following rather
+        // than let follow yank the view back to the playhead.
+        const playhead = playheadRef.current
+        if (playhead != null) {
+          const x = ((playhead - ms) / 1000) * nextPx + viewportX
+          const margin = el.clientWidth * FOLLOW_MARGIN
+          if (x < margin || x > el.clientWidth - margin) setFollowing(false)
+        }
+        setPxPerSec(nextPx)
         return
       }
       // Pan horizontally. Trackpads send horizontal intent as deltaX; a plain
@@ -250,7 +332,7 @@ export const SessionTimeline = forwardRef<
     }
     el.addEventListener("wheel", onWheel, { passive: false })
     return () => el.removeEventListener("wheel", onWheel)
-  }, [hasRallies, scrollStripTo, setPxPerSec])
+  }, [hasRallies, setPxPerSec, setFollowing])
 
   // A hand scroll (wheel or scrollbar) stops the strip tracking the playhead, so
   // you can look ahead without it snapping back. Our own programmatic writes are
@@ -259,6 +341,7 @@ export const SessionTimeline = forwardRef<
     const el = scrollRef.current
     if (!el) return
     const onScroll = () => {
+      setViewport({ left: el.scrollLeft, width: el.clientWidth })
       if (programmaticScrollRef.current) {
         programmaticScrollRef.current = false
         return
@@ -268,6 +351,35 @@ export const SessionTimeline = forwardRef<
     el.addEventListener("scroll", onScroll, { passive: true })
     return () => el.removeEventListener("scroll", onScroll)
   }, [hasRallies, setFollowing])
+
+  // Track the strip's width (and initial offset) so the visible window stays
+  // right through window resizes.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const measure = () =>
+      setViewport({ left: el.scrollLeft, width: el.clientWidth })
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [hasRallies])
+
+  const showHover = useCallback(
+    (clientX: number) => {
+      const line = hoverLineRef.current
+      const label = hoverLabelRef.current
+      if (!line || !label) return
+      const ms = xToMs(clientX)
+      line.style.left = `${(ms / 1000) * pxPerSec}px`
+      label.textContent = formatTimecode(ms)
+      line.hidden = false
+    },
+    [xToMs, pxPerSec]
+  )
+  const hideHover = useCallback(() => {
+    if (hoverLineRef.current) hoverLineRef.current.hidden = true
+  }, [])
 
   // Recenter the strip on the playhead and re-arm follow — the jump-to-playhead
   // control, also reached by the `F` key through this imperative handle.
@@ -286,7 +398,7 @@ export const SessionTimeline = forwardRef<
     const el = scrollRef.current
     if (!el || !following || globalPlayheadMs == null || totalMs === 0) return
     const x = (globalPlayheadMs / 1000) * pxPerSec
-    const margin = el.clientWidth * 0.15
+    const margin = el.clientWidth * FOLLOW_MARGIN
     if (
       x < el.scrollLeft + margin ||
       x > el.scrollLeft + el.clientWidth - margin
@@ -314,6 +426,49 @@ export const SessionTimeline = forwardRef<
   const playheadPx =
     globalPlayheadMs !== null ? (globalPlayheadMs / 1000) * pxPerSec : null
   const snappedToPlayhead = drag?.snappedToPlayhead ?? false
+
+  // The play-interval boxes, from each rally's live bounds so a dragged edge
+  // reshapes (and re-merges) its box as it moves.
+  const playBoxes = paddedPlayIntervals(
+    session.rallies.map((r) => {
+      const seg = session.segments.find((s) => s.index === r.recordingIndex)
+      const recordingStart = seg?.offsetMs ?? 0
+      const live =
+        drag?.key === rallyKey(r)
+          ? [drag.globalMs, drag.anchorGlobalMs]
+          : [r.globalStart, r.globalEnd]
+      return {
+        recordingIndex: r.recordingIndex,
+        globalStart: Math.min(live[0], live[1]),
+        globalEnd: Math.max(live[0], live[1]),
+        recordingStart,
+        recordingEnd: recordingStart + (seg?.durationMs ?? 0),
+      }
+    }),
+    padding
+  )
+
+  // Ticks only for the visible window (plus overscan): a long session at deep
+  // zoom would otherwise be tens of thousands of nodes.
+  const scale = rulerScale(pxPerSec)
+  const overscanPx = viewport.width * RULER_OVERSCAN
+  const ticks = rulerTicks(
+    scale,
+    ((viewport.left - overscanPx) / pxPerSec) * 1000,
+    ((viewport.left + viewport.width + overscanPx) / pxPerSec) * 1000,
+    totalMs
+  )
+  const majorTicks = ticks.filter((t) => t.major)
+
+  // Which side the playhead has gone off to, if you've scrolled it out of view.
+  const playheadOffside =
+    playheadPx === null || viewport.width === 0
+      ? null
+      : playheadPx < viewport.left
+        ? "left"
+        : playheadPx > viewport.left + viewport.width
+          ? "right"
+          : null
 
   return (
     <div className="shrink-0 space-y-2">
@@ -352,15 +507,18 @@ export const SessionTimeline = forwardRef<
         />
       ) : null}
       {hasRallies ? (
-        <>
+        <div className="relative">
           <div
             ref={scrollRef}
             className="w-full overflow-x-auto rounded-md bg-muted"
           >
             <div
               ref={contentRef}
-              className="relative h-20 cursor-pointer"
+              className="relative cursor-pointer select-none"
               style={{ width: `${Math.max(totalPx, 1)}px` }}
+              onClickCapture={(e) => {
+                if (suppressClickRef.current) e.stopPropagation()
+              }}
               onClick={(e) => {
                 if (editing) {
                   setSelectedKey(null)
@@ -369,6 +527,135 @@ export const SessionTimeline = forwardRef<
                 onSeekGlobal(xToMs(e.clientX))
               }}
             >
+              {/* The time ruler: labelled major ticks, short minor ones. The
+                  one place a click seeks to an exact point inside a rally — in
+                  edit mode too, keeping the selection, so you can place the
+                  playhead for a split. */}
+              <div
+                className="relative h-5 cursor-col-resize overflow-hidden border-b border-foreground/15 bg-background/40 hover:bg-background/70"
+                onPointerMove={(e) => showHover(e.clientX)}
+                onPointerLeave={hideHover}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onSeekGlobal(xToMs(e.clientX))
+                }}
+              >
+                {ticks.map((t) => (
+                  <div
+                    key={t.ms}
+                    className={`pointer-events-none absolute bottom-0 w-px ${
+                      t.major
+                        ? "h-2.5 bg-foreground/50"
+                        : "h-1 bg-foreground/25"
+                    }`}
+                    style={{ left: `${(t.ms / 1000) * pxPerSec}px` }}
+                  >
+                    {t.major ? (
+                      <span className="absolute bottom-0.5 left-1 text-[10px] leading-none whitespace-nowrap text-muted-foreground tabular-nums">
+                        {formatTimecode(t.ms)}
+                      </span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+
+              <div className="relative h-20">
+                {session.segments.map((seg) => {
+                  if (seg.durationMs == null || !seg.timeline) return null
+                  const left = (seg.offsetMs / 1000) * pxPerSec
+                  const width = (seg.durationMs / 1000) * pxPerSec
+                  return (
+                    <div
+                      key={seg.path}
+                      className={`pointer-events-none absolute inset-y-0 ${
+                        seg.index % 2 === 1 ? "bg-foreground/[0.07]" : ""
+                      }`}
+                      style={{ left: `${left}px`, width: `${width}px` }}
+                    >
+                      <Waveform peaks={seg.timeline.waveform} />
+                    </div>
+                  )
+                })}
+                {/* Gridlines down from each labelled tick, behind the rallies. */}
+                {majorTicks.map((t) => (
+                  <div
+                    key={t.ms}
+                    className="pointer-events-none absolute inset-y-0 w-px bg-foreground/10"
+                    style={{ left: `${(t.ms / 1000) * pxPerSec}px` }}
+                  />
+                ))}
+                {/* Each play interval as a box: the stored rallies padded by
+                    the lead-in and tail and merged where they touch — exactly
+                    what playback and [ / ] step through. Clicking a box's
+                    padding opens it where playback would. */}
+                {playBoxes.map((box, i) => (
+                  <div
+                    key={i}
+                    aria-hidden
+                    onClick={(e) => {
+                      if (editing) return
+                      e.stopPropagation()
+                      onSeekGlobal(box.globalStart)
+                    }}
+                    className="absolute inset-y-0 cursor-pointer rounded-sm border border-primary/80 bg-primary/40 hover:bg-primary/50"
+                    style={{
+                      left: `${(box.globalStart / 1000) * pxPerSec}px`,
+                      width: `${((box.globalEnd - box.globalStart) / 1000) * pxPerSec}px`,
+                    }}
+                  />
+                ))}
+                {session.rallies.map((rally, i) => {
+                  const key = rallyKey(rally)
+                  const seg = session.segments.find(
+                    (s) => s.index === rally.recordingIndex
+                  )
+                  const minGlobalMs = seg?.offsetMs ?? 0
+                  const maxGlobalMs = minGlobalMs + (seg?.durationMs ?? 0)
+                  return (
+                    <RallyBlock
+                      key={key}
+                      rally={rally}
+                      number={i}
+                      pxPerSec={pxPerSec}
+                      editing={editing}
+                      selected={editing && key === selectedKey}
+                      drag={drag?.key === key ? drag : null}
+                      minGlobalMs={minGlobalMs}
+                      maxGlobalMs={maxGlobalMs}
+                      onSelect={() => setSelectedKey(key)}
+                      onSeek={() => onSeekGlobal(rallyLeadInMs(rally, padding))}
+                      onStartDrag={(edge, anchorGlobalMs, minMs, maxMs) =>
+                        setDrag({
+                          key,
+                          edge,
+                          anchorGlobalMs,
+                          globalMs:
+                            edge === "start"
+                              ? rally.globalStart
+                              : rally.globalEnd,
+                          snappedToPlayhead: false,
+                          minGlobalMs: minMs,
+                          maxGlobalMs: maxMs,
+                        })
+                      }
+                    />
+                  )
+                })}
+                {annotations.map((a) => {
+                  const left = (a.globalMs / 1000) * pxPerSec
+                  return (
+                    <div
+                      key={a.id}
+                      className={`pointer-events-none absolute top-0 h-2.5 w-0.5 -translate-x-1/2 rounded-b ${VERDICT_DOT[a.verdict]}`}
+                      style={{ left: `${left}px` }}
+                      title={`${a.verdict} at ${formatClock(a.globalMs)}`}
+                    />
+                  )
+                })}
+              </div>
+
+              {/* Recording boundaries: a solid divider through ruler and strip,
+                  a notch on the ruler, and a numbered label over the rallies. */}
               {session.segments.map((seg) => {
                 if (seg.durationMs == null || !seg.timeline) return null
                 const left = (seg.offsetMs / 1000) * pxPerSec
@@ -376,85 +663,85 @@ export const SessionTimeline = forwardRef<
                 return (
                   <div
                     key={seg.path}
-                    className="pointer-events-none absolute inset-y-0"
+                    className="pointer-events-none absolute inset-y-0 z-[5]"
                     style={{ left: `${left}px`, width: `${width}px` }}
                   >
-                    <Waveform peaks={seg.timeline.waveform} />
                     {seg.index > 0 ? (
-                      <div className="absolute inset-y-0 left-0 w-px bg-foreground/30" />
+                      <>
+                        <div className="absolute inset-y-0 left-0 w-0.5 -translate-x-1/2 bg-foreground/70" />
+                        <div className="absolute top-0 left-0 size-0 -translate-x-1/2 border-x-[5px] border-t-[6px] border-x-transparent border-t-foreground/70" />
+                      </>
                     ) : null}
-                    <span className="absolute top-0.5 left-1 max-w-full truncate text-[10px] text-muted-foreground/70">
-                      {fileName(seg.path)}
+                    <span
+                      className="absolute bottom-1 left-1.5 max-w-[calc(100%-0.75rem)] truncate rounded-sm border border-foreground/20 bg-background/85 px-1 text-[10px] leading-4 text-foreground/80 shadow-sm"
+                      title={seg.path}
+                    >
+                      <span className="font-semibold tabular-nums">
+                        {seg.index + 1}
+                      </span>{" "}
+                      · {fileName(seg.path)}
                     </span>
                   </div>
                 )
               })}
-              {session.rallies.map((rally, i) => {
-                const key = rallyKey(rally)
-                const seg = session.segments.find(
-                  (s) => s.index === rally.recordingIndex
-                )
-                const minGlobalMs = seg?.offsetMs ?? 0
-                const maxGlobalMs = minGlobalMs + (seg?.durationMs ?? 0)
-                return (
-                  <RallyBlock
-                    key={key}
-                    rally={rally}
-                    number={i}
-                    pxPerSec={pxPerSec}
-                    editing={editing}
-                    selected={editing && key === selectedKey}
-                    drag={drag?.key === key ? drag : null}
-                    minGlobalMs={minGlobalMs}
-                    maxGlobalMs={maxGlobalMs}
-                    onSelect={() => setSelectedKey(key)}
-                    onSeek={() => onSeekGlobal(rally.globalStart)}
-                    onStartDrag={(edge, anchorGlobalMs, minMs, maxMs) =>
-                      setDrag({
-                        key,
-                        edge,
-                        anchorGlobalMs,
-                        globalMs:
-                          edge === "start"
-                            ? rally.globalStart
-                            : rally.globalEnd,
-                        snappedToPlayhead: false,
-                        minGlobalMs: minMs,
-                        maxGlobalMs: maxMs,
-                      })
-                    }
-                  />
-                )
-              })}
-              {annotations.map((a) => {
-                const left = (a.globalMs / 1000) * pxPerSec
-                return (
-                  <div
-                    key={a.id}
-                    className={`pointer-events-none absolute top-0 h-2.5 w-0.5 -translate-x-1/2 rounded-b ${VERDICT_DOT[a.verdict]}`}
-                    style={{ left: `${left}px` }}
-                    title={`${a.verdict} at ${formatClock(a.globalMs)}`}
-                  />
-                )
-              })}
-              {playheadPx !== null ? (
+
+              {/* Hover cursor: where a click would land, and when. */}
+              <div
+                ref={hoverLineRef}
+                hidden
+                className="pointer-events-none absolute inset-y-0 z-10 w-px bg-foreground/50"
+              >
+                <span
+                  ref={hoverLabelRef}
+                  className="absolute top-0.5 left-1 rounded-sm bg-foreground px-1 text-[10px] leading-4 whitespace-nowrap text-background tabular-nums"
+                />
+              </div>
+
+              {playheadPx !== null && globalPlayheadMs !== null ? (
                 <div
-                  className={`pointer-events-none absolute inset-y-0 w-0.5 transition-colors ${
-                    snappedToPlayhead
-                      ? "bg-primary ring-4 ring-primary/30"
-                      : "bg-foreground"
-                  }`}
+                  className="pointer-events-none absolute inset-y-0 z-10"
                   style={{ left: `${playheadPx}px` }}
                   title={
                     snappedToPlayhead
                       ? "Dragged edge snapped to playhead"
                       : undefined
                   }
-                />
+                >
+                  <div
+                    className={`absolute inset-y-0 -translate-x-1/2 bg-red-500 shadow-[0_0_0_1px_var(--background)] transition-[width,box-shadow] ${
+                      snappedToPlayhead ? "w-1 ring-4 ring-red-500/30" : "w-0.5"
+                    }`}
+                  />
+                  <span className="absolute top-0 -translate-x-1/2 rounded-sm bg-red-500 px-1 text-[10px] leading-5 font-medium whitespace-nowrap text-white tabular-nums shadow-sm">
+                    {formatTimecode(globalPlayheadMs)}
+                  </span>
+                </div>
               ) : null}
             </div>
           </div>
-        </>
+
+          {/* The playhead is scrolled out of view: point the way back. */}
+          {playheadOffside !== null && globalPlayheadMs !== null ? (
+            <button
+              type="button"
+              onClick={scrollToPlayhead}
+              className={`absolute top-6 z-20 flex items-center gap-0.5 rounded-full bg-red-500 py-0.5 text-[10px] font-medium text-white tabular-nums shadow-md hover:bg-red-600 ${
+                playheadOffside === "left"
+                  ? "left-1 pr-2 pl-1"
+                  : "right-1 pr-1 pl-2"
+              }`}
+              title="The playhead is off-screen — jump back to it (F)."
+            >
+              {playheadOffside === "left" ? (
+                <ChevronLeftIcon className="size-3" />
+              ) : null}
+              {formatTimecode(globalPlayheadMs)}
+              {playheadOffside === "right" ? (
+                <ChevronRightIcon className="size-3" />
+              ) : null}
+            </button>
+          ) : null}
+        </div>
       ) : null}
     </div>
   )
@@ -466,7 +753,7 @@ export const SessionTimeline = forwardRef<
  * can be eyeballed where the blocks overlay them. Drawn behind the blocks at low
  * contrast and stretched to fill its recording's span.
  */
-function Waveform({ peaks }: { peaks: number[] }) {
+const Waveform = memo(function Waveform({ peaks }: { peaks: number[] }) {
   if (peaks.length === 0) return null
   return (
     <svg
@@ -490,4 +777,4 @@ function Waveform({ peaks }: { peaks: number[] }) {
       })}
     </svg>
   )
-}
+})
