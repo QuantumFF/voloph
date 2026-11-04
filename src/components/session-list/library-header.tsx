@@ -184,20 +184,32 @@ export function LibraryHeader({
                 untouched recordings in the background; hand-edited ones keep
                 their timelines. */}
             <DropdownMenuLabel>Rally detection</DropdownMenuLabel>
-            <DropdownMenuRadioGroup value={segmenter} onValueChange={onSegmenter}>
-              <DropdownMenuRadioItem value="student" className="flex-col items-start gap-0">
+            <DropdownMenuRadioGroup
+              value={segmenter}
+              onValueChange={onSegmenter}
+            >
+              <DropdownMenuRadioItem
+                value="student"
+                className="flex-col items-start gap-0"
+              >
                 <span>Learned</span>
                 <span className="text-xs text-muted-foreground">
                   Rarely invents rallies
                 </span>
               </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="teacher" className="flex-col items-start gap-0">
+              <DropdownMenuRadioItem
+                value="teacher"
+                className="flex-col items-start gap-0"
+              >
                 <span>Learned, high accuracy</span>
                 <span className="text-xs text-muted-foreground">
                   Tracks the shuttle — slow without a GPU
                 </span>
               </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="v6" className="flex-col items-start gap-0">
+              <DropdownMenuRadioItem
+                value="v6"
+                className="flex-col items-start gap-0"
+              >
                 <span>Classic (v6)</span>
                 <span className="text-xs text-muted-foreground">
                   Catches more very short rallies

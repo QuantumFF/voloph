@@ -62,11 +62,15 @@ pub fn validate(rallies: &[[i64; 2]], duration_ms: Option<i64>) -> Result<(), St
             return Err(format!("rally {i} [{start}, {end}] is empty or negative"));
         }
         if start < prev_end {
-            return Err(format!("rally {i} [{start}, {end}] overlaps or precedes the one before it"));
+            return Err(format!(
+                "rally {i} [{start}, {end}] overlaps or precedes the one before it"
+            ));
         }
         if let Some(d) = duration_ms.filter(|&d| d > 0) {
             if end > d {
-                return Err(format!("rally {i} [{start}, {end}] ends past the recording ({d} ms)"));
+                return Err(format!(
+                    "rally {i} [{start}, {end}] ends past the recording ({d} ms)"
+                ));
             }
         }
         prev_end = end;
@@ -111,9 +115,14 @@ pub fn load_dir(dir: &Path) -> Result<HashMap<(i64, String), GoldFile>, String> 
         let gold: GoldFile = serde_json::from_str(&text)
             .map_err(|e| format!("malformed gold file {}: {e}", path.display()))?;
         if gold.format != FORMAT {
-            return Err(format!("{}: unsupported gold format {}", path.display(), gold.format));
+            return Err(format!(
+                "{}: unsupported gold format {}",
+                path.display(),
+                gold.format
+            ));
         }
-        validate(&gold.rallies, gold.duration_ms).map_err(|e| format!("{}: {e}", path.display()))?;
+        validate(&gold.rallies, gold.duration_ms)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let key = (gold.file_size, gold.quick_hash.clone());
         if let Some(prev) = out.insert(key, gold) {
             return Err(format!(
@@ -140,7 +149,8 @@ pub fn save_timeline(dir: &Path, gold: &GoldFile, kind: &str) -> Result<PathBuf,
     let path = dir.join(timeline_file_name(&gold.recording, &gold.quick_hash, kind));
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(gold).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, text + "\n").map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, text + "\n")
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(path)
 }
@@ -171,9 +181,18 @@ mod tests {
     fn validate_rejects_bad_timelines() {
         assert!(validate(&[[5_000, 5_000]], None).is_err(), "zero length");
         assert!(validate(&[[-1, 5_000]], None).is_err(), "negative start");
-        assert!(validate(&[[1_000, 5_000], [4_000, 6_000]], None).is_err(), "overlap");
-        assert!(validate(&[[4_000, 6_000], [1_000, 2_000]], None).is_err(), "unsorted");
-        assert!(validate(&[[1_000, 61_000]], Some(60_000)).is_err(), "past the end");
+        assert!(
+            validate(&[[1_000, 5_000], [4_000, 6_000]], None).is_err(),
+            "overlap"
+        );
+        assert!(
+            validate(&[[4_000, 6_000], [1_000, 2_000]], None).is_err(),
+            "unsorted"
+        );
+        assert!(
+            validate(&[[1_000, 61_000]], Some(60_000)).is_err(),
+            "past the end"
+        );
     }
 
     #[test]

@@ -74,7 +74,12 @@ pub(crate) fn analysis_file_name(
 /// [`analysis_file_name`]'s names, so older builds still find their files; a learned
 /// segmenter publishes as `{key}.{id}{N}.vanalysis` — a name older builds' `{key}_s*`
 /// match never picks up, so they cannot mistake a student draft for a v6 one.
-pub(crate) fn analysis_file_name_for(quick_hash: &str, file_size: i64, segmenter: &str, version: u32) -> String {
+pub(crate) fn analysis_file_name_for(
+    quick_hash: &str,
+    file_size: i64,
+    segmenter: &str,
+    version: u32,
+) -> String {
     if segmenter == "v6" {
         analysis_file_name(quick_hash, file_size, version)
     } else {
@@ -211,7 +216,12 @@ pub fn publish_analysis(conn: &Connection, id: i64) {
         return; // shared library not designated on this device
     };
     let dir = Path::new(&root).join(".voloph").join("analysis");
-    let name = analysis_file_name_for(&quick_hash, file_size, &analysis.segmenter, analysis.segmenter_version);
+    let name = analysis_file_name_for(
+        &quick_hash,
+        file_size,
+        &analysis.segmenter,
+        analysis.segmenter_version,
+    );
     if let Err(e) = write_analysis(&dir, &name, &analysis) {
         // Silent to the user (ADR 0013): the analysis is already in the DB.
         log::warn!("analysis: could not publish {name}: {e}");
@@ -276,7 +286,12 @@ pub fn publish_missing_analyses(conn: &Connection) {
         // stale one under its own name rather than checking for any file — so a bump
         // backfills the superseding file without touching the older sibling. Present
         // and readable → leave it alone; missing or unreadable (truncated) → rewrite.
-        let name = analysis_file_name_for(&quick_hash, file_size, &analysis.segmenter, analysis.segmenter_version);
+        let name = analysis_file_name_for(
+            &quick_hash,
+            file_size,
+            &analysis.segmenter,
+            analysis.segmenter_version,
+        );
         if read_analysis_file(&dir.join(&name)).is_some() {
             continue;
         }
@@ -325,7 +340,12 @@ fn read_analysis_file(path: &Path) -> Option<Analysis> {
 ///
 /// Only Analyses from `segmenter` count (ADR 0019): a library adopts drafts from the
 /// segmenter it uses, never another one's.
-fn read_best_analysis(root: &str, quick_hash: &str, file_size: i64, segmenter: &str) -> Option<Analysis> {
+fn read_best_analysis(
+    root: &str,
+    quick_hash: &str,
+    file_size: i64,
+    segmenter: &str,
+) -> Option<Analysis> {
     let dir = Path::new(root).join(".voloph").join("analysis");
     let prefix = analysis_key_prefix(quick_hash, file_size);
     let mut best: Option<Analysis> = None;
@@ -337,7 +357,8 @@ fn read_best_analysis(root: &str, quick_hash: &str, file_size: i64, segmenter: &
         // matching a longer size that happens to start with these digits.
         // A learned segmenter's file is `{prefix}.{id}{N}.vanalysis` (ADR 0019).
         let is_ours = name == format!("{prefix}.vanalysis")
-            || (name.starts_with(&format!("{prefix}_s")) || name.starts_with(&format!("{prefix}.")))
+            || (name.starts_with(&format!("{prefix}_s"))
+                || name.starts_with(&format!("{prefix}.")))
                 && name.ends_with(".vanalysis");
         if !is_ours {
             continue;
@@ -397,7 +418,8 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
         // Prefer the highest-version Analysis when several are published for these
         // bytes (ADR 0013/0015): every device converges on the best draft, older
         // files stay on disk.
-        let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size, segmenter.id()) else {
+        let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size, segmenter.id())
+        else {
             continue;
         };
         tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;

@@ -132,9 +132,13 @@ pub fn score(draft: &[Interval], gold: &[Interval], duration_ms: i64) -> Score {
             None => misses += 1,
         }
     }
-    let false_positives = draft.iter().filter(|d| !gold.iter().any(|g| d.overlaps(g))).count();
+    let false_positives = draft
+        .iter()
+        .filter(|d| !gold.iter().any(|g| d.overlaps(g)))
+        .count();
 
-    let false_positives_per_hour = per_hour(false_positives, effective_ms(duration_ms, draft, gold));
+    let false_positives_per_hour =
+        per_hour(false_positives, effective_ms(duration_ms, draft, gold));
 
     Score {
         gold_count: gold.len(),
@@ -152,17 +156,14 @@ pub fn score(draft: &[Interval], gold: &[Interval], duration_ms: i64) -> Score {
 /// when none overlaps it at all (a miss). Ties in overlap resolve to the earliest
 /// start, then the earliest end, so the pairing never depends on input order.
 fn best_match<'a>(gold: &Interval, draft: &'a [Interval]) -> Option<&'a Interval> {
-    draft
-        .iter()
-        .filter(|d| d.overlaps(gold))
-        .max_by(|a, b| {
-            let by_overlap = a.overlap_ms(gold).cmp(&b.overlap_ms(gold));
-            // Larger overlap wins; on a tie prefer the earlier (smaller) start, then
-            // the earlier end — so reverse the position comparisons under `max_by`.
-            by_overlap
-                .then_with(|| b.start_ms.cmp(&a.start_ms))
-                .then_with(|| b.end_ms.cmp(&a.end_ms))
-        })
+    draft.iter().filter(|d| d.overlaps(gold)).max_by(|a, b| {
+        let by_overlap = a.overlap_ms(gold).cmp(&b.overlap_ms(gold));
+        // Larger overlap wins; on a tie prefer the earlier (smaller) start, then
+        // the earlier end — so reverse the position comparisons under `max_by`.
+        by_overlap
+            .then_with(|| b.start_ms.cmp(&a.start_ms))
+            .then_with(|| b.end_ms.cmp(&a.end_ms))
+    })
 }
 
 /// Milliseconds in an hour — the divisor for every per-hour rate.
@@ -259,7 +260,8 @@ pub fn teacher_run_cli(args: Vec<String>) -> Result<(), String> {
             "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
             "wall_ms": t0.elapsed().as_millis() as u64,
         });
-        return std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?).map_err(|e| format!("{out}: {e}"));
+        return std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("{out}: {e}"));
     }
     let (track, pose, out) = (
         track.ok_or("--track is required")?,
@@ -274,14 +276,24 @@ pub fn teacher_run_cli(args: Vec<String>) -> Result<(), String> {
         .map(|l| {
             let c: Vec<&str> = l.split(',').collect();
             let num = |i: usize| -> Result<i64, String> {
-                let v: f64 = c.get(i).ok_or("short row")?.trim().parse().map_err(|e| format!("{l}: {e}"))?;
+                let v: f64 = c
+                    .get(i)
+                    .ok_or("short row")?
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("{l}: {e}"))?;
                 Ok(v as i64)
             };
-            Ok(crate::teacher::ShuttleFrame { visible: num(2)? > 0, x: num(3)?, y: num(4)? })
+            Ok(crate::teacher::ShuttleFrame {
+                visible: num(2)? > 0,
+                x: num(3)?,
+                y: num(4)?,
+            })
         })
         .collect::<Result<_, String>>()?;
     let pose: crate::teacher::PoseArrays =
-        serde_json::from_slice(&std::fs::read(&pose).map_err(|e| format!("{pose}: {e}"))?).map_err(|e| e.to_string())?;
+        serde_json::from_slice(&std::fs::read(&pose).map_err(|e| format!("{pose}: {e}"))?)
+            .map_err(|e| e.to_string())?;
     let model = crate::teacher::TeacherModel::bundled()?;
     let t0 = std::time::Instant::now();
     let rallies = crate::teacher::segment(model, &frames, &pose);
@@ -290,7 +302,8 @@ pub fn teacher_run_cli(args: Vec<String>) -> Result<(), String> {
         "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
         "teacher_ms": t0.elapsed().as_millis() as u64,
     });
-    std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?).map_err(|e| format!("{out}: {e}"))
+    std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("{out}: {e}"))
 }
 
 /// The `signals-dump` dev CLI (issue #105): the three cheap signals v6 already computes —
@@ -320,7 +333,11 @@ pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
     let out = out.ok_or("--out is required")?;
     let started = std::time::Instant::now();
     let samples = media::extract_pcm(&file)?;
-    let audio = segment::audio_frames(&samples, media::SEGMENT_SAMPLE_RATE, &segment::Params::default());
+    let audio = segment::audio_frames(
+        &samples,
+        media::SEGMENT_SAMPLE_RATE,
+        &segment::Params::default(),
+    );
     let t_audio = started.elapsed().as_secs_f64();
     let motion = media::extract_motion(&file, |_| {})?;
     let t_motion = started.elapsed().as_secs_f64() - t_audio;
@@ -331,21 +348,25 @@ pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
     if let Some(path) = &student_out {
         let model = crate::student::StudentModel::bundled()?;
         let t0 = std::time::Instant::now();
-        let rallies = crate::student::segment(model, &crate::student::Inputs {
-            duration_ms: (footage * 1000.0).round() as i64,
-            motion_fps: f64::from(media::MOTION_FPS),
-            motion: &motion,
-            audio_frame_ms: audio.frame_ms,
-            audio_energy: &audio.energy,
-            audio_onset: &audio.onset,
-            detect: &detect,
-        });
+        let rallies = crate::student::segment(
+            model,
+            &crate::student::Inputs {
+                duration_ms: (footage * 1000.0).round() as i64,
+                motion_fps: f64::from(media::MOTION_FPS),
+                motion: &motion,
+                audio_frame_ms: audio.frame_ms,
+                audio_energy: &audio.energy,
+                audio_onset: &audio.onset,
+                detect: &detect,
+            },
+        );
         let doc = serde_json::json!({
             "rallies": rallies.iter().map(|r| [r.start_ms, r.end_ms]).collect::<Vec<_>>(),
             "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
             "student_ms": t0.elapsed().as_millis() as u64,
         });
-        std::fs::write(path, serde_json::to_vec(&doc).map_err(|e| e.to_string())?).map_err(|e| format!("{path}: {e}"))?;
+        std::fs::write(path, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("{path}: {e}"))?;
     }
     let doc = serde_json::json!({
         "duration_ms": (footage * 1000.0).round() as i64,
@@ -398,7 +419,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     }
 
     if let Some(out) = &opts.dump_draft {
-        let root = opts.root.as_deref().ok_or("--dump-draft needs --root DIR (the videos to segment)")?;
+        let root = opts
+            .root
+            .as_deref()
+            .ok_or("--dump-draft needs --root DIR (the videos to segment)")?;
         return dump_drafts(Path::new(root), Path::new(out), opts.filter.as_deref());
     }
 
@@ -412,7 +436,8 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             db_path.display()
         ));
     }
-    let mut conn = db::open(&db_path).map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
+    let mut conn =
+        db::open(&db_path).map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
 
     let kind = match opts.library {
         Some(k) => k,
@@ -420,21 +445,27 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     };
     let library = db::library_path_of(&conn, &kind)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("the '{kind}' library is not designated in {}", db_path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "the '{kind}' library is not designated in {}",
+                db_path.display()
+            )
+        })?;
 
-    let gold_dir = opts.gold.map(PathBuf::from).unwrap_or_else(default_gold_dir);
+    let gold_dir = opts
+        .gold
+        .map(PathBuf::from)
+        .unwrap_or_else(default_gold_dir);
     if opts.export_gold {
-        let filter = opts
-            .filter
-            .as_deref()
-            .ok_or("--export-gold needs a RECORDING filter (exports are per recording, on purpose)")?;
+        let filter = opts.filter.as_deref().ok_or(
+            "--export-gold needs a RECORDING filter (exports are per recording, on purpose)",
+        )?;
         return export_gold(&conn, &kind, filter, &gold_dir, opts.allow_unconfirmed);
     }
     if let Some(dir) = &opts.import_draft {
-        let filter = opts
-            .filter
-            .as_deref()
-            .ok_or("--import-draft needs a RECORDING filter (imports are per recording, on purpose)")?;
+        let filter = opts.filter.as_deref().ok_or(
+            "--import-draft needs a RECORDING filter (imports are per recording, on purpose)",
+        )?;
         return import_draft(&mut conn, &kind, filter, Path::new(dir));
     }
 
@@ -442,7 +473,9 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     if let Some(filter) = &opts.filter {
         recordings.retain(|r| r.abs_path.contains(filter) || r.rel_path.contains(filter));
         if recordings.is_empty() {
-            return Err(format!("no recording in the '{kind}' library matched \"{filter}\""));
+            return Err(format!(
+                "no recording in the '{kind}' library matched \"{filter}\""
+            ));
         }
     }
 
@@ -561,7 +594,9 @@ fn export_gold(
         .filter(|r| r.rel_path.contains(filter))
         .collect();
     if rows.is_empty() {
-        return Err(format!("no recording in the '{kind}' library matched \"{filter}\""));
+        return Err(format!(
+            "no recording in the '{kind}' library matched \"{filter}\""
+        ));
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -578,7 +613,12 @@ fn export_gold(
             .prepare("SELECT start_ms, end_ms, confidence FROM rallies WHERE recording_id = ?1 ORDER BY start_ms")
             .map_err(|e| e.to_string())?;
         let timeline = stmt
-            .query_map([r.id], |row| Ok(([row.get::<_, i64>(0)?, row.get::<_, i64>(1)?], row.get::<_, f64>(2)?)))
+            .query_map([r.id], |row| {
+                Ok((
+                    [row.get::<_, i64>(0)?, row.get::<_, i64>(1)?],
+                    row.get::<_, f64>(2)?,
+                ))
+            })
             .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
             .map_err(|e| e.to_string())?;
         for ([s, e], c) in &timeline {
@@ -607,13 +647,22 @@ fn export_gold(
             "nothing exported: {} rall{} never confirmed by hand — check each, then export again \
              (or pass --allow-unconfirmed if they were checked and are right as they stand):\n{}",
             unconfirmed.len(),
-            if unconfirmed.len() == 1 { "y was" } else { "ies were" },
+            if unconfirmed.len() == 1 {
+                "y was"
+            } else {
+                "ies were"
+            },
             unconfirmed.join("\n")
         ));
     }
     for file in files {
         let path = gold::save(gold_dir, &file).map_err(|e| format!("{}: {e}", file.recording))?;
-        println!("GOLD  {}  ({} rallies) → {}", file.recording, file.rallies.len(), path.display());
+        println!(
+            "GOLD  {}  ({} rallies) → {}",
+            file.recording,
+            file.rallies.len(),
+            path.display()
+        );
     }
     Ok(())
 }
@@ -644,17 +693,15 @@ const IMPORT_END_SLACK_MS: i64 = 1000;
 /// recording stays `ready` at its segmenter version, so the app shows the import
 /// and never re-segments over it on its own. Flags on the replaced rallies are
 /// dropped; annotations (pinned to time, not rallies) are kept.
-fn import_draft(
-    conn: &mut Connection,
-    kind: &str,
-    filter: &str,
-    dir: &Path,
-) -> Result<(), String> {
+fn import_draft(conn: &mut Connection, kind: &str, filter: &str, dir: &Path) -> Result<(), String> {
     let mut timelines: Vec<(PathBuf, ImportTimeline)> = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+    {
         let path = entry.map_err(|e| e.to_string())?.path();
         if path.extension().is_some_and(|x| x == "json") {
-            let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let t: ImportTimeline =
                 serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
             timelines.push((path, t));
@@ -666,7 +713,9 @@ fn import_draft(
         .filter(|r| r.rel_path.contains(filter))
         .collect();
     if rows.is_empty() {
-        return Err(format!("no recording in the '{kind}' library matched \"{filter}\""));
+        return Err(format!(
+            "no recording in the '{kind}' library matched \"{filter}\""
+        ));
     }
     for r in rows {
         let found: Vec<_> = timelines
@@ -675,14 +724,27 @@ fn import_draft(
             .collect();
         let (src, t) = match found.as_slice() {
             [] => {
-                println!("SKIP  {}  (no timeline for it in {})", r.rel_path, dir.display());
+                println!(
+                    "SKIP  {}  (no timeline for it in {})",
+                    r.rel_path,
+                    dir.display()
+                );
                 continue;
             }
             [one] => *one,
-            _ => return Err(format!("{}: several timelines in {} match it", r.rel_path, dir.display())),
+            _ => {
+                return Err(format!(
+                    "{}: several timelines in {} match it",
+                    r.rel_path,
+                    dir.display()
+                ))
+            }
         };
         if r.segment_state != "ready" {
-            println!("SKIP  {}  (not segmented yet: {})", r.rel_path, r.segment_state);
+            println!(
+                "SKIP  {}  (not segmented yet: {})",
+                r.rel_path, r.segment_state
+            );
             continue;
         }
         // Machine timelines are timed from their own frame count, which can run a
@@ -696,10 +758,16 @@ fn import_draft(
         }
         gold::validate(&t.rallies, r.duration_ms).map_err(|e| format!("{}: {e}", src.display()))?;
         let conf: Vec<f64> = match &t.confidence {
-            Some(c) if c.len() == t.rallies.len() => {
-                c.iter().map(|&x| x.clamp(0.0, IMPORT_MAX_CONFIDENCE)).collect()
+            Some(c) if c.len() == t.rallies.len() => c
+                .iter()
+                .map(|&x| x.clamp(0.0, IMPORT_MAX_CONFIDENCE))
+                .collect(),
+            Some(_) => {
+                return Err(format!(
+                    "{}: confidence and rallies differ in length",
+                    src.display()
+                ))
             }
-            Some(_) => return Err(format!("{}: confidence and rallies differ in length", src.display())),
             None => vec![IMPORT_CONFIDENCE; t.rallies.len()],
         };
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -713,7 +781,12 @@ fn import_draft(
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
-        println!("DRAFT {}  ({} rallies) ← {}", r.rel_path, t.rallies.len(), src.display());
+        println!(
+            "DRAFT {}  ({} rallies) ← {}",
+            r.rel_path,
+            t.rallies.len(),
+            src.display()
+        );
     }
     Ok(())
 }
@@ -740,10 +813,21 @@ fn dump_drafts(root: &Path, out: &Path, filter: Option<&str>) -> Result<(), Stri
     if videos.is_empty() {
         return Err(format!("no videos under {}", root.display()));
     }
-    println!("dumping segmenter v{} drafts for {} video(s) → {}", segment::SEGMENTER_VERSION, videos.len(), out.display());
+    println!(
+        "dumping segmenter v{} drafts for {} video(s) → {}",
+        segment::SEGMENTER_VERSION,
+        videos.len(),
+        out.display()
+    );
     for path in videos {
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
-        let size = std::fs::metadata(&path).map_err(|e| format!("{rel}: {e}"))?.len();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let size = std::fs::metadata(&path)
+            .map_err(|e| format!("{rel}: {e}"))?
+            .len();
         let hash = db::quick_hash(&path, size).map_err(|e| format!("{rel}: {e}"))?;
         let (draft, duration_ms) = match rerun_segmenter(&path.to_string_lossy()) {
             Ok(v) => v,
@@ -761,8 +845,13 @@ fn dump_drafts(root: &Path, out: &Path, filter: Option<&str>) -> Result<(), Stri
             verified_unix: 0, // a machine draft: never verified
             rallies: draft.iter().map(|i| [i.start_ms, i.end_ms]).collect(),
         };
-        let written = gold::save_timeline(out, &file, "draft").map_err(|e| format!("{rel}: {e}"))?;
-        println!("DRAFT {rel}  ({} rallies) → {}", file.rallies.len(), written.display());
+        let written =
+            gold::save_timeline(out, &file, "draft").map_err(|e| format!("{rel}: {e}"))?;
+        println!(
+            "DRAFT {rel}  ({} rallies) → {}",
+            file.rallies.len(),
+            written.display()
+        );
     }
     Ok(())
 }
@@ -770,7 +859,10 @@ fn dump_drafts(root: &Path, out: &Path, filter: Option<&str>) -> Result<(), Stri
 /// Where gold files live by default: `eval/gold/` at the repo root, so they are
 /// versioned with the code. Overridable with `--gold DIR`.
 fn default_gold_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("eval").join("gold")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("eval")
+        .join("gold")
 }
 
 /// Score each gold recording, print its numbers, and print the corpus aggregate.
@@ -788,7 +880,10 @@ fn score_and_report(recordings: &[CorpusRecording]) {
 
     for rec in recordings {
         if rec.segment_state != "ready" {
-            println!("SKIP  {}  (not segmented: {})", rec.rel_path, rec.segment_state);
+            println!(
+                "SKIP  {}  (not segmented: {})",
+                rec.rel_path, rec.segment_state
+            );
             skipped += 1;
             continue;
         }
@@ -826,11 +921,12 @@ fn score_and_report(recordings: &[CorpusRecording]) {
         return;
     }
     let fp_per_hour = per_hour(total_false_positives, total_ms);
-    println!("footage scored        : {:.2} h", total_ms as f64 / MS_PER_HOUR);
-    println!("missed rallies        : {total_misses}   (ADR 0015 target ≈ 0)");
     println!(
-        "false positives       : {total_false_positives}  ({fp_per_hour:.2} / hour)"
+        "footage scored        : {:.2} h",
+        total_ms as f64 / MS_PER_HOUR
     );
+    println!("missed rallies        : {total_misses}   (ADR 0015 target ≈ 0)");
+    println!("false positives       : {total_false_positives}  ({fp_per_hour:.2} / hour)");
     match median(&all_boundary_errors).map(|ms| ms / 1000.0) {
         Some(secs) => println!("median boundary error : {secs:.2} s"),
         None => println!("median boundary error : n/a (nothing matched)"),
@@ -905,7 +1001,10 @@ const SWEEP_DENSITY: &[f64] = &[0.3, 0.4, 0.5, 0.6];
 const SWEEP_STATIC_FRAC: &[f64] = &[0.02, 0.05];
 
 /// Score one parameter set against every cached recording, aggregated.
-fn score_config(tracks: &[CachedTracks], p: &segment::Params) -> (usize, usize, f64, Option<f64>, usize) {
+fn score_config(
+    tracks: &[CachedTracks],
+    p: &segment::Params,
+) -> (usize, usize, f64, Option<f64>, usize) {
     let mut misses = 0usize;
     let mut false_positives = 0usize;
     let mut total_ms = 0i64;
@@ -919,11 +1018,7 @@ fn score_config(tracks: &[CachedTracks], p: &segment::Params) -> (usize, usize, 
             t.occupancy.as_ref(),
             p,
         );
-        let draft: Vec<Interval> = seg
-            .rallies
-            .iter()
-            .map(Interval::from)
-            .collect();
+        let draft: Vec<Interval> = seg.rallies.iter().map(Interval::from).collect();
         let s = score(&draft, &t.gold, t.duration_ms);
         misses += s.misses;
         false_positives += s.false_positives;
@@ -1090,12 +1185,10 @@ fn trace_and_report(recordings: &[CorpusRecording]) {
             occupancy.as_ref(),
             &p,
         );
-        let draft: Vec<Interval> = seg
-            .rallies
-            .iter()
-            .map(Interval::from)
-            .collect();
-        let firing = occupancy.as_ref().map(|o| (segment::occupancy_firing(o, &p), o.fps));
+        let draft: Vec<Interval> = seg.rallies.iter().map(Interval::from).collect();
+        let firing = occupancy
+            .as_ref()
+            .map(|o| (segment::occupancy_firing(o, &p), o.fps));
         println!("TRACE {}", rec.rel_path);
         for g in &rec.gold {
             if draft.iter().any(|d| d.overlaps(g)) {
@@ -1118,13 +1211,15 @@ fn trace_and_report(recordings: &[CorpusRecording]) {
                     let fired = window.iter().filter(|s| s.fired).count();
                     // Peak windowed density inside the rally, at the same window
                     // width the block judge uses.
-                    let w_samples = ((p.occupancy_window_ms as f64 / 1000.0) * fps).round() as usize;
+                    let w_samples =
+                        ((p.occupancy_window_ms as f64 / 1000.0) * fps).round() as usize;
                     let half = (w_samples / 2).max(1);
                     let peak = (lo..hi)
                         .map(|c| {
                             let a = c.saturating_sub(half);
                             let b = (c + half + 1).min(f.len());
-                            f[a..b].iter().filter(|s| s.fired).count() as f64 / (b - a).max(1) as f64
+                            f[a..b].iter().filter(|s| s.fired).count() as f64
+                                / (b - a).max(1) as f64
                         })
                         .fold(0.0, f64::max);
                     let verdict = if two * 2 < n {
@@ -1156,7 +1251,14 @@ fn trace_and_report(recordings: &[CorpusRecording]) {
 /// scored run, a sweep cache, and a trace.
 fn extract_tracks(
     abs_path: &str,
-) -> Result<(Vec<f32>, segment::MotionTrack, Option<segment::OccupancyTrack>), String> {
+) -> Result<
+    (
+        Vec<f32>,
+        segment::MotionTrack,
+        Option<segment::OccupancyTrack>,
+    ),
+    String,
+> {
     let samples = media::extract_pcm(abs_path)?;
     let energy = media::extract_motion(abs_path, |_| {})?;
     Ok((
@@ -1399,9 +1501,10 @@ fn fp_trace_and_report(recordings: &[CorpusRecording]) {
         let firing = occupancy
             .as_ref()
             .map(|o| (segment::occupancy_firing(o, &p), o.fps));
-        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            samples_to_ms(samples.len()),
-        );
+        let duration_ms = rec
+            .duration_ms
+            .filter(|&d| d > 0)
+            .unwrap_or(samples_to_ms(samples.len()));
         let spans: Vec<SpanSupport> = seg
             .rallies
             .iter()
@@ -1429,7 +1532,10 @@ fn fp_trace_and_report(recordings: &[CorpusRecording]) {
         return;
     }
 
-    let all_spans: Vec<SpanSupport> = traced.iter().flat_map(|t| t.spans.iter().cloned()).collect();
+    let all_spans: Vec<SpanSupport> = traced
+        .iter()
+        .flat_map(|t| t.spans.iter().cloned())
+        .collect();
     let total_ms: i64 = traced.iter().map(|t| t.duration_ms).sum();
     println!(
         "\n=== aggregate over {} recording(s), {} draft spans, {:.2} h ===",
@@ -1447,7 +1553,9 @@ fn fp_trace_and_report(recordings: &[CorpusRecording]) {
     let rules: [(&str, Rule); 4] = [
         (
             "suppress motion-only & audio-unconfirmed",
-            Box::new(|s: &SpanSupport| s.provenance == Provenance::MotionOnly && !s.audio_confirmed),
+            Box::new(|s: &SpanSupport| {
+                s.provenance == Provenance::MotionOnly && !s.audio_confirmed
+            }),
         ),
         (
             "suppress motion-only & unconfirmed & zero occupancy firing",
@@ -1725,7 +1833,10 @@ fn scratch_track(
         if let Err(e) =
             std::fs::create_dir_all(scratch_dir).and_then(|()| std::fs::write(&file, json))
         {
-            eprintln!("      (could not cache scratch track at {} — {e})", file.display());
+            eprintln!(
+                "      (could not cache scratch track at {} — {e})",
+                file.display()
+            );
         }
     }
     Some(track)
@@ -1744,11 +1855,15 @@ fn score_at_rate<'a>(
     let mut total_ms = 0i64;
     let mut errors: Vec<i64> = Vec::new();
     for r in recs {
-        let seg = segment::segment_with(&r.samples, media::SEGMENT_SAMPLE_RATE, &r.motion, occ(r), p);
+        let seg =
+            segment::segment_with(&r.samples, media::SEGMENT_SAMPLE_RATE, &r.motion, occ(r), p);
         let draft: Vec<Interval> = seg
             .rallies
             .iter()
-            .map(|x| Interval { start_ms: x.start_ms, end_ms: x.end_ms })
+            .map(|x| Interval {
+                start_ms: x.start_ms,
+                end_ms: x.end_ms,
+            })
             .collect();
         let s = score(&draft, &r.gold, r.duration_ms);
         misses += s.misses;
@@ -1789,24 +1904,31 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
             crate::detect::SCORE_THRESHOLD,
         )
         .map(|t| t.to_occupancy_track());
-        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            samples_to_ms(samples.len()),
-        );
+        let duration_ms = rec
+            .duration_ms
+            .filter(|&d| d > 0)
+            .unwrap_or(samples_to_ms(samples.len()));
         // The fixed missed-window list every rule is probed on: what the shipped
         // draft misses at the defaults on the app's own 3 fps tracks.
-        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occ3.as_ref(), &p);
-        let draft: Vec<Interval> = seg
-            .rallies
-            .iter()
-            .map(Interval::from)
-            .collect();
+        let seg = segment::segment_with(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occ3.as_ref(),
+            &p,
+        );
+        let draft: Vec<Interval> = seg.rallies.iter().map(Interval::from).collect();
         let missed: Vec<Interval> = rec
             .gold
             .iter()
             .filter(|g| !draft.iter().any(|d| d.overlaps(g)))
             .copied()
             .collect();
-        println!("CACHE {}  ({} missed at v5 defaults)", rec.rel_path, missed.len());
+        println!(
+            "CACHE {}  ({} missed at v5 defaults)",
+            rec.rel_path,
+            missed.len()
+        );
         recs.push(HeadroomRecording {
             rel_path: rec.rel_path.clone(),
             samples,
@@ -1826,9 +1948,15 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     // v5-defaults score at each rate — the "did 5 fps alone move the bar" line.
     println!("\n=== v5-defaults score by detector rate ===");
     let (m3, f3, fh3, med3) = score_at_rate(&recs, &p, |r| r.occ3.as_ref());
-    println!("3 fps (app tracks)     : miss {m3} | fp {f3} ({fh3:.1}/h) | med {}", fmt_med(med3));
+    println!(
+        "3 fps (app tracks)     : miss {m3} | fp {f3} ({fh3:.1}/h) | med {}",
+        fmt_med(med3)
+    );
     let (m5, f5, fh5, med5) = score_at_rate(&recs, &p, |r| r.occ5.as_ref());
-    println!("{HEADROOM_FPS} fps (scratch tracks) : miss {m5} | fp {f5} ({fh5:.1}/h) | med {}", fmt_med(med5));
+    println!(
+        "{HEADROOM_FPS} fps (scratch tracks) : miss {m5} | fp {f5} ({fh5:.1}/h) | med {}",
+        fmt_med(med5)
+    );
 
     // The #85-style rule table, per rate.
     type OccOf = fn(&HeadroomRecording) -> Option<&segment::OccupancyTrack>;
@@ -1840,7 +1968,13 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         println!("\n=== firing-rule headroom @ {rate_label} ===");
         println!(
             "{:<28} {:>8} {:>8} {:>14} {:>10} {:>12} {:>10}",
-            "rule", "in-gold%", "out%", "short med-peak", "short>=dens", "out win>=dens", "missed>=dens"
+            "rule",
+            "in-gold%",
+            "out%",
+            "short med-peak",
+            "short>=dens",
+            "out win>=dens",
+            "missed>=dens"
         );
         for rule in headroom_rules() {
             let mut stats = RuleStats::default();
@@ -1850,9 +1984,17 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
                 stats.add(&fired, occ.fps, &r.gold, &r.missed, &p);
             }
             let pct = |n: usize, d: usize| 100.0 * n as f64 / d.max(1) as f64;
-            let mut peaks: Vec<i64> = stats.short_peaks.iter().map(|&d| (d * 100.0).round() as i64).collect();
+            let mut peaks: Vec<i64> = stats
+                .short_peaks
+                .iter()
+                .map(|&d| (d * 100.0).round() as i64)
+                .collect();
             peaks.sort_unstable();
-            let short_ge = stats.short_peaks.iter().filter(|&&d| d >= p.occupancy_density).count();
+            let short_ge = stats
+                .short_peaks
+                .iter()
+                .filter(|&&d| d >= p.occupancy_density)
+                .count();
             println!(
                 "{:<28} {:>7.0}% {:>7.1}% {:>14} {:>10} {:>11.1}% {:>10}",
                 rule.label(),
@@ -1870,11 +2012,20 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     // "would the density judge (>= 0.50) open here" read per residual miss.
     println!("\n=== missed gold windows: peak windowed density per rule ===");
     let rules = headroom_rules();
-    let header: Vec<String> = rules.iter().map(|r| match r {
-        FiringRule::Current => "cur".to_string(),
-        FiringRule::Velocity(v) => format!("v{v:.2}"),
-    }).collect();
-    println!("{:<44} {:>6}   3fps: {}   {HEADROOM_FPS}fps: {}", "window", "dur", header.join(" "), header.join(" "));
+    let header: Vec<String> = rules
+        .iter()
+        .map(|r| match r {
+            FiringRule::Current => "cur".to_string(),
+            FiringRule::Velocity(v) => format!("v{v:.2}"),
+        })
+        .collect();
+    println!(
+        "{:<44} {:>6}   3fps: {}   {HEADROOM_FPS}fps: {}",
+        "window",
+        "dur",
+        header.join(" "),
+        header.join(" ")
+    );
     for r in &recs {
         for m in &r.missed {
             let mut cells: Vec<String> = Vec::new();
@@ -1885,7 +2036,10 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
                         Some(o) => {
                             let fired = rule_flags(o, &p, *rule);
                             let (lo, hi) = sample_range(*m, o.fps, fired.len());
-                            format!("{:.2}", peak_density(&fired, lo, hi, half_window(&p, o.fps)))
+                            format!(
+                                "{:.2}",
+                                peak_density(&fired, lo, hi, half_window(&p, o.fps))
+                            )
                         }
                     });
                 }
@@ -1893,7 +2047,12 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
             let (head, tail) = cells.split_at(rules.len());
             println!(
                 "{:<44} {:>5.1}s   {}         {}",
-                format!("{} {:.1}s–{:.1}s", r.rel_path, m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+                format!(
+                    "{} {:.1}s–{:.1}s",
+                    r.rel_path,
+                    m.start_ms as f64 / 1000.0,
+                    m.end_ms as f64 / 1000.0
+                ),
                 (m.end_ms - m.start_ms) as f64 / 1000.0,
                 head.join(" "),
                 tail.join(" ")
@@ -1951,8 +2110,12 @@ fn split_boundary_errors(
     split: &mut BoundarySplit,
 ) {
     for g in gold {
-        let Some(d) = best_match(g, draft) else { continue };
-        let Some((first, last)) = edge_blocks(*d, blocks) else { continue };
+        let Some(d) = best_match(g, draft) else {
+            continue;
+        };
+        let Some((first, last)) = edge_blocks(*d, blocks) else {
+            continue;
+        };
         for (edge_block, gold_edge, err) in [
             (first, g.start_ms, (g.start_ms - d.start_ms).abs()),
             (last, g.end_ms, (g.end_ms - d.end_ms).abs()),
@@ -1997,13 +2160,21 @@ fn edges_and_report(recordings: &[CorpusRecording]) {
                 continue;
             }
         };
-        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occupancy.as_ref(), &p);
-        let blocks = segment::fusion_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occupancy.as_ref(), &p);
-        let draft: Vec<Interval> = seg
-            .rallies
-            .iter()
-            .map(Interval::from)
-            .collect();
+        let seg = segment::segment_with(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occupancy.as_ref(),
+            &p,
+        );
+        let blocks = segment::fusion_blocks(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occupancy.as_ref(),
+            &p,
+        );
+        let draft: Vec<Interval> = seg.rallies.iter().map(Interval::from).collect();
         let before = split.occupancy_gold_edges.len();
         split_boundary_errors(&draft, &rec.gold, &blocks, &mut split);
         for &edge in &split.occupancy_gold_edges[before..] {
@@ -2011,7 +2182,8 @@ fn edges_and_report(recordings: &[CorpusRecording]) {
                 viability[i] += motion_near(&blocks, edge, radius) as usize;
             }
         }
-        all_errors.extend(score(&draft, &rec.gold, rec.duration_ms.unwrap_or(0)).boundary_errors_ms);
+        all_errors
+            .extend(score(&draft, &rec.gold, rec.duration_ms.unwrap_or(0)).boundary_errors_ms);
         println!("EDGES {}", rec.rel_path);
     }
     let n_motion = split.motion_edged_errs.len();
@@ -2099,7 +2271,10 @@ fn det_iou(a: &segment::DetBox, b: &segment::DetBox) -> f64 {
 /// crossing into the pure seam's [`segment::OccupancyTrack`]. At the shipped
 /// floor this reproduces the app's own track exactly (the decode banding
 /// invariant); lower floors admit the sub-threshold bands (issue #93).
-fn occupancy_at_floor(track: &crate::detect::DetectionTrack, floor: f32) -> segment::OccupancyTrack {
+fn occupancy_at_floor(
+    track: &crate::detect::DetectionTrack,
+    floor: f32,
+) -> segment::OccupancyTrack {
     segment::OccupancyTrack {
         fps: track.fps,
         samples: track
@@ -2224,13 +2399,15 @@ fn measure_variant(
             .iter()
             .map(|s| s.fired)
             .collect();
-        vs.presence.add(&presence, track.fps, &rec.gold, &rec.missed, p);
+        vs.presence
+            .add(&presence, track.fps, &rec.gold, &rec.missed, p);
         vs.fired.add(&fired, track.fps, &rec.gold, &rec.missed, p);
         let half = half_window(p, track.fps);
         for m in &rec.missed {
             let (lo, hi) = sample_range(*m, track.fps, presence.len());
             vs.window_presence.push(flag_fraction(&presence, lo, hi));
-            vs.window_fired_peak.push(peak_density(&fired, lo, hi, half));
+            vs.window_fired_peak
+                .push(peak_density(&fired, lo, hi, half));
         }
     }
     vs
@@ -2264,21 +2441,39 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
             }
         };
         // The fixed missed-window list (v5 defaults on the app's own tracks).
-        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occ3.as_ref(), &p);
-        let draft: Vec<Interval> = seg
-            .rallies
-            .iter()
-            .map(Interval::from)
-            .collect();
+        let seg = segment::segment_with(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occ3.as_ref(),
+            &p,
+        );
+        let draft: Vec<Interval> = seg.rallies.iter().map(Interval::from).collect();
         let missed: Vec<Interval> = rec
             .gold
             .iter()
             .filter(|g| !draft.iter().any(|d| d.overlaps(g)))
             .copied()
             .collect();
-        let low3 = scratch_track(scratch_dir, &rec.rel_path, &rec.abs_path, crate::detect::DETECT_FPS, PRESENCE_FLOOR);
-        let low5 = scratch_track(scratch_dir, &rec.rel_path, &rec.abs_path, HEADROOM_FPS, PRESENCE_FLOOR);
-        println!("CACHE {}  ({} missed at v5 defaults)", rec.rel_path, missed.len());
+        let low3 = scratch_track(
+            scratch_dir,
+            &rec.rel_path,
+            &rec.abs_path,
+            crate::detect::DETECT_FPS,
+            PRESENCE_FLOOR,
+        );
+        let low5 = scratch_track(
+            scratch_dir,
+            &rec.rel_path,
+            &rec.abs_path,
+            HEADROOM_FPS,
+            PRESENCE_FLOOR,
+        );
+        println!(
+            "CACHE {}  ({} missed at v5 defaults)",
+            rec.rel_path,
+            missed.len()
+        );
         recs.push(PresenceRecording {
             rel_path: rec.rel_path.clone(),
             gold: rec.gold.clone(),
@@ -2305,7 +2500,8 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     for r in &recs {
         if let (Some(occ3), Some(low3)) = (&r.occ3, &r.low3) {
             app_structure += count_structure(occ3);
-            banded_structure += count_structure(&occupancy_at_floor(low3, crate::detect::SCORE_THRESHOLD));
+            banded_structure +=
+                count_structure(&occupancy_at_floor(low3, crate::detect::SCORE_THRESHOLD));
         }
     }
     println!(
@@ -2353,7 +2549,11 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         );
         for (fi, &floor) in PRESENCE_FLOORS.iter().enumerate() {
             let vs = &variants[ri][fi][0];
-            println!("         {:<18} {}", floor_label(floor), stat_row(&vs.presence));
+            println!(
+                "         {:<18} {}",
+                floor_label(floor),
+                stat_row(&vs.presence)
+            );
         }
     }
 
@@ -2366,7 +2566,11 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         );
         for (ki, &k) in PRESENCE_KS.iter().enumerate() {
             let vs = &variants[ri][0][ki];
-            println!("         {:<18} {}", format!("k = {k}"), stat_row(&vs.presence));
+            println!(
+                "         {:<18} {}",
+                format!("k = {k}"),
+                stat_row(&vs.presence)
+            );
         }
     }
 
@@ -2414,9 +2618,18 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         }
         println!(
             "{:<44} {:>5.1}s   {:>11} {:>5} {:>5}   {:>11} {:>5} {:>5}",
-            format!("{rel} {:.1}s–{:.1}s", m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+            format!(
+                "{rel} {:.1}s–{:.1}s",
+                m.start_ms as f64 / 1000.0,
+                m.end_ms as f64 / 1000.0
+            ),
             (m.end_ms - m.start_ms) as f64 / 1000.0,
-            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5],
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
         );
     }
     println!("\n=== per-missed-window presence fraction by bridge depth (shipped floor) ===");
@@ -2433,9 +2646,20 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         }
         println!(
             "{:<44} {:>5.1}s   {:>11} {:>5} {:>5} {:>5}   {:>11} {:>5} {:>5} {:>5}",
-            format!("{rel} {:.1}s–{:.1}s", m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+            format!(
+                "{rel} {:.1}s–{:.1}s",
+                m.start_ms as f64 / 1000.0,
+                m.end_ms as f64 / 1000.0
+            ),
             (m.end_ms - m.start_ms) as f64 / 1000.0,
-            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7],
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
+            cells[6],
+            cells[7],
         );
     }
     println!("\n=== per-missed-window peak fired density: baseline vs mechanisms vs combined ===");
@@ -2455,9 +2679,20 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
         }
         println!(
             "{:<44} {:>5.1}s   {:>11} {:>5} {:>5} {:>5}   {:>11} {:>5} {:>5} {:>5}",
-            format!("{rel} {:.1}s–{:.1}s", m.start_ms as f64 / 1000.0, m.end_ms as f64 / 1000.0),
+            format!(
+                "{rel} {:.1}s–{:.1}s",
+                m.start_ms as f64 / 1000.0,
+                m.end_ms as f64 / 1000.0
+            ),
             (m.end_ms - m.start_ms) as f64 / 1000.0,
-            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7],
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
+            cells[6],
+            cells[7],
         );
     }
 }
@@ -2659,7 +2894,11 @@ fn span_features(
         };
     };
     let (lo, hi) = sample_range(span, v.fps, v.structure[0].len());
-    let presence: Vec<f64> = v.structure.iter().map(|s| flag_fraction(s, lo, hi)).collect();
+    let presence: Vec<f64> = v
+        .structure
+        .iter()
+        .map(|s| flag_fraction(s, lo, hi))
+        .collect();
     let fired: Vec<f64> = v.fired.iter().map(|f| flag_fraction(f, lo, hi)).collect();
     let (max_gap_s, mean_gap_s) = if lo == hi {
         (span_secs, span_secs)
@@ -2825,7 +3064,18 @@ fn print_span_population(title: &str, rows: &[SpanRow], recs: &[String]) {
     }
     println!(
         "{:<44} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>7}",
-        "span", "dur", "prs k0", "k1", "k2", "fired k2", "max-gap", "mean-gap", "sustain", "speed/s", "ons/s", "v5"
+        "span",
+        "dur",
+        "prs k0",
+        "k1",
+        "k2",
+        "fired k2",
+        "max-gap",
+        "mean-gap",
+        "sustain",
+        "speed/s",
+        "ons/s",
+        "v5"
     );
     for r in rows {
         println!(
@@ -2888,15 +3138,18 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
                 continue;
             }
         };
-        let seg = segment::segment_with(&samples, media::SEGMENT_SAMPLE_RATE, &motion, occupancy.as_ref(), &p);
-        let draft: Vec<Interval> = seg
-            .rallies
-            .iter()
-            .map(Interval::from)
-            .collect();
-        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            samples_to_ms(samples.len()),
+        let seg = segment::segment_with(
+            &samples,
+            media::SEGMENT_SAMPLE_RATE,
+            &motion,
+            occupancy.as_ref(),
+            &p,
         );
+        let draft: Vec<Interval> = seg.rallies.iter().map(Interval::from).collect();
+        let duration_ms = rec
+            .duration_ms
+            .filter(|&d| d > 0)
+            .unwrap_or(samples_to_ms(samples.len()));
         let onsets = segment::onset_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &p);
         let views = occupancy.as_ref().map(|occ| span_track_views(occ, &p));
         let (out_windows, skipped) = matched_out_windows(&rec.gold, duration_ms);
@@ -2935,7 +3188,11 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
             rec.rel_path,
             rec.gold.len(),
             out_windows.len(),
-            if skipped > 0 { format!(" ({skipped} skipped: no gap fits)") } else { String::new() },
+            if skipped > 0 {
+                format!(" ({skipped} skipped: no gap fits)")
+            } else {
+                String::new()
+            },
             fp_rows.iter().filter(|r| r.rec == ri).count(),
         );
     }
@@ -2948,9 +3205,21 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
     }
 
     let missed_total = gold_rows.iter().filter(|r| r.missed22).count();
-    print_span_population("all gold rallies (missed at v5 defaults flagged *)", &gold_rows, &rec_names);
-    print_span_population("duration-matched out-of-gold windows", &out_rows, &rec_names);
-    print_span_population("v5 false-positive spans (advisory for #92)", &fp_rows, &rec_names);
+    print_span_population(
+        "all gold rallies (missed at v5 defaults flagged *)",
+        &gold_rows,
+        &rec_names,
+    );
+    print_span_population(
+        "duration-matched out-of-gold windows",
+        &out_rows,
+        &rec_names,
+    );
+    print_span_population(
+        "v5 false-positive spans (advisory for #92)",
+        &fp_rows,
+        &rec_names,
+    );
 
     // Audio onset features per recording — history says a minority of recordings
     // poison the onset baseline (neighbour-court bleed, ADR 0015), so the audio
@@ -2962,7 +3231,11 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
     );
     for (ri, name) in rec_names.iter().enumerate() {
         let of = |rows: &[SpanRow]| {
-            med_cell(rows.iter().filter(|r| r.rec == ri).map(|r| r.feats.onset_per_s))
+            med_cell(
+                rows.iter()
+                    .filter(|r| r.rec == ri)
+                    .map(|r| r.feats.onset_per_s),
+            )
         };
         println!(
             "{:<44} {:>10} {:>12} {:>10}",
@@ -2988,7 +3261,13 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
         "{:<64} {:>14} {:>10} {:>11.1}% {:>9.1}%   <- same-population v5 reference",
         "v5 density judge (peak fired@k0 >= 0.50)",
         format!("{v5_gold_missed}/{}", gold_rows.len()),
-        format!("{}/{missed_total}", gold_rows.iter().filter(|r| r.missed22 && !r.v5_clears).count()),
+        format!(
+            "{}/{missed_total}",
+            gold_rows
+                .iter()
+                .filter(|r| r.missed22 && !r.v5_clears)
+                .count()
+        ),
         v5_out_frac,
         frac(v5_fp_clear, fp_rows.len()),
     );
@@ -3062,7 +3341,11 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
     }
     // The closest operating points either way, for the report's frontier read.
     let mut frontier: Vec<&SepRow> = sep.iter().collect();
-    frontier.sort_by(|a, b| a.gold_below.cmp(&b.gold_below).then(a.out_frac.total_cmp(&b.out_frac)));
+    frontier.sort_by(|a, b| {
+        a.gold_below
+            .cmp(&b.gold_below)
+            .then(a.out_frac.total_cmp(&b.out_frac))
+    });
     println!("\nbest operating points (by gold below, then out clearance):");
     for r in frontier.iter().take(8) {
         println!(
@@ -3273,8 +3556,9 @@ fn scratch_pose_window(
     timing: &mut ServeTiming,
 ) -> Option<crate::pose::PoseWindow> {
     let stem = rel_path.replace(['/', '\\'], "_");
-    let file =
-        scratch_dir.join(format!("{stem}@serve@{start_ms}+{dur_ms}@{SERVE_DENSIFY_FPS}fps.json"));
+    let file = scratch_dir.join(format!(
+        "{stem}@serve@{start_ms}+{dur_ms}@{SERVE_DENSIFY_FPS}fps.json"
+    ));
     if let Ok(text) = std::fs::read_to_string(&file) {
         if let Ok(win) = serde_json::from_str::<crate::pose::PoseWindow>(&text) {
             return Some(win);
@@ -3364,14 +3648,11 @@ fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Pat
             occupancy.as_ref(),
             &p,
         );
-        let draft: Vec<Interval> = seg
-            .rallies
-            .iter()
-            .map(Interval::from)
-            .collect();
-        let duration_ms = rec.duration_ms.filter(|&d| d > 0).unwrap_or(
-            samples_to_ms(samples.len()),
-        );
+        let draft: Vec<Interval> = seg.rallies.iter().map(Interval::from).collect();
+        let duration_ms = rec
+            .duration_ms
+            .filter(|&d| d > 0)
+            .unwrap_or(samples_to_ms(samples.len()));
         let onsets = segment::onset_blocks(&samples, media::SEGMENT_SAMPLE_RATE, &p);
         let (out_windows, _skipped) = matched_out_windows(&rec.gold, duration_ms);
         let fp_spans: Vec<Interval> = draft
@@ -3398,9 +3679,9 @@ fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Pat
 
         // Read one candidate span into a ServeRow (start window pose + span audio).
         let read_row = |span: Interval,
-                            detector: &mut crate::detect::Detector,
-                            pose: &mut crate::pose::PoseEstimator,
-                            timing: &mut ServeTiming|
+                        detector: &mut crate::detect::Detector,
+                        pose: &mut crate::pose::PoseEstimator,
+                        timing: &mut ServeTiming|
          -> ServeRow {
             let start = (span.start_ms - SERVE_WINDOW_PRE_MS).max(0);
             let dur = SERVE_WINDOW_PRE_MS + SERVE_WINDOW_POST_MS;
@@ -3433,7 +3714,13 @@ fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Pat
             } else {
                 0.0
             };
-            ServeRow { rec: ri, cue_vals, near_primary, far_primary, onset_per_s }
+            ServeRow {
+                rec: ri,
+                cue_vals,
+                near_primary,
+                far_primary,
+                onset_per_s,
+            }
         };
 
         for g in &rec.gold {
@@ -3467,7 +3754,11 @@ fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Pat
             rec.gold.len(),
             out_windows.len(),
             fp_spans.len(),
-            if poisoned[ri] { ", POISONED → serve-only" } else { "" }
+            if poisoned[ri] {
+                ", POISONED → serve-only"
+            } else {
+                ""
+            }
         );
     }
 
@@ -3515,18 +3806,25 @@ fn print_serve_corpus(
             "  (window-scoped: densified decode runs only around candidate starts, not whole recordings; ADR 0015 envelope is ≤ ~1.5x real-time CPU)"
         );
     } else {
-        println!("compute: fully cached this run (no timing) — delete the scratch dir to re-measure");
+        println!(
+            "compute: fully cached this run (no timing) — delete the scratch dir to re-measure"
+        );
     }
 }
 
 /// T1 — serve-cue recall at the gold rally starts, per recording × court side, across
 /// the declared cue grid.
 fn print_serve_recall(rec_names: &[String], gold: &[ServeRow]) {
-    println!("\n=== T1: serve-cue recall at gold rally starts (per recording × side × cue grid) ===");
+    println!(
+        "\n=== T1: serve-cue recall at gold rally starts (per recording × side × cue grid) ==="
+    );
     println!("(near/far measure the near/far-court player's own posture separately — a rally counts once per side that has a player; \"either\" = a serve on either court)");
     // Primary cue, split by recording and side.
     let taus = SERVE_CUE_TAUS;
-    print!("{:<40} {:>6} {:>5}", "recording (primary: wrist-over-shoulder)", "side", "n");
+    print!(
+        "{:<40} {:>6} {:>5}",
+        "recording (primary: wrist-over-shoulder)", "side", "n"
+    );
     for t in taus {
         print!("  τ{t:>+.2}");
     }
@@ -3633,7 +3931,8 @@ fn print_serve_frontier(
         Some(b) => !poisoned[r.rec] && r.onset_per_s >= b,
         None => false, // serve-only column
     };
-    let admits = |r: &ServeRow, tau: f64, bar: Option<f64>| r.serve_detected(tau) || audio_admits(r, bar);
+    let admits =
+        |r: &ServeRow, tau: f64, bar: Option<f64>| r.serve_detected(tau) || audio_admits(r, bar);
 
     println!(
         "\n{:<24} {:>16} {:>16} {:>16}",
@@ -3689,8 +3988,7 @@ fn print_serve_frontier(
         .iter()
         .filter(|pt| 100.0 * pt.fp_suppr as f64 / fp.len().max(1) as f64 >= 80.0)
         .collect();
-    let all_reaching_bad =
-        !reaching.is_empty() && reaching.iter().all(|pt| pt.gold_suppr >= 40);
+    let all_reaching_bad = !reaching.is_empty() && reaching.iter().all(|pt| pt.gold_suppr >= 40);
     let zone = if !green.is_empty() {
         "GREEN — proceed to the v6 build"
     } else if reaching.is_empty() || all_reaching_bad {
@@ -3772,7 +4070,8 @@ fn audio_last_onset_error(rally: Interval, ob: &segment::OnsetBlocks) -> Option<
 fn motion_decay_error(rally: Interval, motion: &segment::MotionTrack) -> Option<f64> {
     let fps = motion.fps.max(1e-6);
     let lo = ((rally.start_ms.max(0) as f64 / 1000.0) * fps).floor() as usize;
-    let hi = (((rally.end_ms.max(0) as f64 / 1000.0) * fps).ceil() as usize).min(motion.energy.len());
+    let hi =
+        (((rally.end_ms.max(0) as f64 / 1000.0) * fps).ceil() as usize).min(motion.energy.len());
     if lo >= hi {
         return None;
     }
@@ -3867,10 +4166,15 @@ impl Options {
                 "--export-gold" => opts.export_gold = true,
                 "--allow-unconfirmed" => opts.allow_unconfirmed = true,
                 "--dump-draft" => {
-                    opts.dump_draft = Some(it.next().ok_or("--dump-draft needs an output directory")?.clone());
+                    opts.dump_draft = Some(
+                        it.next()
+                            .ok_or("--dump-draft needs an output directory")?
+                            .clone(),
+                    );
                 }
                 "--import-draft" => {
-                    opts.import_draft = Some(it.next().ok_or("--import-draft needs a directory")?.clone());
+                    opts.import_draft =
+                        Some(it.next().ok_or("--import-draft needs a directory")?.clone());
                 }
                 "--root" => {
                     opts.root = Some(it.next().ok_or("--root needs a directory")?.clone());
@@ -3952,9 +4256,11 @@ fn default_db_path() -> Result<PathBuf, String> {
 /// macOS, `%APPDATA%` on Windows.
 fn app_data_root() -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
-    let root = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-    });
+    let root = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+        });
     #[cfg(target_os = "macos")]
     let root = std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join("Library").join("Application Support"));
@@ -4016,7 +4322,10 @@ mod tests {
         };
         // The import replaces the old draft, and a machine import never reaches the
         // hand-corrected sentinel even when the file claims 1.0.
-        assert_eq!(rows(&conn, 1), vec![(2000, 5000, 0.3), (9000, 12000, IMPORT_MAX_CONFIDENCE)]);
+        assert_eq!(
+            rows(&conn, 1),
+            vec![(2000, 5000, 0.3), (9000, 12000, IMPORT_MAX_CONFIDENCE)]
+        );
         // The other recording is untouched.
         assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
         // A last rally a few frames past the probed duration is trimmed to fit.
@@ -4104,7 +4413,7 @@ mod tests {
     fn false_positives_per_hour_scales_with_duration() {
         let gold = ivals(&[(0, 1000)]);
         let draft = ivals(&[(0, 1000), (5000, 6000), (7000, 8000)]); // two spurious
-        // Two false positives over half an hour → 4.0 per hour.
+                                                                     // Two false positives over half an hour → 4.0 per hour.
         let s = score(&draft, &gold, ONE_HOUR_MS / 2);
         assert_eq!(s.false_positives, 2);
         assert_eq!(s.false_positives_per_hour, 4.0);
@@ -4140,7 +4449,10 @@ mod tests {
         let draft = ivals(&[(0, 300), (200, 1000)]); // overlaps 300 vs 800
         let s = score(&draft, &gold, ONE_HOUR_MS);
         assert_eq!(s.misses, 0);
-        assert_eq!(s.false_positives, 0, "both drafts overlap the gold, neither is spurious");
+        assert_eq!(
+            s.false_positives, 0,
+            "both drafts overlap the gold, neither is spurious"
+        );
         // Paired with (200,1000): start error |0-200|=200, end error |1000-1000|=0.
         assert_eq!(s.boundary_errors_ms, vec![200, 0]);
     }
@@ -4215,7 +4527,16 @@ mod tests {
     #[test]
     fn a_span_over_motion_blocks_alone_is_motion_only() {
         let b = blocks(&[false, true, true, false], &[false; 4]);
-        let s = classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &[]);
+        let s = classify_span(
+            Interval {
+                start_ms: 1000,
+                end_ms: 3000,
+            },
+            &b,
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(s.provenance, Provenance::MotionOnly);
         assert_eq!(s.motion_frac, 1.0);
         assert_eq!(s.occupancy_frac, 0.0);
@@ -4224,14 +4545,32 @@ mod tests {
     #[test]
     fn a_span_over_occupancy_blocks_alone_is_occupancy_only() {
         let b = blocks(&[false; 4], &[false, true, true, false]);
-        let s = classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &[]);
+        let s = classify_span(
+            Interval {
+                start_ms: 1000,
+                end_ms: 3000,
+            },
+            &b,
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(s.provenance, Provenance::OccupancyOnly);
     }
 
     #[test]
     fn a_span_with_both_proposers_is_mixed() {
         let b = blocks(&[false, true, false, false], &[false, false, true, false]);
-        let s = classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &[]);
+        let s = classify_span(
+            Interval {
+                start_ms: 1000,
+                end_ms: 3000,
+            },
+            &b,
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(s.provenance, Provenance::Mixed);
         assert_eq!(s.motion_frac, 0.5);
         assert_eq!(s.occupancy_frac, 0.5);
@@ -4242,7 +4581,16 @@ mod tests {
         // Motion fired only on the middle block; the padded span also covers one
         // inactive block on each side.
         let b = blocks(&[false, false, true, false, false], &[false; 5]);
-        let s = classify_span(Interval { start_ms: 1000, end_ms: 4000 }, &b, &[], None, &[]);
+        let s = classify_span(
+            Interval {
+                start_ms: 1000,
+                end_ms: 4000,
+            },
+            &b,
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(s.provenance, Provenance::MotionOnly);
         assert!((s.motion_frac - 1.0 / 3.0).abs() < 1e-9);
     }
@@ -4250,7 +4598,16 @@ mod tests {
     #[test]
     fn a_span_beyond_the_masks_reads_as_the_motion_proposes_fallback() {
         let b = blocks(&[], &[]);
-        let s = classify_span(Interval { start_ms: 0, end_ms: 2000 }, &b, &[], None, &[]);
+        let s = classify_span(
+            Interval {
+                start_ms: 0,
+                end_ms: 2000,
+            },
+            &b,
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(s.provenance, Provenance::MotionOnly);
         assert_eq!(s.motion_frac, 0.0);
     }
@@ -4259,7 +4616,10 @@ mod tests {
     fn audio_verdicts_match_the_padded_span_by_overlap() {
         let b = blocks(&[true; 10], &[false; 10]);
         // Raw verdict span 2000–5000 sits inside the padded rally 800–6200.
-        let span = Interval { start_ms: 800, end_ms: 6200 };
+        let span = Interval {
+            start_ms: 800,
+            end_ms: 6200,
+        };
         let confirmed = classify_span(span, &b, &[verdict(2000, 5000, true)], None, &[]);
         assert!(confirmed.audio_confirmed);
         let unconfirmed = classify_span(span, &b, &[verdict(2000, 5000, false)], None, &[]);
@@ -4272,7 +4632,10 @@ mod tests {
     #[test]
     fn a_merged_span_covering_one_confirmed_raw_span_is_confirmed() {
         let b = blocks(&[true; 12], &[false; 12]);
-        let span = Interval { start_ms: 0, end_ms: 12000 };
+        let span = Interval {
+            start_ms: 0,
+            end_ms: 12000,
+        };
         let vs = [verdict(1000, 4000, false), verdict(7000, 10000, true)];
         assert!(classify_span(span, &b, &vs, None, &[]).audio_confirmed);
     }
@@ -4285,33 +4648,95 @@ mod tests {
             end_ms: 4000,
             verdict: segment::GateVerdict::MotionNeverFired,
         }];
-        assert!(!classify_span(Interval { start_ms: 0, end_ms: 4000 }, &b, &vs, None, &[]).audio_confirmed);
+        assert!(
+            !classify_span(
+                Interval {
+                    start_ms: 0,
+                    end_ms: 4000
+                },
+                &b,
+                &vs,
+                None,
+                &[]
+            )
+            .audio_confirmed
+        );
     }
 
     #[test]
     fn a_span_overlapping_gold_is_a_tp_and_one_overlapping_none_is_an_fp() {
         let b = blocks(&[true; 4], &[false; 4]);
         let gold = ivals(&[(0, 2000)]);
-        assert!(!classify_span(Interval { start_ms: 1000, end_ms: 3000 }, &b, &[], None, &gold).is_fp);
-        assert!(classify_span(Interval { start_ms: 2500, end_ms: 3500 }, &b, &[], None, &gold).is_fp);
+        assert!(
+            !classify_span(
+                Interval {
+                    start_ms: 1000,
+                    end_ms: 3000
+                },
+                &b,
+                &[],
+                None,
+                &gold
+            )
+            .is_fp
+        );
+        assert!(
+            classify_span(
+                Interval {
+                    start_ms: 2500,
+                    end_ms: 3500
+                },
+                &b,
+                &[],
+                None,
+                &gold
+            )
+            .is_fp
+        );
     }
 
     #[test]
     fn fired_fraction_counts_the_samples_inside_the_span() {
         // 1 fps: samples at 0s, 1s, 2s, 3s. Span 0–2s holds samples 0 and 1.
         let f = [
-            segment::OccupancySample { live: 2, fired: true },
-            segment::OccupancySample { live: 2, fired: false },
-            segment::OccupancySample { live: 2, fired: true },
-            segment::OccupancySample { live: 2, fired: true },
+            segment::OccupancySample {
+                live: 2,
+                fired: true,
+            },
+            segment::OccupancySample {
+                live: 2,
+                fired: false,
+            },
+            segment::OccupancySample {
+                live: 2,
+                fired: true,
+            },
+            segment::OccupancySample {
+                live: 2,
+                fired: true,
+            },
         ];
         assert_eq!(
-            fired_fraction(Interval { start_ms: 0, end_ms: 2000 }, &f, 1.0),
+            fired_fraction(
+                Interval {
+                    start_ms: 0,
+                    end_ms: 2000
+                },
+                &f,
+                1.0
+            ),
             Some(0.5)
         );
         // A span beyond the track's end holds no samples.
         assert_eq!(
-            fired_fraction(Interval { start_ms: 9000, end_ms: 12000 }, &f, 1.0),
+            fired_fraction(
+                Interval {
+                    start_ms: 9000,
+                    end_ms: 12000
+                },
+                &f,
+                1.0
+            ),
             None
         );
     }
@@ -4319,11 +4744,24 @@ mod tests {
     #[test]
     fn no_firing_samples_in_the_span_reads_as_zero_not_absent() {
         let f = [
-            segment::OccupancySample { live: 0, fired: false },
-            segment::OccupancySample { live: 0, fired: false },
+            segment::OccupancySample {
+                live: 0,
+                fired: false,
+            },
+            segment::OccupancySample {
+                live: 0,
+                fired: false,
+            },
         ];
         assert_eq!(
-            fired_fraction(Interval { start_ms: 0, end_ms: 2000 }, &f, 1.0),
+            fired_fraction(
+                Interval {
+                    start_ms: 0,
+                    end_ms: 2000
+                },
+                &f,
+                1.0
+            ),
             Some(0.0)
         );
     }
@@ -4336,7 +4774,10 @@ mod tests {
         is_fp: bool,
     ) -> SpanSupport {
         SpanSupport {
-            span: Interval { start_ms: span.0, end_ms: span.1 },
+            span: Interval {
+                start_ms: span.0,
+                end_ms: span.1,
+            },
             provenance,
             motion_frac: 1.0,
             occupancy_frac: 0.0,
@@ -4364,7 +4805,10 @@ mod tests {
         });
         assert_eq!(fp_removed, 1);
         assert_eq!(fph_remaining, 0.0);
-        assert_eq!(gold_lost, 1, "suppressing the sole covering span loses the gold rally");
+        assert_eq!(
+            gold_lost, 1,
+            "suppressing the sole covering span loses the gold rally"
+        );
     }
 
     #[test]
@@ -4437,9 +4881,29 @@ mod tests {
         assert!(sample_in_gold(1, 2.0, &gold));
         assert!(sample_in_gold(2, 2.0, &gold));
         assert!(!sample_in_gold(3, 2.0, &gold), "gold end is exclusive");
-        assert_eq!(sample_range(Interval { start_ms: 500, end_ms: 1500 }, 2.0, 4), (1, 3));
+        assert_eq!(
+            sample_range(
+                Interval {
+                    start_ms: 500,
+                    end_ms: 1500
+                },
+                2.0,
+                4
+            ),
+            (1, 3)
+        );
         // A range beyond the track clamps to its length.
-        assert_eq!(sample_range(Interval { start_ms: 0, end_ms: 99_000 }, 2.0, 4), (0, 4));
+        assert_eq!(
+            sample_range(
+                Interval {
+                    start_ms: 0,
+                    end_ms: 99_000
+                },
+                2.0,
+                4
+            ),
+            (0, 4)
+        );
     }
 
     /// Two players with size structure whose boxes each step `step` in x per
@@ -4450,8 +4914,18 @@ mod tests {
         let samples = (0..n)
             .map(|i| {
                 let j = (i % 2) as f64 * step;
-                let far = segment::DetBox { x: 0.15 + j, y: 0.25, w: 0.14, h: 0.14 }; // area ~0.02
-                let near = segment::DetBox { x: 0.75 - j, y: 0.65, w: 0.32, h: 0.32 }; // area ~0.10
+                let far = segment::DetBox {
+                    x: 0.15 + j,
+                    y: 0.25,
+                    w: 0.14,
+                    h: 0.14,
+                }; // area ~0.02
+                let near = segment::DetBox {
+                    x: 0.75 - j,
+                    y: 0.65,
+                    w: 0.32,
+                    h: 0.32,
+                }; // area ~0.10
                 vec![far, near]
             })
             .collect();
@@ -4468,17 +4942,25 @@ mod tests {
         let slow = rule_flags(&occ, &p, FiringRule::Velocity(0.15));
         let fast = rule_flags(&occ, &p, FiringRule::Velocity(0.25));
         let current = rule_flags(&occ, &p, FiringRule::Current);
-        assert!(!slow[0] && !fast[0] && !current[0], "no previous sample yet");
+        assert!(
+            !slow[0] && !fast[0] && !current[0],
+            "no previous sample yet"
+        );
         assert!(slow[1..].iter().all(|&f| f), "0.18/s clears a 0.15/s bar");
         assert!(fast[1..].iter().all(|&f| !f), "0.18/s misses a 0.25/s bar");
-        assert!(current[1..].iter().all(|&f| f), "the shipped movement bool fires");
+        assert!(
+            current[1..].iter().all(|&f| f),
+            "the shipped movement bool fires"
+        );
     }
 
     #[test]
     fn rule_stats_pool_rates_and_probe_missed_windows() {
         // 1 fps, 10 samples; gold covers 0–4 s (samples 0..4), the rest is out.
         // All in-gold samples fire, no out-of-gold sample does.
-        let fired = [true, true, true, true, false, false, false, false, false, false];
+        let fired = [
+            true, true, true, true, false, false, false, false, false, false,
+        ];
         let gold = ivals(&[(0, 4000)]);
         let missed = ivals(&[(1000, 3000)]);
         let mut p = segment::Params::default();
@@ -4507,10 +4989,22 @@ mod tests {
             &[false, false, false, true, true, false],
         );
         // The padded span covers blocks 0..6; the active ones are 1 and 3–4.
-        let span = Interval { start_ms: 0, end_ms: 6000 };
+        let span = Interval {
+            start_ms: 0,
+            end_ms: 6000,
+        };
         assert_eq!(edge_blocks(span, &b), Some((1, 4)));
         // A span over quiet blocks only has no edge-placing block.
-        assert_eq!(edge_blocks(Interval { start_ms: 5000, end_ms: 6000 }, &b), None);
+        assert_eq!(
+            edge_blocks(
+                Interval {
+                    start_ms: 5000,
+                    end_ms: 6000
+                },
+                &b
+            ),
+            None
+        );
     }
 
     #[test]
@@ -4555,12 +5049,23 @@ mod tests {
 
     /// A normalized box for presence fixtures.
     fn dbox(x: f64, y: f64, side: f64) -> segment::DetBox {
-        segment::DetBox { x, y, w: side, h: side }
+        segment::DetBox {
+            x,
+            y,
+            w: side,
+            h: side,
+        }
     }
 
     /// A scored detector box for banding fixtures.
     fn sbox(x: f32, side: f32, score: f32) -> crate::detect::Box {
-        crate::detect::Box { x, y: 0.25, w: side, h: side, score }
+        crate::detect::Box {
+            x,
+            y: 0.25,
+            w: side,
+            h: side,
+            score,
+        }
     }
 
     #[test]
@@ -4609,9 +5114,16 @@ mod tests {
             samples: vec![vec![a], vec![], vec![], vec![]],
         };
         let bridged = bridge_track(&occ, 2);
-        assert_eq!(bridged.samples[1], vec![a], "persists one sample after vanishing");
+        assert_eq!(
+            bridged.samples[1],
+            vec![a],
+            "persists one sample after vanishing"
+        );
         assert_eq!(bridged.samples[2], vec![a], "persists a second sample");
-        assert!(bridged.samples[3].is_empty(), "the chain ends after k samples");
+        assert!(
+            bridged.samples[3].is_empty(),
+            "the chain ends after k samples"
+        );
     }
 
     #[test]
@@ -4624,7 +5136,11 @@ mod tests {
             samples: vec![vec![a], vec![a_moved]],
         };
         let bridged = bridge_track(&occ, 3);
-        assert_eq!(bridged.samples[1], vec![a_moved], "no ghost of the re-detected box");
+        assert_eq!(
+            bridged.samples[1],
+            vec![a_moved],
+            "no ghost of the re-detected box"
+        );
     }
 
     #[test]
@@ -4636,7 +5152,11 @@ mod tests {
             samples: vec![vec![a], vec![b]],
         };
         let bridged = bridge_track(&occ, 1);
-        assert_eq!(bridged.samples[1], vec![b, a], "the real box plus the carried one");
+        assert_eq!(
+            bridged.samples[1],
+            vec![b, a],
+            "the real box plus the carried one"
+        );
     }
 
     /// End-to-end through the real pipeline: two players the detector only ever
@@ -4665,21 +5185,34 @@ mod tests {
             .iter()
             .map(|s| s.size_structure)
             .collect();
-        assert!(unbridged.iter().all(|&s| !s), "one visible box never structures");
+        assert!(
+            unbridged.iter().all(|&s| !s),
+            "one visible box never structures"
+        );
         let bridged: Vec<bool> = segment::occupancy_kinematics(&bridge_track(&occ, 1), &p)
             .iter()
             .map(|s| s.size_structure)
             .collect();
         assert!(!bridged[0], "nothing to carry into the first sample");
-        assert!(bridged[1..].iter().all(|&s| s), "every later sample pairs real + carried");
+        assert!(
+            bridged[1..].iter().all(|&s| s),
+            "every later sample pairs real + carried"
+        );
     }
 
     #[test]
     fn flag_fraction_counts_within_the_clipped_range() {
         let flags = [true, false, true, true];
         assert!((flag_fraction(&flags, 0, 2) - 0.5).abs() < 1e-9);
-        assert!((flag_fraction(&flags, 2, 99) - 1.0).abs() < 1e-9, "clips at the track end");
-        assert_eq!(flag_fraction(&flags, 4, 4), 0.0, "an empty range has no presence");
+        assert!(
+            (flag_fraction(&flags, 2, 99) - 1.0).abs() < 1e-9,
+            "clips at the track end"
+        );
+        assert_eq!(
+            flag_fraction(&flags, 4, 4),
+            0.0,
+            "an empty range has no presence"
+        );
     }
 
     // ── Span-score separation (issue #93, round 3) ────────────────────────────
@@ -4740,10 +5273,37 @@ mod tests {
             onsets: vec![1, 2, 0, 3],
         };
         // 500–2500 ms overlaps blocks 0, 1, 2.
-        assert_eq!(onsets_in_span(Interval { start_ms: 500, end_ms: 2500 }, &ob), 3);
+        assert_eq!(
+            onsets_in_span(
+                Interval {
+                    start_ms: 500,
+                    end_ms: 2500
+                },
+                &ob
+            ),
+            3
+        );
         // Beyond the mask clamps to what exists.
-        assert_eq!(onsets_in_span(Interval { start_ms: 3000, end_ms: 9000 }, &ob), 3);
-        assert_eq!(onsets_in_span(Interval { start_ms: 9000, end_ms: 10_000 }, &ob), 0);
+        assert_eq!(
+            onsets_in_span(
+                Interval {
+                    start_ms: 3000,
+                    end_ms: 9000
+                },
+                &ob
+            ),
+            3
+        );
+        assert_eq!(
+            onsets_in_span(
+                Interval {
+                    start_ms: 9000,
+                    end_ms: 10_000
+                },
+                &ob
+            ),
+            0
+        );
     }
 
     /// Hand-built views at 2 fps for span-feature fixtures: structure/fired flags
@@ -4768,8 +5328,18 @@ mod tests {
             [&[false; 8], &f2, &f2],
             &[0.1, 0.2, 0.1, 0.0, 0.1, 0.3, 0.2, 0.0],
         );
-        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![1, 0, 2, 0] };
-        let f = span_features(Interval { start_ms: 0, end_ms: 4000 }, Some(&v), &ob);
+        let ob = segment::OnsetBlocks {
+            block_ms: 1000,
+            onsets: vec![1, 0, 2, 0],
+        };
+        let f = span_features(
+            Interval {
+                start_ms: 0,
+                end_ms: 4000,
+            },
+            Some(&v),
+            &ob,
+        );
         assert!((f.presence[0] - 5.0 / 8.0).abs() < 1e-9);
         assert!((f.presence[SPAN_K2] - 1.0).abs() < 1e-9);
         assert!((f.fired[SPAN_K2] - 0.5).abs() < 1e-9);
@@ -4787,8 +5357,18 @@ mod tests {
 
     #[test]
     fn span_features_without_a_detector_read_as_one_full_gap() {
-        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![2, 2, 2, 2] };
-        let f = span_features(Interval { start_ms: 0, end_ms: 3000 }, None, &ob);
+        let ob = segment::OnsetBlocks {
+            block_ms: 1000,
+            onsets: vec![2, 2, 2, 2],
+        };
+        let f = span_features(
+            Interval {
+                start_ms: 0,
+                end_ms: 3000,
+            },
+            None,
+            &ob,
+        );
         assert!(f.presence.iter().all(|&p| p == 0.0));
         assert_eq!(f.max_gap_s, 3.0, "no samples → one span-length gap");
         assert_eq!(f.sustained_s, 0.0);
@@ -4801,9 +5381,19 @@ mod tests {
     fn span_features_beyond_the_track_read_as_one_full_gap() {
         let s = [true, true];
         let v = views([&s, &s, &s], [&s, &s, &s], &[0.1, 0.1]);
-        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![0; 40] };
+        let ob = segment::OnsetBlocks {
+            block_ms: 1000,
+            onsets: vec![0; 40],
+        };
         // A span past the track's end holds no samples.
-        let f = span_features(Interval { start_ms: 30_000, end_ms: 34_000 }, Some(&v), &ob);
+        let f = span_features(
+            Interval {
+                start_ms: 30_000,
+                end_ms: 34_000,
+            },
+            Some(&v),
+            &ob,
+        );
         assert_eq!(f.presence[0], 0.0);
         assert_eq!(f.max_gap_s, 4.0);
         assert_eq!(f.mean_speed, 0.0);
@@ -4829,7 +5419,10 @@ mod tests {
         let p = segment::Params::default();
         let points = span_score_points(&p);
         let rescue: Vec<_> = points.iter().filter(|pt| pt.label.contains('|')).collect();
-        assert!(!rescue.is_empty(), "the grid must include the rescue family");
+        assert!(
+            !rescue.is_empty(),
+            "the grid must include the rescue family"
+        );
         for pt in &rescue {
             // A span vision fully admits stays admitted with zero audio (audio
             // never sinks)…
@@ -4875,12 +5468,22 @@ mod tests {
     /// A player pose with the listed keypoints set (index, x, y, score); the rest sit
     /// at zero confidence. The box centre is placed low in frame (near court).
     fn pose_with(kps: &[(usize, f32, f32, f32)]) -> crate::pose::PlayerPose {
-        let mut keypoints = [crate::pose::Keypoint { x: 0.0, y: 0.0, score: 0.0 }; crate::pose::NUM_KP];
+        let mut keypoints = [crate::pose::Keypoint {
+            x: 0.0,
+            y: 0.0,
+            score: 0.0,
+        }; crate::pose::NUM_KP];
         for &(i, x, y, s) in kps {
             keypoints[i] = crate::pose::Keypoint { x, y, score: s };
         }
         crate::pose::PlayerPose {
-            bbox: crate::detect::Box { x: 0.45, y: 0.6, w: 0.1, h: 0.3, score: 0.9 },
+            bbox: crate::detect::Box {
+                x: 0.45,
+                y: 0.6,
+                w: 0.1,
+                h: 0.3,
+                score: 0.9,
+            },
             keypoints,
         }
     }
@@ -4936,8 +5539,14 @@ mod tests {
         let win = crate::pose::PoseWindow {
             fps: 15.0,
             frames: vec![
-                crate::pose::PoseFrame { t_ms: 0, players: vec![low] },
-                crate::pose::PoseFrame { t_ms: 66, players: vec![high] },
+                crate::pose::PoseFrame {
+                    t_ms: 0,
+                    players: vec![low],
+                },
+                crate::pose::PoseFrame {
+                    t_ms: 66,
+                    players: vec![high],
+                },
             ],
         };
         // The high frame wins the pooled max; the near-court selector sees it (box
@@ -4960,12 +5569,32 @@ mod tests {
     fn audio_last_onset_error_is_distance_to_the_final_onset() {
         // Blocks 0..4 at 1 s; onsets in blocks 1 and 3. Rally 0–5000 ends at 5000; the
         // last onset is block 3, centre 3500 → 1.5 s error.
-        let ob = segment::OnsetBlocks { block_ms: 1000, onsets: vec![0, 2, 0, 1, 0] };
-        let e = audio_last_onset_error(Interval { start_ms: 0, end_ms: 5000 }, &ob).unwrap();
+        let ob = segment::OnsetBlocks {
+            block_ms: 1000,
+            onsets: vec![0, 2, 0, 1, 0],
+        };
+        let e = audio_last_onset_error(
+            Interval {
+                start_ms: 0,
+                end_ms: 5000,
+            },
+            &ob,
+        )
+        .unwrap();
         assert!((e - 1.5).abs() < 1e-6, "{e}");
         // A rally with no onset inside is undefined, never zeroed.
-        let ob0 = segment::OnsetBlocks { block_ms: 1000, onsets: vec![0, 0, 0] };
-        assert!(audio_last_onset_error(Interval { start_ms: 0, end_ms: 3000 }, &ob0).is_none());
+        let ob0 = segment::OnsetBlocks {
+            block_ms: 1000,
+            onsets: vec![0, 0, 0],
+        };
+        assert!(audio_last_onset_error(
+            Interval {
+                start_ms: 0,
+                end_ms: 3000
+            },
+            &ob0
+        )
+        .is_none());
     }
 
     #[test]
@@ -4974,7 +5603,14 @@ mod tests {
         // frame clearing 50% of it. Energy tail goes quiet after frame 5.
         let energy = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         let motion = segment::MotionTrack { fps: 10.0, energy };
-        let e = motion_decay_error(Interval { start_ms: 0, end_ms: 1000 }, &motion).unwrap();
+        let e = motion_decay_error(
+            Interval {
+                start_ms: 0,
+                end_ms: 1000,
+            },
+            &motion,
+        )
+        .unwrap();
         // last frame >= 0.5*p75 (p75=1.0) is index 5 → 500 ms; end 1000 → 0.5 s error.
         assert!((e - 0.5).abs() < 1e-6, "{e}");
     }

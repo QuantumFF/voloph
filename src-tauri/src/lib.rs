@@ -7,6 +7,8 @@ pub mod detect;
 /// hand-corrected timelines. Public so the `eval-harness` bin can drive it.
 pub mod eval;
 mod export;
+/// Shared pieces of the learned segmenters (ADR 0019).
+mod learned;
 mod media;
 mod media_worker;
 /// Serve-cue pose extraction (ADR 0017, issue #95 round 4): a nano RTMPose-t
@@ -16,8 +18,6 @@ mod media_worker;
 pub mod pose;
 mod segment;
 mod staging;
-/// Shared pieces of the learned segmenters (ADR 0019).
-mod learned;
 /// The learned student segmenter (issue #105): boosted trees on v6's cheap signals.
 mod student;
 /// The learned teacher segmenter (issue #105): TrackNet shuttle track + player pose.
@@ -432,15 +432,23 @@ async fn set_playback_padding(db: State<'_, Db>, padding: db::Padding) -> Result
 async fn active_segmenter(db: State<'_, Db>) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let kind = db::active_kind(&conn).map_err(|e| e.to_string())?;
-    Ok(db::library_segmenter(&conn, &kind).map_err(|e| e.to_string())?.id().to_string())
+    Ok(db::library_segmenter(&conn, &kind)
+        .map_err(|e| e.to_string())?
+        .id()
+        .to_string())
 }
 
 /// Switch the active library's segmenter (ADR 0019): untouched drafts another
 /// segmenter made are re-derived in the background; hand-touched recordings keep
 /// theirs. Returns how many recordings were queued.
 #[tauri::command]
-async fn set_active_segmenter(app: AppHandle, db: State<'_, Db>, segmenter: String) -> Result<usize, String> {
-    let segmenter = segment::Segmenter::from_id(&segmenter).ok_or_else(|| format!("unknown segmenter {segmenter}"))?;
+async fn set_active_segmenter(
+    app: AppHandle,
+    db: State<'_, Db>,
+    segmenter: String,
+) -> Result<usize, String> {
+    let segmenter = segment::Segmenter::from_id(&segmenter)
+        .ok_or_else(|| format!("unknown segmenter {segmenter}"))?;
     let queued = {
         let mut conn = db.0.lock().map_err(|e| e.to_string())?;
         let kind = db::active_kind(&conn).map_err(|e| e.to_string())?;
@@ -631,7 +639,11 @@ fn selected_cuts(
         .collect();
     export::pad_intervals(&strict, pad, timeline.duration_ms)
         .into_iter()
-        .map(|(start_ms, end_ms)| export::Cut { src, start_ms, end_ms })
+        .map(|(start_ms, end_ms)| export::Cut {
+            src,
+            start_ms,
+            end_ms,
+        })
         .collect()
 }
 
@@ -654,7 +666,10 @@ async fn export_rallies(
         let timeline = db::recording_timeline(&conn, &path)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "recording is not registered".to_string())?;
-        (timeline, db::playback_padding(&conn).map_err(|e| e.to_string())?)
+        (
+            timeline,
+            db::playback_padding(&conn).map_err(|e| e.to_string())?,
+        )
     };
     let cuts = selected_cuts(&timeline, 0, &rally_ids, pad);
     export::export(&app, &[&path], &output, &cuts)

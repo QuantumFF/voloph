@@ -433,7 +433,17 @@ pub fn extract_pose_window(
     detector: &mut detect::Detector,
     pose: &mut PoseEstimator,
 ) -> Result<PoseWindow, String> {
-    extract_pose_window_k(path, start_ms, dur_ms, fps, src_w, src_h, MAX_PLAYERS, detector, pose)
+    extract_pose_window_k(
+        path,
+        start_ms,
+        dur_ms,
+        fps,
+        src_w,
+        src_h,
+        MAX_PLAYERS,
+        detector,
+        pose,
+    )
 }
 
 /// [`extract_pose_window`] keeping the `max_players` highest-scored person boxes per
@@ -538,7 +548,11 @@ pub fn dump_cli(args: Vec<String>) -> Result<(), String> {
             "--file" => file = Some(val("--file")?),
             "--out" => out = Some(val("--out")?),
             "--fps" => fps = val("--fps")?.parse().map_err(|e| format!("--fps: {e}"))?,
-            "--players" => players = val("--players")?.parse().map_err(|e| format!("--players: {e}"))?,
+            "--players" => {
+                players = val("--players")?
+                    .parse()
+                    .map_err(|e| format!("--players: {e}"))?
+            }
             "-h" | "--help" => {
                 println!("pose-dump --file PATH --out FILE.json [--fps N] [--players K]");
                 return Ok(());
@@ -553,7 +567,17 @@ pub fn dump_cli(args: Vec<String>) -> Result<(), String> {
     let mut pose = PoseEstimator::load(&vendored_pose_model_path()?)?;
     let started = std::time::Instant::now();
     // A day-long window: ffmpeg's `-t` stops at end of file.
-    let win = extract_pose_window_k(&file, 0, 86_400_000, fps, w, h, players, &mut detector, &mut pose)?;
+    let win = extract_pose_window_k(
+        &file,
+        0,
+        86_400_000,
+        fps,
+        w,
+        h,
+        players,
+        &mut detector,
+        &mut pose,
+    )?;
     let wall = started.elapsed().as_secs_f64();
     let footage = win.frames.len() as f64 / f64::from(fps);
     let tmp = format!("{out}.tmp");

@@ -281,7 +281,16 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
             }
         }) {
             Ok(rallies) => {
-                return finish_segmentation(app, conn, id, path, &samples, rallies, segment::Segmenter::Teacher, &started);
+                return finish_segmentation(
+                    app,
+                    conn,
+                    id,
+                    path,
+                    &samples,
+                    rallies,
+                    segment::Segmenter::Teacher,
+                    &started,
+                );
             }
             Err(e) => {
                 log::warn!("media worker: teacher failed for {path}, using the student: {e}");
@@ -327,7 +336,9 @@ fn finish_segmentation(
 
     match conn.lock() {
         Ok(mut c) => {
-            if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform, segmenter) {
+            if let Err(e) =
+                db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform, segmenter)
+            {
                 log::error!("media worker: could not save timeline for {path}: {e}");
             } else {
                 // Publish the pristine machine Analysis for adoption by other users
@@ -357,27 +368,46 @@ fn run_segmenter(
         match (crate::student::StudentModel::bundled(), detections) {
             (Ok(model), Some(detect)) => {
                 let started = Instant::now();
-                let audio = segment::audio_frames(samples, media::SEGMENT_SAMPLE_RATE, &segment::Params::default());
+                let audio = segment::audio_frames(
+                    samples,
+                    media::SEGMENT_SAMPLE_RATE,
+                    &segment::Params::default(),
+                );
                 // Duration as the training pipeline computed it (signals-dump).
                 let footage_s = samples.len() as f64 / f64::from(media::SEGMENT_SAMPLE_RATE);
-                let rallies = crate::student::segment(model, &crate::student::Inputs {
-                    duration_ms: (footage_s * 1000.0).round() as i64,
-                    motion_fps: motion.fps,
-                    motion: &motion.energy,
-                    audio_frame_ms: audio.frame_ms,
-                    audio_energy: &audio.energy,
-                    audio_onset: &audio.onset,
-                    detect,
-                });
-                log::info!("media worker: student segmented {path} in {} ms", started.elapsed().as_millis());
+                let rallies = crate::student::segment(
+                    model,
+                    &crate::student::Inputs {
+                        duration_ms: (footage_s * 1000.0).round() as i64,
+                        motion_fps: motion.fps,
+                        motion: &motion.energy,
+                        audio_frame_ms: audio.frame_ms,
+                        audio_energy: &audio.energy,
+                        audio_onset: &audio.onset,
+                        detect,
+                    },
+                );
+                log::info!(
+                    "media worker: student segmented {path} in {} ms",
+                    started.elapsed().as_millis()
+                );
                 return (rallies, segment::Segmenter::Student);
             }
-            (Err(e), _) => log::warn!("media worker: student model unavailable, using v6 for {path}: {e}"),
-            (_, None) => log::warn!("media worker: no person detections for {path}; the student needs them, using v6"),
+            (Err(e), _) => {
+                log::warn!("media worker: student model unavailable, using v6 for {path}: {e}")
+            }
+            (_, None) => log::warn!(
+                "media worker: no person detections for {path}; the student needs them, using v6"
+            ),
         }
     }
     let occupancy = detections.map(detect::DetectionTrack::to_occupancy_track);
-    let segmentation = segment::segment(samples, media::SEGMENT_SAMPLE_RATE, motion, occupancy.as_ref());
+    let segmentation = segment::segment(
+        samples,
+        media::SEGMENT_SAMPLE_RATE,
+        motion,
+        occupancy.as_ref(),
+    );
     // Per-span gate verdicts (ADR 0015 Stage 0): one line per candidate span the
     // segmenter weighed, so running a bad recording shows which gate ate a rally.
     // Diagnostic only — the draft is unaffected.

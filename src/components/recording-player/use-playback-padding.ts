@@ -17,7 +17,12 @@ export function usePlaybackPadding(): Padding {
     let live = true
     trackedInvoke<Padding>("playback_padding")
       .then((p) => {
-        if (live && p && typeof p.lead_ms === "number" && typeof p.tail_ms === "number") {
+        if (
+          live &&
+          p &&
+          typeof p.lead_ms === "number" &&
+          typeof p.tail_ms === "number"
+        ) {
           setPadding(p)
         }
       })

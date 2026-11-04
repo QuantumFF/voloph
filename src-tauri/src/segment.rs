@@ -678,7 +678,11 @@ pub fn audio_frames(samples: &[f32], sample_rate: u32, p: &Params) -> AudioFrame
             window_sum -= energy[i - baseline_frames];
         }
     }
-    AudioFrames { frame_ms, energy, onset }
+    AudioFrames {
+        frame_ms,
+        energy,
+        onset,
+    }
 }
 
 /// The per-block shuttle-hit **onset counts** behind the confidence modulator —
@@ -902,8 +906,12 @@ pub fn occupancy_firing(occ: &OccupancyTrack, p: &Params) -> Vec<OccupancySample
     let mut out = Vec::with_capacity(occ.samples.len());
     let mut prev_centers: Vec<(f64, f64)> = Vec::new();
     for s in filtered_samples(occ, p) {
-        let fired = s.size_structure && centers_moved(&prev_centers, &s.centers, p.occupancy_static_frac);
-        out.push(OccupancySample { live: s.live, fired });
+        let fired =
+            s.size_structure && centers_moved(&prev_centers, &s.centers, p.occupancy_static_frac);
+        out.push(OccupancySample {
+            live: s.live,
+            fired,
+        });
         prev_centers = s.centers;
     }
     out
@@ -970,9 +978,9 @@ fn filtered_samples(occ: &OccupancyTrack, p: &Params) -> Vec<FilteredSample> {
     let static_positions = static_furniture_positions(occ, p.occupancy_static_frac);
     let is_furniture = |b: &DetBox| {
         let (cx, cy) = b.center();
-        static_positions
-            .iter()
-            .any(|&(sx, sy)| (cx - sx).abs() <= p.occupancy_static_frac && (cy - sy).abs() <= p.occupancy_static_frac)
+        static_positions.iter().any(|&(sx, sy)| {
+            (cx - sx).abs() <= p.occupancy_static_frac && (cy - sy).abs() <= p.occupancy_static_frac
+        })
     };
 
     // 2. Plausibility cap from the median surviving-box area — one near-camera
@@ -1082,7 +1090,9 @@ fn static_furniture_positions(occ: &OccupancyTrack, frac: f64) -> Vec<(f64, f64)
     let persistence = (occ.samples.len() / 4).max(3);
     clusters
         .into_iter()
-        .filter(|c| c.count >= persistence && (c.maxx - c.minx) <= frac && (c.maxy - c.miny) <= frac)
+        .filter(|c| {
+            c.count >= persistence && (c.maxx - c.minx) <= frac && (c.maxy - c.miny) <= frac
+        })
         .map(|c| ((c.minx + c.maxx) / 2.0, (c.miny + c.maxy) / 2.0))
         .collect()
 }
@@ -1257,12 +1267,18 @@ mod tests {
 
         // Motion edges place the (strict, since v7) boundaries; inclusion bias now
         // lives in presentation padding — the default lead-in covers any late start.
-        assert!(rallies[0].start_ms <= 5000 + LEAD, "rally 0 start {rallies:?}");
+        assert!(
+            rallies[0].start_ms <= 5000 + LEAD,
+            "rally 0 start {rallies:?}"
+        );
         assert!(
             (13_000..=16_500).contains(&rallies[0].end_ms),
             "rally 0 end {rallies:?}"
         );
-        assert!(rallies[1].start_ms <= 22_000 + LEAD, "rally 1 start {rallies:?}");
+        assert!(
+            rallies[1].start_ms <= 22_000 + LEAD,
+            "rally 1 start {rallies:?}"
+        );
         assert!(
             (30_000..=33_500).contains(&rallies[1].end_ms),
             "rally 1 end {rallies:?}"
@@ -1527,7 +1543,11 @@ mod tests {
         let motion = synth_motion(20.0, &[]); // motion never fires
         let occ = synth_occupancy(20.0, |i, t| active_rally_sample(i, t, 4.0, 16.0));
         let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
-        assert_eq!(rallies.len(), 1, "occupancy should propose a rally: {rallies:?}");
+        assert_eq!(
+            rallies.len(),
+            1,
+            "occupancy should propose a rally: {rallies:?}"
+        );
         // Occupancy places the (unedged-by-motion) span roughly over [4,16). Any late
         // start / early end stays within the default presentation padding (#104).
         assert!(rallies[0].start_ms <= 4_000 + LEAD, "start {rallies:?}");
@@ -1621,10 +1641,7 @@ mod tests {
         let motion = synth_motion(20.0, &[]);
         let occ = synth_occupancy(20.0, |i, _t| {
             let drift = i as f64 * 0.005; // per-sample step ≪ occupancy_static_frac
-            vec![
-                dbox(0.3 + drift, 0.60, 0.02),
-                dbox(0.7 - drift, 0.65, 0.10),
-            ]
+            vec![dbox(0.3 + drift, 0.60, 0.02), dbox(0.7 - drift, 0.65, 0.10)]
         });
         let rallies = segment(&audio, SR, &motion, Some(&occ)).rallies;
         assert!(
@@ -1762,16 +1779,24 @@ mod tests {
                 k.size_structure && k.max_step.is_some_and(|d| d > p.occupancy_static_frac);
             assert_eq!(f.fired, recovered, "shipped {f:?} vs kinematics {k:?}");
         }
-        assert!(kin.iter().any(|k| k.size_structure), "fixture must exercise structure");
+        assert!(
+            kin.iter().any(|k| k.size_structure),
+            "fixture must exercise structure"
+        );
     }
 
     #[test]
     fn kinematics_report_the_step_magnitude() {
         // A lone box stepping exactly 0.1 in x each sample: max_step must report
         // that magnitude (no second box to confuse the nearest-match).
-        let occ = synth_occupancy(20.0, |i, _t| vec![dbox(0.2 + (i % 2) as f64 * 0.1, 0.5, 0.02)]);
+        let occ = synth_occupancy(20.0, |i, _t| {
+            vec![dbox(0.2 + (i % 2) as f64 * 0.1, 0.5, 0.02)]
+        });
         let kin = occupancy_kinematics(&occ, &Params::default());
-        assert_eq!(kin[0].max_step, None, "first sample has no previous centers");
+        assert_eq!(
+            kin[0].max_step, None,
+            "first sample has no previous centers"
+        );
         for k in &kin[1..] {
             let step = k.max_step.expect("box present in consecutive samples");
             assert!((step - 0.1).abs() < 1e-9, "{k:?}");
@@ -1838,7 +1863,10 @@ mod tests {
         let audio = synth_audio(20.0, &[(4.0, 16.0)], 0.6);
         let motion = synth_motion(20.0, &[(4.0, 16.0)]);
         let with_none = segment(&audio, SR, &motion, None).rallies;
-        let empty = OccupancyTrack { fps: DET_FPS, samples: vec![] };
+        let empty = OccupancyTrack {
+            fps: DET_FPS,
+            samples: vec![],
+        };
         let with_empty = segment(&audio, SR, &motion, Some(&empty)).rallies;
         assert_eq!(with_none.len(), 1, "motion still proposes: {with_none:?}");
         // An empty track is the same as no track — a failed detector changes nothing.

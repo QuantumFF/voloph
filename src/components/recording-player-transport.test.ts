@@ -623,7 +623,12 @@ describe("playIntervals (presentation padding, #104)", () => {
   it("clamps to the recording and merges rallies the padding makes overlap", async () => {
     const { playIntervals } = await import("./recording-player-transport")
     const got = playIntervals(
-      [r(1, 500, 3000), r(2, 8000, 9000), r(3, 11000, 12000), r(4, 19000, 19500)],
+      [
+        r(1, 500, 3000),
+        r(2, 8000, 9000),
+        r(3, 11000, 12000),
+        r(4, 19000, 19500),
+      ],
       pad,
       20000
     )
@@ -635,7 +640,10 @@ describe("playIntervals (presentation padding, #104)", () => {
   })
 
   it("leaves the stored edges alone with no padding", async () => {
-    const { playIntervals, NO_PADDING } = await import("./recording-player-transport")
-    expect(playIntervals([r(1, 5000, 6000)], NO_PADDING)).toEqual([r(1, 5000, 6000)])
+    const { playIntervals, NO_PADDING } =
+      await import("./recording-player-transport")
+    expect(playIntervals([r(1, 5000, 6000)], NO_PADDING)).toEqual([
+      r(1, 5000, 6000),
+    ])
   })
 })
