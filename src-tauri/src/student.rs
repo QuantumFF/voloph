@@ -114,6 +114,53 @@ pub struct Inputs<'a> {
     pub detect: &'a DetectionTrack,
 }
 
+/// The student's audio signal and the footage length, derived from the decoded audio
+/// exactly as `signals-dump` hands them to the training pipeline. The app's drafting
+/// and the `signals-dump` parity CLI both build [`Inputs`] from here, so the two
+/// cannot drift apart (ADR 0019).
+pub struct AudioSignals {
+    pub audio: crate::segment::AudioFrames,
+    /// Recording length from the decoded audio, rounded as the training pipeline
+    /// rounds it.
+    pub duration_ms: i64,
+}
+
+impl AudioSignals {
+    /// From the decoded audio at [`crate::media::SEGMENT_SAMPLE_RATE`].
+    pub fn of(samples: &[f32]) -> AudioSignals {
+        let audio = crate::segment::audio_frames(
+            samples,
+            crate::media::SEGMENT_SAMPLE_RATE,
+            &crate::segment::Params::default(),
+        );
+        // Duration as the training pipeline computed it (signals-dump).
+        let footage_s = samples.len() as f64 / f64::from(crate::media::SEGMENT_SAMPLE_RATE);
+        AudioSignals {
+            audio,
+            duration_ms: (footage_s * 1000.0).round() as i64,
+        }
+    }
+
+    /// The student's inputs: these audio signals beside the motion energy (sampled at
+    /// `motion_fps`) and the person detections.
+    pub fn inputs<'a>(
+        &'a self,
+        motion_fps: f64,
+        motion: &'a [f64],
+        detect: &'a DetectionTrack,
+    ) -> Inputs<'a> {
+        Inputs {
+            duration_ms: self.duration_ms,
+            motion_fps,
+            motion,
+            audio_frame_ms: self.audio.frame_ms,
+            audio_energy: &self.audio.energy,
+            audio_onset: &self.audio.onset,
+            detect,
+        }
+    }
+}
+
 /// Segment a recording with the student. Returns strict rally intervals with a
 /// per-rally confidence (0.5 = the model's threshold; amber below it in review).
 pub fn segment(model: &StudentModel, inp: &Inputs) -> Vec<Rally> {

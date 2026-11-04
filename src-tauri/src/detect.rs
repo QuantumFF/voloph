@@ -155,17 +155,9 @@ impl Detector {
     /// one. Errors only when the model itself cannot be loaded, never for a missing
     /// GPU.
     pub fn load(model_path: &std::path::Path) -> Result<Detector, String> {
-        crate::gpu::init_environment();
-        let session = Session::builder()
-            .map_err(|e| format!("ort session builder: {e}"))?
-            .with_execution_providers(crate::gpu::general_providers())
-            .map_err(|e| format!("ort execution providers: {e}"))?
-            // The recording's motion pass already saturates cores; cap inference
-            // threads so the two passes do not thrash the CPU against each other.
-            .with_intra_threads(4)
-            .map_err(|e| format!("ort intra threads: {e}"))?
-            .commit_from_file(model_path)
-            .map_err(|e| format!("ort could not load {}: {e}", model_path.display()))?;
+        // The recording's motion pass already saturates cores; cap inference threads
+        // so the two passes do not thrash the CPU against each other.
+        let session = crate::gpu::build_session(model_path, crate::gpu::general_providers(), 4)?;
 
         // YOLOX-Nano has a single input; take its name so we feed it by name rather
         // than hardcoding "images"/"input" (which differs across exports).
@@ -407,48 +399,10 @@ impl Letterbox {
     }
 }
 
-/// Resolve the vendored YOLOX-Nano detector model. See [`vendored_model_file`].
+/// Resolve the vendored YOLOX-Nano detector model. See
+/// [`crate::gpu::vendored_model_file`].
 pub fn vendored_model_path() -> Result<PathBuf, String> {
-    vendored_model_file("yolox_nano.onnx", "detector")
-}
-
-/// Resolve a vendored ONNX model file by name. Tauri copies `bundle.resources` into a
-/// `resources/` folder beside the app executable in a release build, and the same
-/// layout is used in `tauri dev`; the dev CLIs run from `target/<profile>/` where the
-/// model is likewise expected at `resources/models/…` or `models/…`. We probe the
-/// candidate layouts in order and return the first that exists, so both dev and release
-/// resolve without a code change. `label` names the model in the not-found error, which
-/// lists every tried path. Shared by the detector and the pose pass
-/// ([`crate::pose::vendored_pose_model_path`]).
-pub(crate) fn vendored_model_file(model_file: &str, label: &str) -> Result<PathBuf, String> {
-    let mut tried: Vec<PathBuf> = Vec::new();
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|p| p.to_path_buf()));
-    if let Some(dir) = &exe_dir {
-        // Release/dev bundle layout: resources next to the executable.
-        tried.push(dir.join("resources").join("models").join(model_file));
-        tried.push(dir.join("models").join(model_file));
-    }
-    // Source-tree layout: running the dev CLI from the crate root / target dir.
-    tried.push(PathBuf::from("models").join(model_file));
-    tried.push(PathBuf::from("src-tauri").join("models").join(model_file));
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        tried.push(PathBuf::from(manifest).join("models").join(model_file));
-    }
-    for p in &tried {
-        if p.exists() {
-            return Ok(p.clone());
-        }
-    }
-    Err(format!(
-        "vendored {label} model not found; looked in: {}",
-        tried
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
+    crate::gpu::vendored_model_file("yolox_nano.onnx", "detector")
 }
 
 /// Probe a recording's source frame dimensions with the ffprobe sidecar, so the

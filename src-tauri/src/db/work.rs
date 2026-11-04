@@ -5,6 +5,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
+use super::draft::{clear_draft, write_draft, DraftStamp};
 use super::{
     absolute, active_kind, is_hand_touched, library_path_of, pending_bundle_paths, stored_key,
 };
@@ -177,19 +178,17 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
     let Some((kind, key)) = stored_key(conn, path)? else {
         return Ok(());
     };
-    conn.execute(
-        "DELETE FROM rallies WHERE recording_id =
-            (SELECT id FROM recordings WHERE library = ?1 AND path = ?2)",
-        rusqlite::params![&kind, &key],
-    )?;
-    conn.execute(
-        "UPDATE recordings
-         SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
-             segmenter_version = NULL, segmenter_id = NULL
-         WHERE library = ?1 AND path = ?2",
-        rusqlite::params![&kind, &key],
-    )?;
-    Ok(())
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM recordings WHERE library = ?1 AND path = ?2",
+            rusqlite::params![&kind, &key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id {
+        Some(id) => clear_draft(conn, id),
+        None => Ok(()),
+    }
 }
 
 /// Reset every recording's draft timeline in the **active** library so the media
@@ -199,18 +198,16 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
 /// manual corrections (ADR 0002).
 pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
     let kind = active_kind(conn)?;
-    conn.execute(
-        "DELETE FROM rallies WHERE recording_id IN
-            (SELECT id FROM recordings WHERE library = ?1)",
-        [&kind],
-    )?;
-    conn.execute(
-        "UPDATE recordings
-         SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
-             segmenter_version = NULL, segmenter_id = NULL
-         WHERE library = ?1",
-        [&kind],
-    )?;
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM recordings WHERE library = ?1")?;
+        let ids = stmt
+            .query_map([&kind], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids
+    };
+    for id in ids {
+        clear_draft(conn, id)?;
+    }
     Ok(())
 }
 
@@ -260,8 +257,8 @@ pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite:
                 s
             }
         };
-        let made_by = seg_id.as_deref().unwrap_or("v6");
-        if made_by != active.id() || version < i64::from(active.version()) {
+        // The query admits only stamped rows, so every row has a stamp.
+        if DraftStamp::from_row(seg_id, Some(version)).is_some_and(|s| !s.is_current_for(active)) {
             stale.push(id);
         }
     }
@@ -270,14 +267,7 @@ pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite:
         if is_hand_touched(tx, id)? {
             continue;
         }
-        tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
-        tx.execute(
-            "UPDATE recordings
-             SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
-                 segmenter_version = NULL, segmenter_id = NULL
-             WHERE id = ?1",
-            [id],
-        )?;
+        clear_draft(tx, id)?;
     }
     Ok(())
 }
@@ -331,41 +321,17 @@ pub fn save_rallies(
     waveform: &[f32],
     segmenter: crate::segment::Segmenter,
 ) -> rusqlite::Result<()> {
-    let waveform_json = super::waveform_to_json(waveform);
     let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM rallies WHERE recording_id = ?1",
-        [recording_id],
-    )?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for r in rallies {
-            stmt.execute(rusqlite::params![
-                recording_id,
-                r.start_ms,
-                r.end_ms,
-                r.confidence
-            ])?;
-        }
-    }
-    // Stamp the producing segmenter and its version onto the draft (ADR 0013/0015/
-    // 0019) so a later bump — or a switch of the library's segmenter — can tell this
-    // draft is stale. Re-analyze and silent re-analysis both flow through here.
-    tx.execute(
-        "UPDATE recordings
-         SET segment_state = 'ready', duration_ms = ?1, waveform = ?2, segmenter_version = ?3,
-             segmenter_id = ?4
-         WHERE id = ?5",
-        rusqlite::params![
-            duration_ms,
-            waveform_json,
-            segmenter.version(),
-            segmenter.id(),
-            recording_id
-        ],
+    // Stamped with the segmenter that drew it (ADR 0013/0015/0019) so a later bump —
+    // or a switch of the library's segmenter — can tell this draft is stale.
+    // Re-analyze and silent re-analysis both flow through here.
+    write_draft(
+        &tx,
+        recording_id,
+        &DraftStamp::of(segmenter),
+        Some(duration_ms),
+        waveform,
+        rallies.iter().map(|r| (r.start_ms, r.end_ms, r.confidence)),
     )?;
     tx.commit()
 }

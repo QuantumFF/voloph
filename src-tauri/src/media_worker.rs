@@ -8,13 +8,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::{db, detect, media, segment, staging};
+use crate::{db, draft, media, segment, staging};
 
 /// Tauri event carrying how far a recording's background analysis has progressed
 /// (issue #81, spec #75 user story #13), so the session list can show a
@@ -207,26 +207,16 @@ fn probe_recording(conn: &Mutex<Connection>, id: i64, path: &str) -> &'static st
     state
 }
 
-/// Extract the recording's audio, motion and person-detection tracks and run its
-/// library's segmenter (ADR 0019: the learned student, or the v6 heuristic of ADR
-/// 0006), persisting the draft timeline stamped with the segmenter that made it. The
-/// slow extraction + segmentation happen unlocked; only the segmenter lookup, the
-/// final persist (and the failure mark) take the lock.
+/// Draft the recording's timeline with its library's segmenter (ADR 0019; see
+/// [`draft::draft`]) and persist it stamped with the segmenter that drew it. The slow
+/// drafting happens unlocked; only the segmenter lookup, the final persist (and the
+/// failure mark) take the lock.
 fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &str) {
     // The recording's total duration paces the remaining-time estimate (issue
     // #81): each progress tick reports footage decoded so far out of this total.
     // A missing duration is non-fatal — the estimate just does not show.
     let total_ms = media::probe_duration_ms(path);
-
-    let samples = match media::extract_pcm(path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("media worker: audio extraction failed for {path}: {e}");
-            set_segment_state(conn, id, "failed", path);
-            return;
-        }
-    };
-    let mut chosen = match conn.lock() {
+    let chosen = match conn.lock() {
         Ok(c) => db::recording_segmenter(&c, id).unwrap_or_else(|e| {
             log::error!("media worker: could not read the segmenter for {path}: {e}");
             segment::DEFAULT_SEGMENTER
@@ -236,107 +226,38 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
             segment::DEFAULT_SEGMENTER
         }
     };
-    if chosen == segment::Segmenter::Teacher {
-        // The teacher reads neither motion nor the detection track (it runs its own
-        // shuttle and pose passes), so they are extracted only if it fails. Its
-        // progress covers both of its passes on one footage scale.
-        let started = Instant::now();
-        let mut last_emit = Instant::now();
-        match crate::teacher::segment_recording(path, |processed_ms| {
-            if last_emit.elapsed().as_millis() >= 500 {
-                last_emit = Instant::now();
-                emit_progress(app, id, processed_ms, total_ms, &started);
-            }
-        }) {
-            Ok(rallies) => {
-                return finish_segmentation(
-                    app,
-                    conn,
-                    id,
-                    path,
-                    &samples,
-                    rallies,
-                    segment::Segmenter::Teacher,
-                    &started,
-                );
-            }
-            Err(e) => {
-                log::warn!("media worker: teacher failed for {path}, using the student: {e}");
-                chosen = segment::Segmenter::Student;
-            }
-        }
-    }
-    // Motion extraction is the long pole of analysis; report footage decoded as
-    // frames stream in, throttled to avoid flooding the frontend with events. The
-    // wall clock starts here, at the phase the ticks measure, so the frontend's
-    // speed = processed ÷ elapsed is a clean ratio rather than one skewed by the
-    // (untracked) audio-extraction time that ran first.
-    let started = Instant::now();
-    let mut last_emit = Instant::now();
-    let motion = match media::extract_motion(path, |processed_ms| {
-        if last_emit.elapsed().as_millis() >= 500 {
-            last_emit = Instant::now();
-            emit_progress(app, id, processed_ms, total_ms, &started);
-        }
-    }) {
-        Ok(energy) => segment::MotionTrack {
-            fps: f64::from(media::MOTION_FPS),
-            energy,
-        },
+    let mut ticks = AnalysisTicks::new(app, id, total_ms);
+    let draft = match draft::draft(path, chosen, &mut ticks) {
+        Ok(d) => d,
         Err(e) => {
-            log::warn!("media worker: motion extraction failed for {path}: {e}");
+            log::warn!("media worker: {e} for {path}");
             set_segment_state(conn, id, "failed", path);
             return;
         }
     };
-    // Occupancy detection extraction (ADR 0015 Stage 2, issue #84): compute the
-    // per-recording person-detection track alongside motion so occupancy can *propose*
-    // candidate play spans in fusion below. Load the nano detector (GPU probed, silent
-    // CPU fallback), run it over the recording, and hand the pure track to the seam.
-    //
-    // Degradation (the zero-miss bar, ADR 0015): any failure — model missing, ort init,
-    // ffmpeg, inference — is logged and swallowed, yielding `None`. The seam then falls
-    // back to motion-proposes (pre-#84 behavior); a failed detector must never turn into
-    // deleted play, so analysis still completes with a full draft timeline.
-    let detections = extract_detections(path);
-    let (rallies, segmenter) = run_segmenter(chosen, &samples, &motion, detections.as_ref(), path);
-    finish_segmentation(app, conn, id, path, &samples, rallies, segmenter, &started);
-}
-
-/// Persist a finished draft (shared tail of every segmenter path): waveform, duration,
-/// the final progress tick, then save + publish under the lock.
-#[allow(clippy::too_many_arguments)]
-fn finish_segmentation(
-    app: &AppHandle,
-    conn: &Mutex<Connection>,
-    id: i64,
-    path: &str,
-    samples: &[f32],
-    rallies: Vec<segment::Rally>,
-    segmenter: segment::Segmenter,
-    started: &Instant,
-) {
-    // The displayed waveform for the timeline strip (issue #6), reduced from the
-    // same samples while we still hold them in memory.
-    let waveform = segment::waveform(samples);
-    let duration_ms = (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
     // Final tick: the pass is done, so processed == total. The waveform-derived
     // duration is the authoritative length, so report it as both (the container
     // probe can be slightly off). The UI clears the estimate once the row flips
     // to `ready` on its next poll; this just avoids a stale mid-pass number.
-    emit_progress(app, id, duration_ms, Some(duration_ms), started);
+    ticks.emit(draft.duration_ms, Some(draft.duration_ms));
     log::info!(
-        "media worker: segmented {path} into {} rallies ({duration_ms} ms, {} v{})",
-        rallies.len(),
-        segmenter.id(),
-        segmenter.version()
+        "media worker: segmented {path} into {} rallies ({} ms, {} v{})",
+        draft.rallies.len(),
+        draft.duration_ms,
+        draft.made_by.id(),
+        draft.made_by.version()
     );
 
     match conn.lock() {
         Ok(mut c) => {
-            if let Err(e) =
-                db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform, segmenter)
-            {
+            if let Err(e) = db::save_rallies(
+                &mut c,
+                id,
+                draft.duration_ms,
+                &draft.rallies,
+                &draft.waveform,
+                draft.made_by,
+            ) {
                 log::error!("media worker: could not save timeline for {path}: {e}");
             } else {
                 // Publish the pristine machine Analysis for adoption by other users
@@ -347,103 +268,6 @@ fn finish_segmentation(
         }
         Err(e) => log::error!("media worker: db lock poisoned saving {path}: {e}"),
     }
-}
-
-/// Run the chosen segmenter (ADR 0019) and say which one actually drew the draft.
-///
-/// The student needs the person detections (with scores) and its bundled model; if
-/// either is missing it falls back to v6, which degrades to motion-proposes without
-/// occupancy (ADR 0015) — so a failed detector never costs the recording its draft.
-/// The fallback draft is stamped v6, so the next scan offers it to the student again.
-fn run_segmenter(
-    chosen: segment::Segmenter,
-    samples: &[f32],
-    motion: &segment::MotionTrack,
-    detections: Option<&detect::DetectionTrack>,
-    path: &str,
-) -> (Vec<segment::Rally>, segment::Segmenter) {
-    if chosen == segment::Segmenter::Student {
-        match (crate::student::StudentModel::bundled(), detections) {
-            (Ok(model), Some(detect)) => {
-                let started = Instant::now();
-                let audio = segment::audio_frames(
-                    samples,
-                    media::SEGMENT_SAMPLE_RATE,
-                    &segment::Params::default(),
-                );
-                // Duration as the training pipeline computed it (signals-dump).
-                let footage_s = samples.len() as f64 / f64::from(media::SEGMENT_SAMPLE_RATE);
-                let rallies = crate::student::segment(
-                    model,
-                    &crate::student::Inputs {
-                        duration_ms: (footage_s * 1000.0).round() as i64,
-                        motion_fps: motion.fps,
-                        motion: &motion.energy,
-                        audio_frame_ms: audio.frame_ms,
-                        audio_energy: &audio.energy,
-                        audio_onset: &audio.onset,
-                        detect,
-                    },
-                );
-                log::info!(
-                    "media worker: student segmented {path} in {} ms",
-                    started.elapsed().as_millis()
-                );
-                return (rallies, segment::Segmenter::Student);
-            }
-            (Err(e), _) => {
-                log::warn!("media worker: student model unavailable, using v6 for {path}: {e}")
-            }
-            (_, None) => log::warn!(
-                "media worker: no person detections for {path}; the student needs them, using v6"
-            ),
-        }
-    }
-    let occupancy = detections.map(detect::DetectionTrack::to_occupancy_track);
-    let segmentation = segment::segment(
-        samples,
-        media::SEGMENT_SAMPLE_RATE,
-        motion,
-        occupancy.as_ref(),
-    );
-    // Per-span gate verdicts (ADR 0015 Stage 0): one line per candidate span the
-    // segmenter weighed, so running a bad recording shows which gate ate a rally.
-    // Diagnostic only — the draft is unaffected.
-    for v in &segmentation.verdicts {
-        log::info!(
-            "media worker: gate verdict {} for span {}-{} ms of {path}",
-            v.verdict.label(),
-            v.start_ms,
-            v.end_ms
-        );
-    }
-    (segmentation.rallies, segment::Segmenter::V6)
-}
-
-/// Compute the person-detection track for a recording (ADR 0015 Stage 2, issue #84):
-/// v6 turns it into its occupancy track, the student reads it with scores. Loads the
-/// vendored nano detector (probing a GPU, falling back to CPU silently), runs it over
-/// the recording, and logs a one-line summary of what it saw.
-///
-/// Returns `None` on **every** failure path — the shared degradation policy in
-/// [`detect::detections_or_none`]: v6 falls back to motion-proposes when occupancy is
-/// `None`, so a detector that cannot load or run costs precision, never a rally
-/// (ADR 0015).
-fn extract_detections(path: &str) -> Option<detect::DetectionTrack> {
-    let started = Instant::now();
-    let track = detect::detections_or_none(path, |why| {
-        log::warn!("media worker: occupancy disabled for {path}: {why}");
-    })?;
-    let total: usize = track.samples.iter().map(Vec::len).sum();
-    let peak = track.samples.iter().map(Vec::len).max().unwrap_or(0);
-    log::info!(
-        "media worker: occupancy track for {path} — {} samples @ {} fps, \
-         {total} person boxes, peak {peak} simultaneous ({} ms)",
-        track.samples.len(),
-        track.fps,
-        started.elapsed().as_millis(),
-    );
-    Some(track)
 }
 
 /// Read a recording's embedded capture date with ffprobe and re-home its session
@@ -462,25 +286,79 @@ fn refine_recording_date(conn: &Mutex<Connection>, id: i64, path: &str) {
     }
 }
 
-/// Push one [`EVENT_ANALYSIS_PROGRESS`] tick to the frontend (issue #81). Fire-
-/// and-forget: a dropped tick only means one skipped UI update, and the next
-/// tick (or the row flipping to `ready`) corrects it.
-fn emit_progress(
-    app: &AppHandle,
+/// A draft's progress as [`EVENT_ANALYSIS_PROGRESS`] ticks for one recording (issue
+/// #81), throttled so a pass decoding thousands of frames does not flood the
+/// frontend. Fire-and-forget: a dropped tick only means one skipped UI update, and
+/// the next tick (or the row flipping to `ready`) corrects it.
+struct AnalysisTicks<'a> {
+    app: &'a AppHandle,
     recording_id: i64,
-    processed_ms: i64,
     total_ms: Option<i64>,
-    started: &Instant,
-) {
-    let _ = app.emit(
-        EVENT_ANALYSIS_PROGRESS,
-        AnalysisProgress {
+    /// When the current pass started: ticks report elapsed time from here.
+    started: Instant,
+    throttle: Throttle,
+}
+
+impl<'a> AnalysisTicks<'a> {
+    fn new(app: &'a AppHandle, recording_id: i64, total_ms: Option<i64>) -> AnalysisTicks<'a> {
+        let now = Instant::now();
+        AnalysisTicks {
+            app,
             recording_id,
-            processed_ms,
             total_ms,
-            elapsed_ms: started.elapsed().as_millis() as i64,
-        },
-    );
+            started: now,
+            throttle: Throttle::new(now),
+        }
+    }
+
+    /// Push one tick now, unthrottled.
+    fn emit(&self, processed_ms: i64, total_ms: Option<i64>) {
+        let _ = self.app.emit(
+            EVENT_ANALYSIS_PROGRESS,
+            AnalysisProgress {
+                recording_id: self.recording_id,
+                processed_ms,
+                total_ms,
+                elapsed_ms: self.started.elapsed().as_millis() as i64,
+            },
+        );
+    }
+}
+
+impl draft::Progress for AnalysisTicks<'_> {
+    fn pass_started(&mut self) {
+        let now = Instant::now();
+        self.started = now;
+        self.throttle = Throttle::new(now);
+    }
+
+    fn processed(&mut self, footage_ms: i64) {
+        if self.throttle.admit(Instant::now()) {
+            self.emit(footage_ms, self.total_ms);
+        }
+    }
+}
+
+/// Lets one event through per [`Throttle::EVERY`], counted from the last one let
+/// through (or from the start).
+struct Throttle {
+    last: Instant,
+}
+
+impl Throttle {
+    const EVERY: Duration = Duration::from_millis(500);
+
+    fn new(now: Instant) -> Throttle {
+        Throttle { last: now }
+    }
+
+    fn admit(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last) < Self::EVERY {
+            return false;
+        }
+        self.last = now;
+        true
+    }
 }
 
 /// Update a recording's segmentation state under a brief lock, logging on failure.
@@ -489,5 +367,26 @@ fn set_segment_state(conn: &Mutex<Connection>, id: i64, state: &str, path: &str)
         if let Err(e) = db::set_segment_state(&c, id, state) {
             log::error!("media worker: could not update segment state for {path}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_throttle_lets_one_event_through_per_half_second() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut throttle = Throttle::new(t0);
+        let admitted: Vec<u64> = [0, 100, 499, 500, 501, 999, 1000, 1700, 1800, 2200]
+            .into_iter()
+            .filter(|&ms| throttle.admit(at(ms)))
+            .collect();
+        assert_eq!(admitted, [500, 1000, 1700, 2200]);
+        // Sub-millisecond: 499.9 ms is still inside the window.
+        let mut throttle = Throttle::new(t0);
+        assert!(!throttle.admit(t0 + Duration::from_micros(499_900)));
+        assert!(throttle.admit(t0 + Duration::from_micros(500_000)));
     }
 }

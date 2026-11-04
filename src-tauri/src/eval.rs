@@ -339,11 +339,8 @@ pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
     let out = out.ok_or("--out is required")?;
     let started = std::time::Instant::now();
     let samples = media::extract_pcm(&file)?;
-    let audio = segment::audio_frames(
-        &samples,
-        media::SEGMENT_SAMPLE_RATE,
-        &segment::Params::default(),
-    );
+    // The student's audio inputs as the app's drafting builds them (ADR 0019 parity).
+    let signals = crate::student::AudioSignals::of(&samples);
     let t_audio = started.elapsed().as_secs_f64();
     let motion = media::extract_motion(&file, |_| {})?;
     let t_motion = started.elapsed().as_secs_f64() - t_audio;
@@ -356,22 +353,14 @@ pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
         let t0 = std::time::Instant::now();
         let rallies = crate::student::segment(
             model,
-            &crate::student::Inputs {
-                duration_ms: (footage * 1000.0).round() as i64,
-                motion_fps: f64::from(media::MOTION_FPS),
-                motion: &motion,
-                audio_frame_ms: audio.frame_ms,
-                audio_energy: &audio.energy,
-                audio_onset: &audio.onset,
-                detect: &detect,
-            },
+            &signals.inputs(f64::from(media::MOTION_FPS), &motion, &detect),
         );
         write_timeline_json(path, &rallies, "student_ms", t0)?;
     }
     let doc = serde_json::json!({
-        "duration_ms": (footage * 1000.0).round() as i64,
+        "duration_ms": signals.duration_ms,
         "motion": {"fps": media::MOTION_FPS, "energy": motion},
-        "audio": audio,
+        "audio": signals.audio,
         "detect": detect,
         "timing_s": {"audio": t_audio, "motion": t_motion, "detect": t_detect},
     });

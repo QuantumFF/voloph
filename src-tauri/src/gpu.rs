@@ -10,23 +10,91 @@
 //! checked — see `tracknet::ShuttleTracker::load`'s self-check. Windows keeps DirectML
 //! for every model.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Once;
 
 use ort::execution_providers::ExecutionProviderDispatch;
+use ort::session::builder::SessionBuilder;
+use ort::session::Session;
 
-/// Create the process-wide ONNX Runtime environment, once, before any session. A GPU
-/// provider registered on a session builder *before* the environment exists cannot
-/// reach ONNX Runtime's default logger, and WebGPU then fails to register — silently,
-/// leaving that session on CPU (`ort` creates the environment lazily, after the first
-/// builder's providers). Every session builder calls this first.
-pub(crate) fn init_environment() {
+/// A session builder, after the process-wide ONNX Runtime environment exists — the
+/// only way the app gets one. A GPU provider registered on a builder *before* the
+/// environment exists cannot reach ONNX Runtime's default logger, and WebGPU then
+/// fails to register — silently, leaving that session on CPU (`ort` creates the
+/// environment lazily, after the first builder's providers).
+pub(crate) fn session_builder() -> ort::Result<SessionBuilder> {
+    init_environment();
+    Session::builder()
+}
+
+/// Load `model` into a session on `providers`, most-preferred first (`ort` skips any
+/// that cannot register and falls back to CPU; none = CPU), with `intra_threads`
+/// inference threads. Errors only when the model itself cannot be loaded, never for
+/// a missing GPU.
+pub(crate) fn build_session(
+    model: &Path,
+    providers: Vec<ExecutionProviderDispatch>,
+    intra_threads: usize,
+) -> Result<Session, String> {
+    session_builder()
+        .map_err(|e| format!("ort session builder: {e}"))?
+        .with_execution_providers(providers)
+        .map_err(|e| format!("ort execution providers: {e}"))?
+        .with_intra_threads(intra_threads)
+        .map_err(|e| format!("ort intra threads: {e}"))?
+        .commit_from_file(model)
+        .map_err(|e| format!("ort could not load {}: {e}", model.display()))
+}
+
+/// Create the process-wide ONNX Runtime environment, once, before any session (see
+/// [`session_builder`]).
+fn init_environment() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         if let Err(e) = ort::init().with_name("voloph").commit() {
             log::warn!("onnx runtime: environment init failed: {e}");
         }
     });
+}
+
+/// Resolve a vendored ONNX model file by name. Tauri copies `bundle.resources` into a
+/// `resources/` folder beside the app executable in a release build, and the same
+/// layout is used in `tauri dev`; the dev CLIs run from `target/<profile>/` where the
+/// model is likewise expected at `resources/models/…` or `models/…`. We probe the
+/// candidate layouts in order and return the first that exists, so both dev and release
+/// resolve without a code change. `label` names the model in the not-found error, which
+/// lists every tried path. Shared by the detector, the pose pass and the
+/// shuttle tracker.
+pub(crate) fn vendored_model_file(model_file: &str, label: &str) -> Result<PathBuf, String> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    if let Some(dir) = &exe_dir {
+        // Release/dev bundle layout: resources next to the executable.
+        tried.push(dir.join("resources").join("models").join(model_file));
+        tried.push(dir.join("models").join(model_file));
+    }
+    // Source-tree layout: running the dev CLI from the crate root / target dir.
+    tried.push(PathBuf::from("models").join(model_file));
+    tried.push(PathBuf::from("src-tauri").join("models").join(model_file));
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        tried.push(PathBuf::from(manifest).join("models").join(model_file));
+    }
+    for p in &tried {
+        if p.exists() {
+            return Ok(p.clone());
+        }
+    }
+    Err(format!(
+        "vendored {label} model not found; looked in: {}",
+        tried
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// GPU providers for the person detector and the pose model, most-preferred first;

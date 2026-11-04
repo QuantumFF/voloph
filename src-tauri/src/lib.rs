@@ -3,6 +3,7 @@ mod db;
 /// detector behind the sidecar. Public so the `detect-dump` dev CLI can drive it.
 /// Feeds nothing yet — fusion is issue #84.
 pub mod detect;
+mod draft;
 /// The eval harness (ADR 0015): a dev CLI that referees the segmenter against
 /// hand-corrected timelines. Public so the `eval-harness` bin can drive it.
 pub mod eval;
