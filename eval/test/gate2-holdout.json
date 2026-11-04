@@ -1,0 +1,25 @@
+{
+ "about": "Gate v2 test set (issue #100, approved 2026-11-04): never used in training or development. Models under test exclude every audit moment in these recordings; each is verified into gold from the frozen v3 draft (eval/test/gate2/v3; the user chose this over v6 drafts on 2026-11-04, verifying strictly), and the frozen model is scored once.",
+ "recordings": [
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0"
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b"
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca"
+  }
+ ],
+ "dropped": {
+  "recording": "PXL_20260615_071725666.TS-006.mp4",
+  "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+  "why": "Owner's call on 2026-11-04 to save verification time, made before any test score was computed. It stays out of v3's training (v3 was trained with it held out); it is no longer scored."
+ }
+}

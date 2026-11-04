@@ -17,23 +17,27 @@
 //! open the DB, gather the gold corpus, re-run the segmenter, feed the pure core,
 //! print. Re-running as new footage arrives is a single command.
 //!
-//! **Gold vs. machine draft are separable artifacts** (ADR 0015). Gold is the
-//! recording's *current* DB timeline, kept only when it shows hand-correction — the
-//! confidence sentinel [`crate::db::CORRECTED_CONFIDENCE`] an inline edit stamps on a
-//! rally. A recording with no such rally is **skipped and reported**, never scored
-//! against unverified gold. The machine draft is produced fresh by re-running the
-//! segmenter here, so rebuilding with a changed segmenter and re-running the harness
-//! re-measures it — the eval gate of Stages 1–2. (Reading the machine draft from the
-//! published Analysis instead would only ever measure the version frozen there before
-//! the human corrected it; a gold recording's Analysis never regenerates.)
+//! **Gold vs. machine draft are separable artifacts** (ADR 0015). Gold is a **gold
+//! file** ([`gold`]) — a recording's timeline exported with `--export-gold` once a
+//! human has verified the whole recording, matched back to the recording by content
+//! identity (size + quick hash), never by path. A recording with no gold file is
+//! **skipped and reported**, never scored. (Gold used to be the live DB timeline
+//! flagged by the confidence sentinel, but machine drafts hit that sentinel too and
+//! the DB proved disposable — see [`gold`].) The machine draft is produced fresh by
+//! re-running the segmenter here, so rebuilding with a changed segmenter and
+//! re-running the harness re-measures it — the eval gate of Stages 1–2. (Reading the
+//! machine draft from the published Analysis instead would only ever measure the
+//! version frozen there before the human corrected it.)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use crate::db::{self, CORRECTED_CONFIDENCE};
+use crate::db;
 use crate::media;
 use crate::segment;
+
+pub mod gold;
 
 // ── Pure scoring core ────────────────────────────────────────────────────────
 //
@@ -220,10 +224,66 @@ struct CorpusRecording {
     rel_path: String,
     duration_ms: Option<i64>,
     segment_state: String,
+    /// The verified timeline from this recording's gold file (empty when it has none).
     gold: Vec<Interval>,
-    /// Whether the timeline shows hand-correction — the confidence sentinel on at
-    /// least one rally. Only these are scored; the rest are reported as skipped.
-    hand_corrected: bool,
+    /// Whether a gold file matched this recording. Only these are scored; the rest
+    /// are reported as skipped.
+    has_gold: bool,
+}
+
+/// The `signals-dump` dev CLI (issue #105): the three cheap signals v6 already computes —
+/// motion energy, audio energy + hit onsets, and the person-detector boxes — for one
+/// whole recording, through the app's own extractors, as JSON. The student segmenter is
+/// trained on exactly these, so in the app it costs what v6 costs.
+///
+/// Usage: `signals-dump --file PATH --out FILE.json`
+pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
+    let (mut file, mut out) = (None, None);
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--file" => file = Some(it.next().ok_or("--file needs a path")?),
+            "--out" => out = Some(it.next().ok_or("--out needs a path")?),
+            "-h" | "--help" => {
+                println!("signals-dump --file PATH --out FILE.json");
+                return Ok(());
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let file = file.ok_or("--file is required")?;
+    let out = out.ok_or("--out is required")?;
+    let started = std::time::Instant::now();
+    let samples = media::extract_pcm(&file)?;
+    let audio = segment::audio_frames(
+        &samples,
+        media::SEGMENT_SAMPLE_RATE,
+        &segment::Params::default(),
+    );
+    let t_audio = started.elapsed().as_secs_f64();
+    let motion = media::extract_motion(&file, |_| {})?;
+    let t_motion = started.elapsed().as_secs_f64() - t_audio;
+    let detect = crate::detect::detections_or_none(&file, |e| eprintln!("detector: {e}"))
+        .ok_or("person detection failed")?;
+    let t_detect = started.elapsed().as_secs_f64() - t_audio - t_motion;
+    let footage = samples.len() as f64 / f64::from(media::SEGMENT_SAMPLE_RATE);
+    let doc = serde_json::json!({
+        "duration_ms": (footage * 1000.0).round() as i64,
+        "motion": {"fps": media::MOTION_FPS, "energy": motion},
+        "audio": audio,
+        "detect": detect,
+        "timing_s": {"audio": t_audio, "motion": t_motion, "detect": t_detect},
+    });
+    let tmp = format!("{out}.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
+        .and_then(|()| std::fs::rename(&tmp, &out))
+        .map_err(|e| format!("{out}: {e}"))?;
+    println!(
+        "{footage:.0} s footage: audio {t_audio:.0} s, motion {t_motion:.0} s, detect {t_detect:.0} s \
+         = {:.1}x real-time -> {out}",
+        footage / started.elapsed().as_secs_f64().max(1e-9)
+    );
+    Ok(())
 }
 
 /// Run the eval harness. `args` is the process arguments **after** the program name.
@@ -257,6 +317,14 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
 
+    if let Some(out) = &opts.dump_draft {
+        let root = opts
+            .root
+            .as_deref()
+            .ok_or("--dump-draft needs --root DIR (the videos to segment)")?;
+        return dump_drafts(Path::new(root), Path::new(out), opts.filter.as_deref());
+    }
+
     let db_path = match opts.db {
         Some(p) => PathBuf::from(p),
         None => default_db_path()?,
@@ -267,7 +335,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             db_path.display()
         ));
     }
-    let conn =
+    let mut conn =
         db::open(&db_path).map_err(|e| format!("could not open {}: {e}", db_path.display()))?;
 
     let kind = match opts.library {
@@ -283,7 +351,24 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             )
         })?;
 
-    let mut recordings = gather_corpus(&conn, &kind, &library).map_err(|e| e.to_string())?;
+    let gold_dir = opts
+        .gold
+        .map(PathBuf::from)
+        .unwrap_or_else(default_gold_dir);
+    if opts.export_gold {
+        let filter = opts.filter.as_deref().ok_or(
+            "--export-gold needs a RECORDING filter (exports are per recording, on purpose)",
+        )?;
+        return export_gold(&conn, &kind, filter, &gold_dir, opts.allow_unconfirmed);
+    }
+    if let Some(dir) = &opts.import_draft {
+        let filter = opts.filter.as_deref().ok_or(
+            "--import-draft needs a RECORDING filter (imports are per recording, on purpose)",
+        )?;
+        return import_draft(&mut conn, &kind, filter, Path::new(dir));
+    }
+
+    let mut recordings = gather_corpus(&conn, &kind, &library, &gold_dir)?;
     if let Some(filter) = &opts.filter {
         recordings.retain(|r| r.abs_path.contains(filter) || r.rel_path.contains(filter));
         if recordings.is_empty() {
@@ -294,9 +379,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     }
 
     println!(
-        "eval harness — segmenter v{} against '{kind}' library ({})\n",
+        "eval harness — segmenter v{} against '{kind}' library ({})\ngold: {}\n",
         segment::SEGMENTER_VERSION,
-        library
+        library,
+        gold_dir.display()
     );
     if opts.sweep {
         sweep_and_report(&recordings);
@@ -326,57 +412,356 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Read every recording in the `kind` library, resolve its absolute path, and load
-/// its gold timeline (the current DB rallies) together with whether that timeline
-/// shows hand-correction (the confidence sentinel).
+/// Read every recording in the `kind` library, resolve its absolute path, and attach
+/// its gold timeline from the matching gold file in `gold_dir` (matched by file size
+/// + quick hash). The DB's own rallies are never read as gold.
 fn gather_corpus(
     conn: &Connection,
     kind: &str,
     library: &str,
-) -> rusqlite::Result<Vec<CorpusRecording>> {
-    let rows: Vec<(i64, String, Option<i64>, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, path, duration_ms, segment_state FROM recordings
-             WHERE library = ?1 ORDER BY path",
-        )?;
-        let rows = stmt
-            .query_map([kind], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-
-    let mut out = Vec::with_capacity(rows.len());
-    for (id, rel_path, duration_ms, segment_state) in rows {
-        let mut stmt = conn.prepare(
-            "SELECT start_ms, end_ms, confidence FROM rallies
-             WHERE recording_id = ?1 ORDER BY start_ms",
-        )?;
-        let mut gold = Vec::new();
-        let mut hand_corrected = false;
-        let mapped = stmt.query_map([id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, f64>(2)?,
-            ))
-        })?;
-        for row in mapped {
-            let (start_ms, end_ms, confidence) = row?;
-            if confidence >= CORRECTED_CONFIDENCE {
-                hand_corrected = true;
+    gold_dir: &Path,
+) -> Result<Vec<CorpusRecording>, String> {
+    let gold_files = gold::load_dir(gold_dir)?;
+    let rows = library_recordings(conn, kind).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let gold = gold_files.get(&(r.file_size, r.quick_hash.clone()));
+            CorpusRecording {
+                abs_path: db::absolute(library, &r.rel_path),
+                rel_path: r.rel_path,
+                duration_ms: r.duration_ms,
+                segment_state: r.segment_state,
+                gold: gold.map(gold::GoldFile::intervals).unwrap_or_default(),
+                has_gold: gold.is_some(),
             }
-            gold.push(Interval { start_ms, end_ms });
+        })
+        .collect())
+}
+
+/// One `recordings` row as the harness needs it.
+struct RecordingRow {
+    id: i64,
+    rel_path: String,
+    file_size: i64,
+    quick_hash: String,
+    duration_ms: Option<i64>,
+    segment_state: String,
+}
+
+/// Every recording in the `kind` library, ordered by path.
+fn library_recordings(conn: &Connection, kind: &str) -> rusqlite::Result<Vec<RecordingRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, file_size, quick_hash, duration_ms, segment_state FROM recordings
+         WHERE library = ?1 ORDER BY path",
+    )?;
+    let rows = stmt
+        .query_map([kind], |r| {
+            Ok(RecordingRow {
+                id: r.get(0)?,
+                rel_path: r.get(1)?,
+                file_size: r.get(2)?,
+                quick_hash: r.get(3)?,
+                duration_ms: r.get(4)?,
+                segment_state: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// `--export-gold`: declare each recording matching `filter` fully verified by
+/// writing its *current DB timeline* to a gold file in `gold_dir`. This is the only
+/// way a timeline becomes gold, so run it only after checking the whole recording —
+/// gaps included, since review skips them and a missed rally hides there.
+///
+/// Every rally must be **confirmed** (at [`db::CORRECTED_CONFIDENCE`], which any
+/// hand edit sets) — a leftover machine rally means the check missed it, so the
+/// whole export is refused before anything is written, naming each such rally.
+/// `allow_unconfirmed` overrides that for a recording whose rallies were checked
+/// but left unedited.
+fn export_gold(
+    conn: &Connection,
+    kind: &str,
+    filter: &str,
+    gold_dir: &Path,
+    allow_unconfirmed: bool,
+) -> Result<(), String> {
+    let rows: Vec<RecordingRow> = library_recordings(conn, kind)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.rel_path.contains(filter))
+        .collect();
+    if rows.is_empty() {
+        return Err(format!(
+            "no recording in the '{kind}' library matched \"{filter}\""
+        ));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut files = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for r in rows {
+        if r.segment_state != "ready" {
+            println!("SKIP  {}  (not segmented: {})", r.rel_path, r.segment_state);
+            continue;
         }
-        out.push(CorpusRecording {
-            abs_path: db::absolute(library, &rel_path),
-            rel_path,
-            duration_ms,
-            segment_state,
-            gold,
-            hand_corrected,
+        let mut stmt = conn
+            .prepare("SELECT start_ms, end_ms, confidence FROM rallies WHERE recording_id = ?1 ORDER BY start_ms")
+            .map_err(|e| e.to_string())?;
+        let timeline = stmt
+            .query_map([r.id], |row| {
+                Ok((
+                    [row.get::<_, i64>(0)?, row.get::<_, i64>(1)?],
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .and_then(|m| m.collect::<rusqlite::Result<Vec<_>>>())
+            .map_err(|e| e.to_string())?;
+        for ([s, e], c) in &timeline {
+            if *c < db::CORRECTED_CONFIDENCE {
+                unconfirmed.push(format!(
+                    "  {}  {:.1}–{:.1} s (confidence {c:.2})",
+                    r.rel_path,
+                    *s as f64 / 1000.0,
+                    *e as f64 / 1000.0
+                ));
+            }
+        }
+        let rallies = timeline.into_iter().map(|(iv, _)| iv).collect();
+        files.push(gold::GoldFile {
+            format: gold::FORMAT,
+            recording: r.rel_path.clone(),
+            file_size: r.file_size,
+            quick_hash: r.quick_hash,
+            duration_ms: r.duration_ms,
+            verified_unix: now,
+            rallies,
         });
     }
-    Ok(out)
+    if !unconfirmed.is_empty() && !allow_unconfirmed {
+        return Err(format!(
+            "nothing exported: {} rall{} never confirmed by hand — check each, then export again \
+             (or pass --allow-unconfirmed if they were checked and are right as they stand):\n{}",
+            unconfirmed.len(),
+            if unconfirmed.len() == 1 {
+                "y was"
+            } else {
+                "ies were"
+            },
+            unconfirmed.join("\n")
+        ));
+    }
+    for file in files {
+        let path = gold::save(gold_dir, &file).map_err(|e| format!("{}: {e}", file.recording))?;
+        println!(
+            "GOLD  {}  ({} rallies) → {}",
+            file.recording,
+            file.rallies.len(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// A machine timeline to import as a recording's draft (`--import-draft`): the
+/// gold-file schema (silver, draft, …) plus optional per-rally confidences.
+#[derive(Clone, serde::Deserialize)]
+struct ImportTimeline {
+    file_size: i64,
+    quick_hash: String,
+    rallies: Vec<[i64; 2]>,
+    #[serde(default)]
+    confidence: Option<Vec<f64>>,
+}
+
+/// Confidence for an imported rally that carries none. Imports are machine output,
+/// so they always stay strictly below [`db::CORRECTED_CONFIDENCE`]: a later edit is
+/// what marks a rally hand-corrected, never the import.
+const IMPORT_CONFIDENCE: f64 = 0.75;
+const IMPORT_MAX_CONFIDENCE: f64 = 0.99;
+/// How far past the app's probed duration an imported timeline's last rally may
+/// run and still be trimmed to fit (a few frames of frame-rate rounding).
+const IMPORT_END_SLACK_MS: i64 = 1000;
+
+/// `--import-draft DIR`: replace the DB timeline of each recording matching
+/// `filter` with the machine timeline in `dir` that has the same identity (file
+/// size + quick hash), as the starting point for hand-verifying it into gold. The
+/// recording stays `ready` at its segmenter version, so the app shows the import
+/// and never re-segments over it on its own. Flags on the replaced rallies are
+/// dropped; annotations (pinned to time, not rallies) are kept.
+fn import_draft(conn: &mut Connection, kind: &str, filter: &str, dir: &Path) -> Result<(), String> {
+    let mut timelines: Vec<(PathBuf, ImportTimeline)> = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+    {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().is_some_and(|x| x == "json") {
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let t: ImportTimeline =
+                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            timelines.push((path, t));
+        }
+    }
+    let rows: Vec<RecordingRow> = library_recordings(conn, kind)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.rel_path.contains(filter))
+        .collect();
+    if rows.is_empty() {
+        return Err(format!(
+            "no recording in the '{kind}' library matched \"{filter}\""
+        ));
+    }
+    for r in rows {
+        let found: Vec<_> = timelines
+            .iter()
+            .filter(|(_, t)| t.file_size == r.file_size && t.quick_hash == r.quick_hash)
+            .collect();
+        let (src, t) = match found.as_slice() {
+            [] => {
+                println!(
+                    "SKIP  {}  (no timeline for it in {})",
+                    r.rel_path,
+                    dir.display()
+                );
+                continue;
+            }
+            [one] => *one,
+            _ => {
+                return Err(format!(
+                    "{}: several timelines in {} match it",
+                    r.rel_path,
+                    dir.display()
+                ))
+            }
+        };
+        if r.segment_state != "ready" {
+            println!(
+                "SKIP  {}  (not segmented yet: {})",
+                r.rel_path, r.segment_state
+            );
+            continue;
+        }
+        // Machine timelines are timed from their own frame count, which can run a
+        // few frames past the app's probed duration (variable-frame-rate sources).
+        // Trim an overrun of up to IMPORT_END_SLACK_MS; anything larger is an error.
+        let mut t = (*t).clone();
+        if let (Some(d), Some(last)) = (r.duration_ms, t.rallies.last_mut()) {
+            if last[1] > d && last[1] - d <= IMPORT_END_SLACK_MS && last[0] < d {
+                last[1] = d;
+            }
+        }
+        gold::validate(&t.rallies, r.duration_ms).map_err(|e| format!("{}: {e}", src.display()))?;
+        let conf: Vec<f64> = match &t.confidence {
+            Some(c) if c.len() == t.rallies.len() => c
+                .iter()
+                .map(|&x| x.clamp(0.0, IMPORT_MAX_CONFIDENCE))
+                .collect(),
+            Some(_) => {
+                return Err(format!(
+                    "{}: confidence and rallies differ in length",
+                    src.display()
+                ))
+            }
+            None => vec![IMPORT_CONFIDENCE; t.rallies.len()],
+        };
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [r.id])
+            .map_err(|e| e.to_string())?;
+        for (&[s, e], c) in t.rallies.iter().zip(&conf) {
+            tx.execute(
+                "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![r.id, s, e, c],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        println!(
+            "DRAFT {}  ({} rallies) ← {}",
+            r.rel_path,
+            t.rallies.len(),
+            src.display()
+        );
+    }
+    Ok(())
+}
+
+/// `--dump-draft`: run the current segmenter over every video under `root` (no DB
+/// needed) and write each draft in the gold-file schema as `*.draft.json` in `out`,
+/// so drafts can be scored by tools that read that schema (e.g. the rally audit)
+/// side by side with teacher and student timelines.
+fn dump_drafts(root: &Path, out: &Path, filter: Option<&str>) -> Result<(), String> {
+    const VIDEO_EXT: [&str; 4] = ["mov", "mp4", "mkv", "m4v"];
+    let mut videos: Vec<PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            p.extension()
+                .map(|x| VIDEO_EXT.contains(&x.to_string_lossy().to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .filter(|p| filter.map_or(true, |f| p.to_string_lossy().contains(f)))
+        .collect();
+    videos.sort();
+    if videos.is_empty() {
+        return Err(format!("no videos under {}", root.display()));
+    }
+    println!(
+        "dumping segmenter v{} drafts for {} video(s) → {}",
+        segment::SEGMENTER_VERSION,
+        videos.len(),
+        out.display()
+    );
+    for path in videos {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let size = std::fs::metadata(&path)
+            .map_err(|e| format!("{rel}: {e}"))?
+            .len();
+        let hash = db::quick_hash(&path, size).map_err(|e| format!("{rel}: {e}"))?;
+        let (draft, duration_ms) = match rerun_segmenter(&path.to_string_lossy()) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("ERR   {rel}  ({e})");
+                continue;
+            }
+        };
+        let file = gold::GoldFile {
+            format: gold::FORMAT,
+            recording: rel.clone(),
+            file_size: size as i64,
+            quick_hash: hash,
+            duration_ms: Some(duration_ms),
+            verified_unix: 0, // a machine draft: never verified
+            rallies: draft.iter().map(|i| [i.start_ms, i.end_ms]).collect(),
+        };
+        let written =
+            gold::save_timeline(out, &file, "draft").map_err(|e| format!("{rel}: {e}"))?;
+        println!(
+            "DRAFT {rel}  ({} rallies) → {}",
+            file.rallies.len(),
+            written.display()
+        );
+    }
+    Ok(())
+}
+
+/// Where gold files live by default: `eval/gold/` at the repo root, so they are
+/// versioned with the code. Overridable with `--gold DIR`.
+fn default_gold_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("eval")
+        .join("gold")
 }
 
 /// Score each gold recording, print its numbers, and print the corpus aggregate.
@@ -401,11 +786,8 @@ fn score_and_report(recordings: &[CorpusRecording]) {
             skipped += 1;
             continue;
         }
-        if !rec.hand_corrected {
-            println!(
-                "SKIP  {}  (no hand-corrected timeline — not gold)",
-                rec.rel_path
-            );
+        if !rec.has_gold {
+            println!("SKIP  {}  (no gold file — not verified)", rec.rel_path);
             skipped += 1;
             continue;
         }
@@ -554,7 +936,7 @@ fn score_config(
 fn sweep_and_report(recordings: &[CorpusRecording]) {
     let mut tracks: Vec<CachedTracks> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -685,7 +1067,7 @@ fn trace_and_report(recordings: &[CorpusRecording]) {
     let p = segment::Params::default();
     let mut total_missed = 0usize;
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             continue;
         }
         let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
@@ -991,7 +1373,7 @@ fn fp_trace_and_report(recordings: &[CorpusRecording]) {
     let p = segment::Params::default();
     let mut traced: Vec<TracedRecording> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             continue;
         }
         let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
@@ -1402,7 +1784,7 @@ fn headroom_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     let p = segment::Params::default();
     let mut recs: Vec<HeadroomRecording> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -1667,7 +2049,7 @@ fn edges_and_report(recordings: &[CorpusRecording]) {
     let mut viability = [0usize; TRIM_RADII_MS.len()];
     let mut all_errors: Vec<i64> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             continue;
         }
         let (samples, motion, occupancy) = match extract_tracks(&rec.abs_path) {
@@ -1946,7 +2328,7 @@ fn presence_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::
     let p = segment::Params::default();
     let mut recs: Vec<PresenceRecording> = Vec::new();
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -2644,7 +3026,7 @@ fn spans_and_report(recordings: &[CorpusRecording]) {
     let mut fp_rows: Vec<SpanRow> = Vec::new();
     let mut total_skipped = 0usize;
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -3147,7 +3529,7 @@ fn serve_and_report(recordings: &[CorpusRecording], scratch_dir: &std::path::Pat
     let ncues = SERVE_CUES.len();
 
     for rec in recordings {
-        if rec.segment_state != "ready" || !rec.hand_corrected {
+        if rec.segment_state != "ready" || !rec.has_gold {
             println!("SKIP  {}  (not gold)", rec.rel_path);
             continue;
         }
@@ -3634,6 +4016,12 @@ struct Options {
     spans: bool,
     serve: bool,
     scratch: Option<String>,
+    gold: Option<String>,
+    export_gold: bool,
+    allow_unconfirmed: bool,
+    dump_draft: Option<String>,
+    import_draft: Option<String>,
+    root: Option<String>,
     help: bool,
 }
 
@@ -3654,6 +4042,12 @@ impl Options {
             spans: false,
             serve: false,
             scratch: None,
+            gold: None,
+            export_gold: false,
+            allow_unconfirmed: false,
+            dump_draft: None,
+            import_draft: None,
+            root: None,
             help: false,
         };
         let mut it = args.iter();
@@ -3668,6 +4062,25 @@ impl Options {
                 "--presence" => opts.presence = true,
                 "--spans" => opts.spans = true,
                 "--serve" => opts.serve = true,
+                "--export-gold" => opts.export_gold = true,
+                "--allow-unconfirmed" => opts.allow_unconfirmed = true,
+                "--dump-draft" => {
+                    opts.dump_draft = Some(
+                        it.next()
+                            .ok_or("--dump-draft needs an output directory")?
+                            .clone(),
+                    );
+                }
+                "--import-draft" => {
+                    opts.import_draft =
+                        Some(it.next().ok_or("--import-draft needs a directory")?.clone());
+                }
+                "--root" => {
+                    opts.root = Some(it.next().ok_or("--root needs a directory")?.clone());
+                }
+                "--gold" => {
+                    opts.gold = Some(it.next().ok_or("--gold needs a directory")?.clone());
+                }
                 "--scratch" => {
                     opts.scratch = Some(it.next().ok_or("--scratch needs a directory")?.clone());
                 }
@@ -3698,7 +4111,9 @@ impl Options {
 fn print_usage() {
     println!(
         "eval-harness — referee the segmenter against hand-corrected timelines (ADR 0015)\n\n\
-         USAGE:\n    eval-harness [--db PATH] [--library local|shared] [--sweep] [RECORDING]\n\n\
+         USAGE:\n    eval-harness [--db PATH] [--library local|shared] [--gold DIR] [--sweep] [RECORDING]\n    \
+         eval-harness --export-gold RECORDING\n    \
+         eval-harness --import-draft DIR RECORDING\n\n\
          OPTIONS:\n    \
          --db PATH              metadata DB to read (default: the app's own DB)\n    \
          --library local|shared which library to score (default: the active one)\n    \
@@ -3711,9 +4126,18 @@ fn print_usage() {
          --spans                span-score separation over the declared grid (issue #93)\n    \
          --serve                serve-cue + confirmation viability, gold only (ADR 0017, issue #95)\n    \
          --scratch DIR          cache dir for scratch detection/pose tracks (default: temp)\n    \
+         --gold DIR             gold-file dir (default: <repo>/eval/gold)\n    \
+         --export-gold          write the matching recordings' current DB timelines as gold\n    \
+                                files — run only once the whole recording is verified\n    \
+         --allow-unconfirmed    export even if some rallies were never hand-confirmed\n    \
+         --import-draft DIR     replace the matching recordings' DB timelines with the\n    \
+                                same-identity timeline in DIR (silver/draft JSON) — the\n    \
+                                starting point for verifying a recording into gold\n    \
+         --dump-draft OUT --root DIR  segment every video under DIR (no DB) and write the\n    \
+                                drafts as OUT/*.draft.json (gold-file schema)\n    \
          RECORDING              path substring; score only matching recordings\n    \
          -h, --help             show this help\n\n\
-         Recordings without a hand-corrected timeline are skipped, never scored."
+         Recordings without a gold file are skipped, never scored."
     );
 }
 
@@ -3761,6 +4185,95 @@ mod tests {
 
     /// One hour, so a single false positive reads as exactly `1.0 / hour`.
     const ONE_HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn import_draft_replaces_only_the_matching_recordings_timeline() {
+        let dir = std::env::temp_dir().join(format!("voloph-import-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conn = db::open(&dir.join("t.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, capture_day, library) VALUES (1, '2026-06-21', 'local');
+             INSERT INTO recordings (id, session_id, path, library, file_size, quick_hash, capture_day,
+                                     segment_state, duration_ms)
+               VALUES (1, 1, 'a/IMG_1.MOV', 'local', 100, 'aaaa', '2026-06-21', 'ready', 60000),
+                      (2, 1, 'a/IMG_2.MOV', 'local', 200, 'bbbb', '2026-06-21', 'ready', 60000);
+             INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
+               VALUES (1, 0, 1000, 1.0), (2, 0, 1000, 1.0);",
+        )
+        .unwrap();
+        let src = dir.join("timelines");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("IMG_1.MOV.aaaa.silver.json"),
+            r#"{"file_size":100,"quick_hash":"aaaa","rallies":[[2000,5000],[9000,12000]],"confidence":[0.3,1.0]}"#,
+        )
+        .unwrap();
+        import_draft(&mut conn, "local", "IMG_1", &src).unwrap();
+        let rows = |conn: &Connection, id: i64| -> Vec<(i64, i64, f64)> {
+            let mut st = conn
+                .prepare("SELECT start_ms, end_ms, confidence FROM rallies WHERE recording_id = ?1 ORDER BY start_ms")
+                .unwrap();
+            st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        // The import replaces the old draft, and a machine import never reaches the
+        // hand-corrected sentinel even when the file claims 1.0.
+        assert_eq!(
+            rows(&conn, 1),
+            vec![(2000, 5000, 0.3), (9000, 12000, IMPORT_MAX_CONFIDENCE)]
+        );
+        // The other recording is untouched.
+        assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
+        // A last rally a few frames past the probed duration is trimmed to fit.
+        std::fs::write(
+            src.join("IMG_1.MOV.aaaa.silver.json"),
+            r#"{"file_size":100,"quick_hash":"aaaa","rallies":[[58000,60400]]}"#,
+        )
+        .unwrap();
+        import_draft(&mut conn, "local", "IMG_1", &src).unwrap();
+        assert_eq!(rows(&conn, 1), vec![(58000, 60000, IMPORT_CONFIDENCE)]);
+        // A filter with no timeline in the dir changes nothing; a bad filter is an error.
+        import_draft(&mut conn, "local", "IMG_2", &src).unwrap();
+        assert_eq!(rows(&conn, 2), vec![(0, 1000, 1.0)]);
+        assert!(import_draft(&mut conn, "local", "NOPE", &src).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_gold_refuses_a_timeline_with_an_unconfirmed_rally() {
+        let dir = std::env::temp_dir().join(format!("voloph-export-gold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = db::open(&dir.join("t.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, capture_day, library) VALUES (1, '2026-06-21', 'local');
+             INSERT INTO recordings (id, session_id, path, library, file_size, quick_hash, capture_day,
+                                     segment_state, duration_ms)
+               VALUES (1, 1, 'a/IMG_1.MOV', 'local', 100, 'aaaa', '2026-06-21', 'ready', 60000),
+                      (2, 1, 'a/IMG_2.MOV', 'local', 200, 'bbbb', '2026-06-21', 'ready', 60000);
+             INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
+               VALUES (1, 0, 1000, 1.0), (1, 59500, 60000, 0.64), (2, 0, 1000, 1.0);",
+        )
+        .unwrap();
+        let gold_dir = dir.join("gold");
+        let written = || std::fs::read_dir(&gold_dir).map(|d| d.count()).unwrap_or(0);
+        // A leftover machine rally (never confirmed by hand) blocks the export, and the
+        // error names it so it can be found and checked.
+        let err = export_gold(&conn, "local", "IMG_", &gold_dir, false).unwrap_err();
+        assert!(err.contains("IMG_1") && err.contains("59.5"), "{err}");
+        // Nothing is written, not even the fully confirmed recording in the same run.
+        assert_eq!(written(), 0);
+        // A fully confirmed recording exports on its own.
+        export_gold(&conn, "local", "IMG_2", &gold_dir, false).unwrap();
+        assert_eq!(written(), 1);
+        // The override writes the timeline as it stands.
+        export_gold(&conn, "local", "IMG_1", &gold_dir, true).unwrap();
+        assert_eq!(written(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_perfect_draft_scores_zero_on_every_axis() {

@@ -1,0 +1,1360 @@
+{
+ "format": 1,
+ "question": "Is a rally (serve to point decided) in progress at the final frame? Warm-up/knock-up hitting is NOT a rally.",
+ "seed": 2,
+ "footage_hours": 5.021,
+ "label_order": [
+  21,
+  34,
+  142,
+  17,
+  70,
+  101,
+  144,
+  42,
+  28,
+  38,
+  32,
+  73,
+  45,
+  62,
+  90,
+  97,
+  115,
+  9,
+  141,
+  51,
+  76,
+  114,
+  103,
+  105,
+  133,
+  86,
+  44,
+  119,
+  10,
+  109,
+  121,
+  5,
+  145,
+  149,
+  16,
+  143,
+  80,
+  22,
+  138,
+  102,
+  77,
+  50,
+  36,
+  137,
+  69,
+  60,
+  118,
+  91,
+  95,
+  123,
+  98,
+  1,
+  134,
+  124,
+  122,
+  84,
+  83,
+  56,
+  99,
+  128,
+  31,
+  40,
+  94,
+  7,
+  57,
+  127,
+  25,
+  72,
+  107,
+  81,
+  120,
+  78,
+  100,
+  47,
+  37,
+  79,
+  15,
+  104,
+  89,
+  46,
+  61,
+  112,
+  110,
+  88,
+  126,
+  53,
+  6,
+  75,
+  74,
+  111,
+  117,
+  54,
+  55,
+  93,
+  26,
+  87,
+  106,
+  48,
+  82,
+  68,
+  39,
+  131,
+  136,
+  85,
+  66,
+  3,
+  27,
+  135,
+  29,
+  125,
+  23,
+  2,
+  12,
+  13,
+  30,
+  11,
+  139,
+  129,
+  148,
+  132,
+  52,
+  49,
+  4,
+  19,
+  0,
+  96,
+  67,
+  71,
+  108,
+  65,
+  92,
+  58,
+  20,
+  147,
+  18,
+  113,
+  140,
+  63,
+  146,
+  130,
+  59,
+  116,
+  24,
+  43,
+  41,
+  33,
+  8,
+  64,
+  14,
+  35
+ ],
+ "moments": [
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 327709,
+   "label": "no_rally",
+   "seq": 125
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 383392,
+   "label": "no_rally",
+   "seq": 52
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 431946,
+   "label": "rally",
+   "seq": 112
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 458550,
+   "label": "rally",
+   "seq": 106
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 496132,
+   "label": "no_rally",
+   "seq": 123
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 556368,
+   "label": "rally",
+   "seq": 32
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 575376,
+   "label": "no_rally",
+   "seq": 87
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 647875,
+   "label": "no_rally",
+   "seq": 64
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 654043,
+   "label": "unsure",
+   "seq": 147
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 777377,
+   "label": "unsure",
+   "seq": 18
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 1017001,
+   "label": "no_rally",
+   "seq": 29
+  },
+  {
+   "recording": "21-06-2026/IMG_5930.MOV",
+   "file_size": 1362822145,
+   "quick_hash": "9377065aa6b823c33ef28321390fb3eb6f1e57b9c6c657cc19a327224b8d260c",
+   "t_ms": 1056505,
+   "label": "no_rally",
+   "seq": 116
+  },
+  {
+   "recording": "21-06-2026/IMG_5931.MOV",
+   "file_size": 734977449,
+   "quick_hash": "e321eb44d343b0de29557d8972e43727bba995c031916bd28cf9a0c63d501ad5",
+   "t_ms": 121246,
+   "label": "no_rally",
+   "seq": 113
+  },
+  {
+   "recording": "21-06-2026/IMG_5931.MOV",
+   "file_size": 734977449,
+   "quick_hash": "e321eb44d343b0de29557d8972e43727bba995c031916bd28cf9a0c63d501ad5",
+   "t_ms": 255958,
+   "label": "no_rally",
+   "seq": 114
+  },
+  {
+   "recording": "21-06-2026/IMG_5931.MOV",
+   "file_size": 734977449,
+   "quick_hash": "e321eb44d343b0de29557d8972e43727bba995c031916bd28cf9a0c63d501ad5",
+   "t_ms": 291191,
+   "label": "no_rally",
+   "seq": 149
+  },
+  {
+   "recording": "21-06-2026/IMG_5931.MOV",
+   "file_size": 734977449,
+   "quick_hash": "e321eb44d343b0de29557d8972e43727bba995c031916bd28cf9a0c63d501ad5",
+   "t_ms": 598580,
+   "label": "no_rally",
+   "seq": 77
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 13678,
+   "label": "no_rally",
+   "seq": 35
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 136242,
+   "label": "rally",
+   "seq": 4
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 394319,
+   "label": "no_rally",
+   "seq": 135
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 558256,
+   "label": "no_rally",
+   "seq": 124
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 685887,
+   "label": "rally",
+   "seq": 133
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 821723,
+   "label": "no_rally",
+   "seq": 1
+  },
+  {
+   "recording": "21-06-2026/IMG_5933.MOV",
+   "file_size": 1028354464,
+   "quick_hash": "d79a680a740dfa1291f870d0a6af3cdcbf7bd89b9b8e15b49beabeafe19611a0",
+   "t_ms": 923694,
+   "label": "no_rally",
+   "seq": 38
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 16370,
+   "label": "no_rally",
+   "seq": 111
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 66509,
+   "label": "rally",
+   "seq": 143
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 153928,
+   "label": "no_rally",
+   "seq": 67
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 257923,
+   "label": "no_rally",
+   "seq": 95
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 436204,
+   "label": "no_rally",
+   "seq": 107
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 470121,
+   "label": "no_rally",
+   "seq": 9
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 607269,
+   "label": "no_rally",
+   "seq": 109
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 901033,
+   "label": "rally",
+   "seq": 115
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 948643,
+   "label": "no_rally",
+   "seq": 61
+  },
+  {
+   "recording": "21-06-2026/IMG_5934.MOV",
+   "file_size": 1332341153,
+   "quick_hash": "610cb0889db532ac05a377c93ed0656b3fc3d367ec0c89ceba125af9231ab5e3",
+   "t_ms": 1151433,
+   "label": "rally",
+   "seq": 11
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 16632,
+   "label": "no_rally",
+   "seq": 146
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 36119,
+   "label": "no_rally",
+   "seq": 2
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 206247,
+   "label": "no_rally",
+   "seq": 150
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 362089,
+   "label": "no_rally",
+   "seq": 43
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 556397,
+   "label": "no_rally",
+   "seq": 75
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 617355,
+   "label": "no_rally",
+   "seq": 10
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 779148,
+   "label": "rally",
+   "seq": 101
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 780995,
+   "label": "rally",
+   "seq": 62
+  },
+  {
+   "recording": "21-06-2026/IMG_5935.MOV",
+   "file_size": 1290373307,
+   "quick_hash": "1cf38b765a6d8a500cefb80416b4da8e75cfcef22c32ba1563067ccb2e6c09aa",
+   "t_ms": 867948,
+   "label": "rally",
+   "seq": 145
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 321724,
+   "label": "rally",
+   "seq": 8
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 347255,
+   "label": "no_rally",
+   "seq": 144
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 388078,
+   "label": "no_rally",
+   "seq": 27
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 467919,
+   "label": "rally",
+   "seq": 13
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 506559,
+   "label": "no_rally",
+   "seq": 80
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 617547,
+   "label": "rally",
+   "seq": 74
+  },
+  {
+   "recording": "IMG_0045.MOV",
+   "file_size": 1272601291,
+   "quick_hash": "5e489ac3cabad4503984b662bbdd51785109a731b732f4ee6d66a0d6027a28ca",
+   "t_ms": 626060,
+   "label": "no_rally",
+   "seq": 98
+  },
+  {
+   "recording": "IMG_0046.MOV",
+   "file_size": 515860098,
+   "quick_hash": "58b5435671136c288cb46722bd379359f82c8d589bbb80956495e33066b97f72",
+   "t_ms": 211995,
+   "label": "no_rally",
+   "seq": 122
+  },
+  {
+   "recording": "IMG_0046.MOV",
+   "file_size": 515860098,
+   "quick_hash": "58b5435671136c288cb46722bd379359f82c8d589bbb80956495e33066b97f72",
+   "t_ms": 337034,
+   "label": "no_rally",
+   "seq": 42
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 101427,
+   "label": "no_rally",
+   "seq": 20
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 103883,
+   "label": "no_rally",
+   "seq": 121
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 254788,
+   "label": "no_rally",
+   "seq": 86
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 570783,
+   "label": "no_rally",
+   "seq": 92
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 670119,
+   "label": "rally",
+   "seq": 93
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 802305,
+   "label": "no_rally",
+   "seq": 58
+  },
+  {
+   "recording": "IMG_5916.MOV",
+   "file_size": 1105561045,
+   "quick_hash": "be0bb5bcd75a5d5e2ca4a2d7dc456a54b948fca5d39861330141a2cb87b5a82b",
+   "t_ms": 812671,
+   "label": "no_rally",
+   "seq": 65
+  },
+  {
+   "recording": "IMG_5917.MOV",
+   "file_size": 570388397,
+   "quick_hash": "c8d0b0fa53aa8dad4197cf0c39c3679a9b8b15945e2c741d79094e9bc4d9b058",
+   "t_ms": 158003,
+   "label": "no_rally",
+   "seq": 132
+  },
+  {
+   "recording": "IMG_5917.MOV",
+   "file_size": 570388397,
+   "quick_hash": "c8d0b0fa53aa8dad4197cf0c39c3679a9b8b15945e2c741d79094e9bc4d9b058",
+   "t_ms": 214590,
+   "label": "no_rally",
+   "seq": 141
+  },
+  {
+   "recording": "IMG_5917.MOV",
+   "file_size": 570388397,
+   "quick_hash": "c8d0b0fa53aa8dad4197cf0c39c3679a9b8b15945e2c741d79094e9bc4d9b058",
+   "t_ms": 353314,
+   "label": "no_rally",
+   "seq": 46
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 31297,
+   "label": "rally",
+   "seq": 81
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 84404,
+   "label": "rally",
+   "seq": 14
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 99282,
+   "label": "no_rally",
+   "seq": 138
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 320448,
+   "label": "rally",
+   "seq": 148
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 327508,
+   "label": "rally",
+   "seq": 130
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 389912,
+   "label": "no_rally",
+   "seq": 105
+  },
+  {
+   "recording": "IMG_5918.MOV",
+   "file_size": 583513878,
+   "quick_hash": "9a2214869ebaa158ee194a67ab18a1238aaee885530f4561ee2a487177bf2f5b",
+   "t_ms": 531028,
+   "label": "rally",
+   "seq": 127
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 190129,
+   "label": "no_rally",
+   "seq": 100
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 251069,
+   "label": "no_rally",
+   "seq": 45
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 444823,
+   "label": "no_rally",
+   "seq": 5
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 505806,
+   "label": "no_rally",
+   "seq": 128
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 612730,
+   "label": "rally",
+   "seq": 68
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 642576,
+   "label": "no_rally",
+   "seq": 12
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 694670,
+   "label": "rally",
+   "seq": 89
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 747373,
+   "label": "no_rally",
+   "seq": 88
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 829958,
+   "label": "unsure",
+   "seq": 21
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 890624,
+   "label": "rally",
+   "seq": 41
+  },
+  {
+   "recording": "IMG_5919.MOV",
+   "file_size": 1138539109,
+   "quick_hash": "99e61e43964cb1e14fd011cee77669ebcee5ff272e07b0f39f3db121e8a9306c",
+   "t_ms": 972995,
+   "label": "no_rally",
+   "seq": 72
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 62790,
+   "label": "no_rally",
+   "seq": 76
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 309263,
+   "label": "no_rally",
+   "seq": 37
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 355079,
+   "label": "no_rally",
+   "seq": 70
+  },
+  {
+   "recording": "IMG_5920.MOV",
+   "file_size": 672199271,
+   "quick_hash": "d8aa869bab0bec1dd078166b1a5baed5d1c3d09859b6c2f9efc69abc0368ad12",
+   "t_ms": 483830,
+   "label": "no_rally",
+   "seq": 99
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 46357,
+   "label": "no_rally",
+   "seq": 57
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 113494,
+   "label": "no_rally",
+   "seq": 56
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 166984,
+   "label": "no_rally",
+   "seq": 104
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 489089,
+   "label": "no_rally",
+   "seq": 26
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 491482,
+   "label": "no_rally",
+   "seq": 96
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 504435,
+   "label": "rally",
+   "seq": 84
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 655431,
+   "label": "no_rally",
+   "seq": 79
+  },
+  {
+   "recording": "IMG_5921.MOV",
+   "file_size": 795070552,
+   "quick_hash": "de65acf0fe920eafc00832f0b827f4140fc49ca6db91909788e0da13e117da33",
+   "t_ms": 799051,
+   "label": "no_rally",
+   "seq": 15
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 497433,
+   "label": "no_rally",
+   "seq": 48
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 524196,
+   "label": "no_rally",
+   "seq": 131
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 665901,
+   "label": "no_rally",
+   "seq": 94
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 825203,
+   "label": "rally",
+   "seq": 63
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 879516,
+   "label": "rally",
+   "seq": 49
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 910193,
+   "label": "no_rally",
+   "seq": 126
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1214694,
+   "label": "no_rally",
+   "seq": 16
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1359220,
+   "label": "rally",
+   "seq": 51
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1462538,
+   "label": "rally",
+   "seq": 59
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1477940,
+   "label": "rally",
+   "seq": 73
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1638015,
+   "label": "no_rally",
+   "seq": 6
+  },
+  {
+   "recording": "PXL_20260615_060612369.TS-004.mp4",
+   "file_size": 4295993491,
+   "quick_hash": "1fa5f4c638e1f46aab2ebb8213940eeff5d8c29fa3a9183483ba11fad663b9bf",
+   "t_ms": 1670409,
+   "label": "no_rally",
+   "seq": 40
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 74510,
+   "label": "rally",
+   "seq": 23
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 88126,
+   "label": "rally",
+   "seq": 78
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 127072,
+   "label": "no_rally",
+   "seq": 24
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 189244,
+   "label": "rally",
+   "seq": 97
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 278330,
+   "label": "rally",
+   "seq": 69
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 306395,
+   "label": "rally",
+   "seq": 129
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 377558,
+   "label": "no_rally",
+   "seq": 30
+  },
+  {
+   "recording": "PXL_20260615_063623685.TS.mp4",
+   "file_size": 1134769200,
+   "quick_hash": "bc7cd14816e827d10ac382024286e4a7449ef7dd0dab8317a31b6e58719ea403",
+   "t_ms": 422529,
+   "label": "rally",
+   "seq": 83
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 21347,
+   "label": "no_rally",
+   "seq": 90
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 186365,
+   "label": "rally",
+   "seq": 82
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 216037,
+   "label": "rally",
+   "seq": 136
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 345300,
+   "label": "no_rally",
+   "seq": 22
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 400497,
+   "label": "unsure",
+   "seq": 17
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 826006,
+   "label": "no_rally",
+   "seq": 142
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 951492,
+   "label": "no_rally",
+   "seq": 91
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 1248454,
+   "label": "no_rally",
+   "seq": 47
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 1374537,
+   "label": "unsure",
+   "seq": 28
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 1573613,
+   "label": "rally",
+   "seq": 71
+  },
+  {
+   "recording": "PXL_20260615_064720510.TS-003.mp4",
+   "file_size": 4218588726,
+   "quick_hash": "5420b1b2031049317a15eee18abe4d08dd492ef19db83e0a101f512f0a3e0184",
+   "t_ms": 1644736,
+   "label": "no_rally",
+   "seq": 31
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 301092,
+   "label": "no_rally",
+   "seq": 55
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 453251,
+   "label": "unsure",
+   "seq": 50
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 673672,
+   "label": "no_rally",
+   "seq": 54
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 686702,
+   "label": "no_rally",
+   "seq": 110
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 777799,
+   "label": "rally",
+   "seq": 85
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 818406,
+   "label": "rally",
+   "seq": 66
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 978364,
+   "label": "rally",
+   "seq": 60
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 1010254,
+   "label": "rally",
+   "seq": 118
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 1119935,
+   "label": "no_rally",
+   "seq": 140
+  },
+  {
+   "recording": "PXL_20260615_071725666.TS-006.mp4",
+   "file_size": 2982145755,
+   "quick_hash": "4b69d39ba41a01e6f6530cc1c8ddb7d4062cf6d3128126085a9ccf4cd08b5b31",
+   "t_ms": 1161445,
+   "label": "no_rally",
+   "seq": 102
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 64399,
+   "label": "no_rally",
+   "seq": 120
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 83368,
+   "label": "rally",
+   "seq": 25
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 88502,
+   "label": "no_rally",
+   "seq": 53
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 150014,
+   "label": "rally",
+   "seq": 108
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 310223,
+   "label": "no_rally",
+   "seq": 103
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 390781,
+   "label": "no_rally",
+   "seq": 44
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 557605,
+   "label": "no_rally",
+   "seq": 39
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 802290,
+   "label": "no_rally",
+   "seq": 117
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 830349,
+   "label": "rally",
+   "seq": 137
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 922808,
+   "label": "no_rally",
+   "seq": 19
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 949152,
+   "label": "no_rally",
+   "seq": 3
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 972907,
+   "label": "no_rally",
+   "seq": 36
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1015309,
+   "label": "rally",
+   "seq": 7
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1054138,
+   "label": "no_rally",
+   "seq": 33
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1395501,
+   "label": "rally",
+   "seq": 139
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1557005,
+   "label": "no_rally",
+   "seq": 134
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1643225,
+   "label": "no_rally",
+   "seq": 119
+  },
+  {
+   "recording": "PXL_20260615_073731514.TS-010.mp4",
+   "file_size": 4422700702,
+   "quick_hash": "ac8d805839c84a5ee4d2fb24d12d1d23144abb2352434e428f00fc72ffee5ba7",
+   "t_ms": 1712372,
+   "label": "no_rally",
+   "seq": 34
+  }
+ ]
+}
