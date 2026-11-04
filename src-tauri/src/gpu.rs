@@ -67,6 +67,12 @@ pub(crate) fn is_webgpu(provider: &str) -> bool {
     provider.starts_with("WebGpu")
 }
 
+/// Whether a provider name (as `tracknet::probe_execution_provider` reports it, or a
+/// `"CPU (...)"` fallback reason) means the sessions run on the CPU.
+pub(crate) fn is_cpu(provider: &str) -> bool {
+    provider.starts_with("CPU")
+}
+
 static WEBGPU_USED: AtomicBool = AtomicBool::new(false);
 static SESSIONS_LIVE: AtomicUsize = AtomicUsize::new(0);
 

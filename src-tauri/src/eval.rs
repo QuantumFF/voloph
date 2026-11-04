@@ -255,13 +255,7 @@ pub fn teacher_run_cli(args: Vec<String>) -> Result<(), String> {
         let out = out.ok_or("--out is required")?;
         let t0 = std::time::Instant::now();
         let rallies = crate::teacher::segment_recording(&file, |_| {})?;
-        let doc = serde_json::json!({
-            "rallies": rallies.iter().map(|r| [r.start_ms, r.end_ms]).collect::<Vec<_>>(),
-            "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
-            "wall_ms": t0.elapsed().as_millis() as u64,
-        });
-        return std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("{out}: {e}"));
+        return write_timeline_json(&out, &rallies, "wall_ms", t0);
     }
     let (track, pose, out) = (
         track.ok_or("--track is required")?,
@@ -297,12 +291,24 @@ pub fn teacher_run_cli(args: Vec<String>) -> Result<(), String> {
     let model = crate::teacher::TeacherModel::bundled()?;
     let t0 = std::time::Instant::now();
     let rallies = crate::teacher::segment(model, &frames, &pose);
-    let doc = serde_json::json!({
+    write_timeline_json(&out, &rallies, "teacher_ms", t0)
+}
+
+/// Write a dev CLI's timeline as the parity scripts read it: `rallies` as
+/// `[start_ms, end_ms]` pairs, their `confidence`, and how long the run took under
+/// `timing_key`.
+fn write_timeline_json(
+    out: &str,
+    rallies: &[crate::segment::Rally],
+    timing_key: &str,
+    started: std::time::Instant,
+) -> Result<(), String> {
+    let mut doc = serde_json::json!({
         "rallies": rallies.iter().map(|r| [r.start_ms, r.end_ms]).collect::<Vec<_>>(),
         "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
-        "teacher_ms": t0.elapsed().as_millis() as u64,
     });
-    std::fs::write(&out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
+    doc[timing_key] = serde_json::json!(started.elapsed().as_millis() as u64);
+    std::fs::write(out, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
         .map_err(|e| format!("{out}: {e}"))
 }
 
@@ -360,13 +366,7 @@ pub fn signals_dump_cli(args: Vec<String>) -> Result<(), String> {
                 detect: &detect,
             },
         );
-        let doc = serde_json::json!({
-            "rallies": rallies.iter().map(|r| [r.start_ms, r.end_ms]).collect::<Vec<_>>(),
-            "confidence": rallies.iter().map(|r| r.confidence).collect::<Vec<_>>(),
-            "student_ms": t0.elapsed().as_millis() as u64,
-        });
-        std::fs::write(path, serde_json::to_vec(&doc).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("{path}: {e}"))?;
+        write_timeline_json(path, &rallies, "student_ms", t0)?;
     }
     let doc = serde_json::json!({
         "duration_ms": (footage * 1000.0).round() as i64,

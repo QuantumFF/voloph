@@ -1,4 +1,4 @@
-# Vendored detector weights (ADR 0015 Stage 2, issue #83)
+# Vendored model weights (ADR 0015 Stage 2, issue #83; ADR 0019, issue #105)
 
 The occupancy signal (ADR 0015) is derived from a single **nano-scale person
 detector** run through ONNX Runtime (`ort`) over frames the ffmpeg sidecar
@@ -41,8 +41,9 @@ record the new one), and keep this README and `LICENSE` in sync.
 The **serve cue** (ADR 0017) is a nano-scale **pose** model — a *new signal
 class*, not a bigger detector — run only in densified windows around candidate
 span starts to decide whether a proposal shows a serve. It is observational in
-round 4 (the `eval-harness --serve` mode); the shipped app never runs it until
-the v6 build clears the kill criterion.
+round 4 (the `eval-harness --serve` mode); the v6 segmenter never runs it. Since
+ADR 0019 the **teacher** segmenter runs it in the app over the whole recording for
+its player features (see `teacher-v1.json`).
 
 - **Model:** RTMPose-t (`rtmpose-t_simcc-body7`, OpenMMLab MMPose). Top-down
   17-keypoint (COCO body) SimCC pose estimator, ~3.4M params. Nano-class, and

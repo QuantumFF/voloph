@@ -215,7 +215,7 @@ pub fn segment_recording(
     let started = std::time::Instant::now();
     let model = TeacherModel::bundled()?;
     let mut tracker = crate::tracknet::ShuttleTracker::load_vendored()?;
-    let share = shuttle_share(!tracker.provider().starts_with("CPU"));
+    let share = shuttle_share(!crate::gpu::is_cpu(tracker.provider()));
     let track = crate::tracknet::track_recording(path, &mut tracker, |ms| {
         on_progress((ms as f64 * share) as i64)
     })?;

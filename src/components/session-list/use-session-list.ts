@@ -44,7 +44,8 @@ export function useSessionList(rescanOnMount: boolean) {
   const [refreshing, setRefreshing] = useState(false)
   const [reanalyzingAll, setReanalyzingAll] = useState(false)
   // Which segmenter draws the active library's drafts (ADR 0019): "student" (the
-  // learned default) or "v6" (the classic heuristic).
+  // learned default), "teacher" (the accurate, GPU-hungry one) or "v6" (the
+  // classic heuristic).
   const [segmenter, setSegmenter] = useState<string>("student")
   // The lead-in and tail playback and export add around each rally (ADR 0020);
   // one app-wide setting, not per library.

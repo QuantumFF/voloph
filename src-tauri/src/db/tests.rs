@@ -2565,11 +2565,13 @@ fn a_current_version_recording_is_left_alone() {
 fn scan_adopts_the_highest_version_and_keeps_older_files() {
     let lib = TempLib::new();
     let abs = lib.write("game.mp4", b"aaaa");
-    // Two Analyses for the same bytes: an older v1 and a newer v2, side by side.
+    // Two Analyses for the same bytes: the current version and a newer one (a
+    // device on a later build published it), side by side.
+    let cur = crate::segment::SEGMENTER_VERSION;
     let v1_name = publish_versioned_analysis(
         &lib,
         &abs,
-        1,
+        cur,
         vec![AnalysisRally {
             start_ms: 0,
             end_ms: 1000,
@@ -2579,7 +2581,7 @@ fn scan_adopts_the_highest_version_and_keeps_older_files() {
     let v2_name = publish_versioned_analysis(
         &lib,
         &abs,
-        2,
+        cur + 1,
         vec![AnalysisRally {
             start_ms: 5000,
             end_ms: 9000,
@@ -2592,11 +2594,12 @@ fn scan_adopts_the_highest_version_and_keeps_older_files() {
     designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
     scan_library(&mut conn).unwrap();
 
-    // The v2 draft (highest version) was adopted, not v1.
+    // The newer draft (highest version) was adopted, not the current one.
     let tl = recording_timeline(&conn, &abs.to_string_lossy())
         .unwrap()
         .unwrap();
-    assert_eq!(tl.duration_ms, Some(2000)); // publish_versioned_analysis marks v2 → 2000
+    // publish_versioned_analysis marks version N with a duration of N s.
+    assert_eq!(tl.duration_ms, Some(1000 * i64::from(cur + 1)));
     assert_eq!(
         tl.rallies
             .iter()
@@ -2614,12 +2617,43 @@ fn scan_adopts_the_highest_version_and_keeps_older_files() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, Some(2));
+    assert_eq!(v, Some(i64::from(cur + 1)));
 
     // Both files remain on disk — nothing was deleted from shared storage.
     let dir = lib.0.join(".voloph").join("analysis");
     assert!(dir.join(&v1_name).exists(), "older Analysis was deleted");
     assert!(dir.join(&v2_name).exists());
+}
+
+/// An Analysis older than the library segmenter's version is never adopted: the
+/// stale path would re-derive it on the next scan, and a pre-v7 v6 draft carries
+/// the old baked-in padding that playback would pad a second time (ADR 0020). The
+/// recording stays queued for the worker, and the old file stays on disk.
+#[test]
+fn scan_never_adopts_an_analysis_older_than_the_segmenter() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let old = publish_versioned_analysis(
+        &lib,
+        &abs,
+        crate::segment::SEGMENTER_VERSION - 1,
+        vec![AnalysisRally {
+            start_ms: 0,
+            end_ms: 1000,
+            confidence: 0.9,
+        }],
+    );
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    // Twice: a rescan must not adopt it either.
+    scan_library(&mut conn).unwrap();
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(tl.segment_state, "unknown");
+    assert!(tl.rallies.is_empty());
+    assert!(lib.0.join(".voloph").join("analysis").join(&old).exists());
 }
 
 /// A newer-version Analysis is published *alongside* a stale one — a bump backfills

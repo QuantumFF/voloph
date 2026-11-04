@@ -145,6 +145,17 @@ export function playIntervals(
   return out
 }
 
+/**
+ * Where playback opens a session rally (#104): its padded lead-in on the
+ * session axis, clamped to the start of the rally's own recording, as
+ * `playIntervals` clamps it, so the lead-in never reaches into the previous
+ * recording's tail.
+ */
+export function rallyLeadInMs(r: SessionRally, pad: Padding): number {
+  const recordingStart = r.globalStart - r.localStart
+  return Math.max(recordingStart, r.globalStart - pad.lead_ms)
+}
+
 /** Result of the `recording_timeline` command (see `src-tauri/src/db.rs`). */
 export interface Timeline {
   segment_state: "unknown" | "ready" | "failed"
@@ -525,13 +536,16 @@ export function resumeEntersFreePlay(
  */
 export function nextUncertainMs(
   rallies: SessionRally[],
-  hereMs: number
+  hereMs: number,
+  pad: Padding = NO_PADDING
 ): number | null {
   const uncertain = rallies.filter((r) => r.confidence < UNCERTAIN_CONFIDENCE)
   if (uncertain.length === 0) return null
+  // Compare lead-ins, not strict starts: after a jump the playhead sits on the
+  // rally's lead-in, before its start, and must not find the same rally again.
   const target =
-    uncertain.find((r) => r.globalStart > hereMs + 1) ?? uncertain[0]
-  return target.globalStart
+    uncertain.find((r) => rallyLeadInMs(r, pad) > hereMs + 1) ?? uncertain[0]
+  return rallyLeadInMs(target, pad)
 }
 
 /**

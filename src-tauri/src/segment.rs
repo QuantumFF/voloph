@@ -61,7 +61,8 @@
 pub const SEGMENTER_VERSION: u32 = 7;
 
 /// Which segmenter draws a library's drafts (ADR 0019): the v6 heuristic in this
-/// module, or the learned student ([`crate::student`]). Each has its own version, and
+/// module, the learned student ([`crate::student`]), or the teacher
+/// ([`crate::teacher`]). Each has its own version, and
 /// a draft records both, so switching re-derives exactly the untouched drafts another
 /// segmenter (or an older version) made, and a shared Analysis says who made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

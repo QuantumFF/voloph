@@ -339,12 +339,15 @@ fn read_analysis_file(path: &Path) -> Option<Analysis> {
 /// is skipped silently, never blocking a good one.
 ///
 /// Only Analyses from `segmenter` count (ADR 0019): a library adopts drafts from the
-/// segmenter it uses, never another one's.
+/// segmenter it uses, never another one's. One older than that segmenter's current
+/// version is skipped too, as the stale path would re-derive it on the next scan
+/// anyway — and a pre-v7 v6 draft has the old 1.2 s padding baked in, which
+/// playback would then pad again (ADR 0020).
 fn read_best_analysis(
     root: &str,
     quick_hash: &str,
     file_size: i64,
-    segmenter: &str,
+    segmenter: crate::segment::Segmenter,
 ) -> Option<Analysis> {
     let dir = Path::new(root).join(".voloph").join("analysis");
     let prefix = analysis_key_prefix(quick_hash, file_size);
@@ -366,7 +369,8 @@ fn read_best_analysis(
         let Some(analysis) = read_analysis_file(&entry.path()) else {
             continue;
         };
-        if analysis.segmenter != segmenter {
+        if analysis.segmenter != segmenter.id() || analysis.segmenter_version < segmenter.version()
+        {
             continue;
         }
         if best
@@ -418,8 +422,7 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
         // Prefer the highest-version Analysis when several are published for these
         // bytes (ADR 0013/0015): every device converges on the best draft, older
         // files stay on disk.
-        let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size, segmenter.id())
-        else {
+        let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size, segmenter) else {
             continue;
         };
         tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;

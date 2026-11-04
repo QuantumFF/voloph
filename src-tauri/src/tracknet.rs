@@ -170,7 +170,7 @@ impl ShuttleTracker {
             match built {
                 Ok((tn, ip)) => {
                     let provider = probe_execution_provider();
-                    if provider.starts_with("CPU") {
+                    if crate::gpu::is_cpu(&provider) {
                         // No GPU provider took: these sessions already run on CPU.
                         return Ok(ShuttleTracker::new(tn, ip, provider));
                     }
@@ -201,7 +201,7 @@ impl ShuttleTracker {
 
     fn new(tracknet: Session, inpaintnet: Session, provider: String) -> ShuttleTracker {
         let webgpu = crate::gpu::is_webgpu(&provider);
-        let batch = if provider.starts_with("CPU") {
+        let batch = if crate::gpu::is_cpu(&provider) {
             CPU_BATCH
         } else {
             GPU_BATCH

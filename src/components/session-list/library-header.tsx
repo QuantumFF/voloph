@@ -34,7 +34,7 @@ import type { Library } from "./types"
 /**
  * The thin top bar (issue #48): app identity, the library switcher, and the
  * library actions — browse moments, refresh, designate libraries, receive a
- * bundle, pick the rally detector (ADR 0019) and the clip padding (ADR 0020),
+ * bundle, choose rally detection (ADR 0019) and the clip padding (ADR 0020),
  * and re-analyze all.
  */
 export function LibraryHeader({
@@ -228,7 +228,7 @@ export function LibraryHeader({
                 </span>
               </DropdownMenuRadioItem>
             </DropdownMenuRadioGroup>
-            {/* Clip padding (ADR 0020): rallies are stored tight, serve to
+            {/* Clip padding (ADR 0020): rallies are stored strict, serve to
                 landing; playback and export add this lead-in and tail. One
                 setting for every library; changing it re-analyzes nothing. A
                 value set outside these presets shows as "Custom". */}

@@ -12,6 +12,7 @@ import {
   NO_PADDING,
   playIntervals,
   prevRallyAction,
+  rallyLeadInMs,
   resumeEntersFreePlay,
   resumeStartMs,
   resumeTickLanded,
@@ -417,7 +418,7 @@ export function useSessionPlayback({
       const localMs = clamp(target - seg.offsetMs, 0, seg.durationMs ?? target)
       freePlayRef.current = !session.rallies.some(
         (r) =>
-          target >= r.globalStart - padding.lead_ms &&
+          target >= rallyLeadInMs(r, padding) &&
           target < r.globalEnd + padding.tail_ms
       )
       if (seg.index === index) {
@@ -464,8 +465,12 @@ export function useSessionPlayback({
 
   // Jump to the next uncertain region across the whole session (ADR 0002).
   const goToUncertain = useCallback(() => {
-    const target = nextUncertainMs(session.rallies, globalPlayheadMs ?? 0)
-    if (target != null) seekSession(target - padding.lead_ms)
+    const target = nextUncertainMs(
+      session.rallies,
+      globalPlayheadMs ?? 0,
+      padding
+    )
+    if (target != null) seekSession(target)
   }, [session, globalPlayheadMs, seekSession, padding])
 
   const toggleLoop = useCallback(() => setLooping((l) => !l), [])

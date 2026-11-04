@@ -12,6 +12,7 @@ import {
   buildSessionAnnotations,
   buildSessionModel,
   clamp,
+  rallyLeadInMs,
   type PlaylistRecording,
   type SessionModel,
   type SessionRally,
@@ -448,9 +449,7 @@ export function RecordingPlayer({
           recordings={recordings}
           annotations={sessionAnnotations}
           currentRallyIndex={currentRallyIndex}
-          onSelectRally={(rally) =>
-            seekSession(rally.globalStart - padding.lead_ms)
-          }
+          onSelectRally={(rally) => seekSession(rallyLeadInMs(rally, padding))}
         />
 
         <main className="flex min-w-0 flex-1 flex-col">

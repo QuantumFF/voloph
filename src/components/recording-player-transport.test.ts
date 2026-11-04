@@ -12,6 +12,7 @@ import {
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
+  rallyLeadInMs,
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
@@ -225,6 +226,34 @@ describe("nextUncertainMs", () => {
       "a.mp4": timeline(10000, [rally(1, 1000, 2000, 0.9)]),
     })
     expect(nextUncertainMs(model.rallies, 0)).toBeNull()
+  })
+
+  it("lands on the padded lead-in and moves on from it on the next jump", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }], {
+      "a.mp4": timeline(10000, [
+        rally(1, 4000, 5000, 0.2),
+        rally(2, 7000, 8000, 0.3),
+      ]),
+    })
+    const pad = { lead_ms: 1000, tail_ms: 1500 }
+    expect(nextUncertainMs(model.rallies, 0, pad)).toBe(3000)
+    // The playhead now sits on rally 1's lead-in, before its strict start.
+    expect(nextUncertainMs(model.rallies, 3000, pad)).toBe(6000)
+  })
+})
+
+describe("rallyLeadInMs", () => {
+  it("pads the start, but never back into the previous recording", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": timeline(10000, [rally(1, 5000, 6000)]),
+      "b.mp4": timeline(10000, [rally(2, 300, 2000)]),
+    })
+    const pad = { lead_ms: 1000, tail_ms: 1500 }
+    const [first, second] = model.rallies
+    expect(rallyLeadInMs(first, pad)).toBe(4000)
+    // b.mp4 starts at 10 s on the session axis; its rally starts 0.3 s in.
+    expect(second.globalStart).toBe(10300)
+    expect(rallyLeadInMs(second, pad)).toBe(10000)
   })
 })
 
