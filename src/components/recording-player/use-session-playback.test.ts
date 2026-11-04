@@ -101,9 +101,11 @@ const TIMELINE: Timeline = {
  */
 const flush = () => act(async () => {})
 
-async function renderPlayback(padding?: { lead_ms: number; tail_ms: number }) {
-  const recordings = [{ path: "a.mp4" }]
-  const timelines = { "a.mp4": TIMELINE }
+async function renderPlayback(
+  padding?: { lead_ms: number; tail_ms: number },
+  timelines: Record<string, Timeline> = { "a.mp4": TIMELINE }
+) {
+  const recordings = Object.keys(timelines).map((path) => ({ path }))
   const session = buildSessionModel(recordings, timelines)
   const view = renderHook(
     () =>
@@ -141,6 +143,56 @@ describe("session playback orchestration vs. the async mpv boundary", () => {
     expect(seeksSent()).toEqual([])
     tick(37_000) // out of the tail, into the gap
     expect(seeksSent()).toEqual([59_000]) // R2's start minus the 1 s lead-in
+  })
+
+  it("a click just past a recording's end free-plays the next recording's opening gap (#104)", async () => {
+    // Recording A is 10 s and its last rally ends at 9.5 s, so its 1.5 s tail
+    // is clamped to A's end; B opens on 19 s of gap before its first rally.
+    const a: Timeline = {
+      ...TIMELINE,
+      duration_ms: 10_000,
+      rallies: [
+        {
+          id: 1,
+          start_ms: 2_000,
+          end_ms: 9_500,
+          confidence: 0.9,
+          flagged: false,
+        },
+      ],
+    }
+    const b: Timeline = {
+      ...TIMELINE,
+      duration_ms: 60_000,
+      rallies: [
+        {
+          id: 2,
+          start_ms: 20_000,
+          end_ms: 30_000,
+          confidence: 0.9,
+          flagged: false,
+        },
+      ],
+    }
+    const { result } = await renderPlayback(
+      { lead_ms: 1000, tail_ms: 1500 },
+      { "a.mp4": a, "b.mp4": b }
+    )
+    fileLoaded()
+    tick(5_000) // inside A's rally
+
+    // Click at session 10.5 s: 0.5 s into B, a gap. A's tail does not reach
+    // across the recording boundary, so this is a manual move into a gap.
+    act(() => result.current.seekSession(10_500))
+    expect(result.current.index).toBe(1)
+    fileLoaded()
+    tick(500)
+    tick(1_000)
+
+    // Symptom: the click read as inside A's padded rally, so gap-skip yanked
+    // the playhead to B's first lead-in (19 s) instead of playing from 0.5 s.
+    expect(seeksSent()).toEqual([])
+    expect(result.current.currentMs).toBe(1_000)
   })
 
   it("control: gap-free playback skips a gap to the next rally", async () => {

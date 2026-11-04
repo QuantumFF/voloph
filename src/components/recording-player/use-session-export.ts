@@ -4,10 +4,11 @@ import { useCallback, useMemo } from "react"
 
 import { fileName } from "@/lib/format"
 import { useExport } from "@/components/use-export"
-import type {
-  PlaylistRecording,
-  SessionAnnotation,
-  SessionModel,
+import {
+  rallyContains,
+  type PlaylistRecording,
+  type SessionAnnotation,
+  type SessionModel,
 } from "@/components/recording-player-transport"
 
 /**
@@ -96,9 +97,7 @@ export function useSessionExport({
       .filter((a) => a.verdict === "mistake")
       .map((a) => a.globalMs)
     const ids = session.rallies
-      .filter((r) =>
-        mistakeMs.some((ms) => ms >= r.globalStart && ms < r.globalEnd)
-      )
+      .filter((r) => mistakeMs.some((ms) => rallyContains(r, ms)))
       .map((r) => r.id)
     return exportReel("rallies with mistakes", "mistakes", ids)
   }, [exportReel, session, sessionAnnotations])

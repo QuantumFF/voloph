@@ -14,6 +14,8 @@ import { fileName, formatClock } from "@/lib/format"
 import {
   UNCERTAIN_CONFIDENCE,
   clamp,
+  editAffordances,
+  rallyKey,
   stripScrollTarget,
   type SessionAnnotation,
   type SessionModel,
@@ -126,7 +128,6 @@ export const SessionTimeline = forwardRef<
 
   const totalMs = session.totalMs
   const totalPx = (totalMs / 1000) * pxPerSec
-  const rallyKey = (r: SessionRally) => `${r.path}:${r.id}`
   // The strip only renders once a recording has rallies; the wheel/scroll
   // listeners below re-attach when it appears (deps include this).
   const hasRallies = totalMs > 0 && session.rallies.length > 0
@@ -301,19 +302,14 @@ export const SessionTimeline = forwardRef<
   const selectedIndex = session.rallies.findIndex(
     (r) => rallyKey(r) === selectedKey
   )
-  const selected = selectedIndex >= 0 ? session.rallies[selectedIndex] : null
-  const next =
-    selectedIndex >= 0 ? (session.rallies[selectedIndex + 1] ?? null) : null
-  const mergeTarget =
-    selected && next && next.recordingIndex === selected.recordingIndex
-      ? next
-      : null
-  const canSplit =
-    selected !== null &&
-    globalPlayheadMs !== null &&
-    globalPlayheadMs > selected.globalStart &&
-    globalPlayheadMs < selected.globalEnd
-  const canMerge = mergeTarget !== null
+  // The toolbar edits only the selected rally (the hotkeys also fall back to
+  // the one under the playhead — same rule, see `editAffordances`).
+  const {
+    target: selected,
+    mergeTarget,
+    canSplit,
+    canMerge,
+  } = editAffordances(session.rallies, selectedIndex, globalPlayheadMs)
 
   const playheadPx =
     globalPlayheadMs !== null ? (globalPlayheadMs / 1000) * pxPerSec : null

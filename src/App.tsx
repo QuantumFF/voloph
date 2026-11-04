@@ -12,10 +12,11 @@ interface Playing {
   recordings: PlaylistRecording[]
   startIndex: number
   /**
-   * Recording-local time (ms) to open at — set when jumping to a moment from the
-   * cross-session browser (issue #11); undefined for a normal session review.
+   * Recording-local strict start (ms) of the rally to open on — set when jumping
+   * to a moment from the cross-session browser (issue #11); the player opens on
+   * its padded lead-in. Undefined for a normal session review.
    */
-  startMs?: number
+  rallyStartMs?: number
   /** The session's capture day, shown in the review top bar. */
   day: string
 }
@@ -41,7 +42,7 @@ export default function App() {
           <RecordingPlayer
             recordings={playing.recordings}
             startIndex={playing.startIndex}
-            startMs={playing.startMs}
+            rallyStartMs={playing.rallyStartMs}
             day={playing.day}
             onBack={() => {
               setPlaying(null)
