@@ -446,12 +446,15 @@ pub fn extract_pose_window(
         MAX_PLAYERS,
         detector,
         pose,
+        &mut |_| {},
     )
 }
 
 /// [`extract_pose_window`] keeping the `max_players` highest-scored person boxes per
 /// frame instead of [`MAX_PLAYERS`] (the `pose-dump` CLI keeps a few more so a
 /// downstream model can see spectators and other courts, and pick the players itself).
+/// `on_progress` gets each decoded frame's position in ms (the teacher's pass over a
+/// whole recording drives the analysis progress row with it).
 #[allow(clippy::too_many_arguments)]
 pub fn extract_pose_window_k(
     path: &str,
@@ -463,6 +466,7 @@ pub fn extract_pose_window_k(
     max_players: usize,
     detector: &mut detect::Detector,
     pose: &mut PoseEstimator,
+    on_progress: &mut dyn FnMut(i64),
 ) -> Result<PoseWindow, String> {
     // The pose pass decodes at *source* resolution (unlike detection, which lets
     // ffmpeg letterbox to a fixed square), so it needs the true decoded frame size.
@@ -523,6 +527,7 @@ pub fn extract_pose_window_k(
                 players.push(PlayerPose { bbox, keypoints });
             }
             frames.push(PoseFrame { t_ms, players });
+            on_progress(t_ms);
         }
     }
 
@@ -580,6 +585,7 @@ pub fn dump_cli(args: Vec<String>) -> Result<(), String> {
         players,
         &mut detector,
         &mut pose,
+        &mut |_| {},
     )?;
     let wall = started.elapsed().as_secs_f64();
     let footage = win.frames.len() as f64 / f64::from(fps);

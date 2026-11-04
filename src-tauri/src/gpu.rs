@@ -113,7 +113,8 @@ pub fn exit(code: i32) -> ! {
             let _ = std::io::stderr().flush();
             log::logger().flush();
             // SAFETY: `_exit` ends the process at once; nothing runs after it.
-            #[cfg(unix)]
+            // `libc` is a Linux-only dependency, and only Linux runs WebGPU.
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::_exit(code)
             };

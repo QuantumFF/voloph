@@ -226,6 +226,46 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
             return;
         }
     };
+    let mut chosen = match conn.lock() {
+        Ok(c) => db::recording_segmenter(&c, id).unwrap_or_else(|e| {
+            log::error!("media worker: could not read the segmenter for {path}: {e}");
+            segment::DEFAULT_SEGMENTER
+        }),
+        Err(e) => {
+            log::error!("media worker: db lock poisoned reading the segmenter for {path}: {e}");
+            segment::DEFAULT_SEGMENTER
+        }
+    };
+    if chosen == segment::Segmenter::Teacher {
+        // The teacher reads neither motion nor the detection track (it runs its own
+        // shuttle and pose passes), so they are extracted only if it fails. Its
+        // progress covers both of its passes on one footage scale.
+        let started = Instant::now();
+        let mut last_emit = Instant::now();
+        match crate::teacher::segment_recording(path, |processed_ms| {
+            if last_emit.elapsed().as_millis() >= 500 {
+                last_emit = Instant::now();
+                emit_progress(app, id, processed_ms, total_ms, &started);
+            }
+        }) {
+            Ok(rallies) => {
+                return finish_segmentation(
+                    app,
+                    conn,
+                    id,
+                    path,
+                    &samples,
+                    rallies,
+                    segment::Segmenter::Teacher,
+                    &started,
+                );
+            }
+            Err(e) => {
+                log::warn!("media worker: teacher failed for {path}, using the student: {e}");
+                chosen = segment::Segmenter::Student;
+            }
+        }
+    }
     // Motion extraction is the long pole of analysis; report footage decoded as
     // frames stream in, throttled to avoid flooding the frontend with events. The
     // wall clock starts here, at the phase the ticks measure, so the frontend's
@@ -258,48 +298,6 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
     // ffmpeg, inference — is logged and swallowed, yielding `None`. The seam then falls
     // back to motion-proposes (pre-#84 behavior); a failed detector must never turn into
     // deleted play, so analysis still completes with a full draft timeline.
-    let chosen = match conn.lock() {
-        Ok(c) => db::recording_segmenter(&c, id).unwrap_or_else(|e| {
-            log::error!("media worker: could not read the segmenter for {path}: {e}");
-            segment::DEFAULT_SEGMENTER
-        }),
-        Err(e) => {
-            log::error!("media worker: db lock poisoned reading the segmenter for {path}: {e}");
-            segment::DEFAULT_SEGMENTER
-        }
-    };
-    let mut chosen = chosen;
-    if chosen == segment::Segmenter::Teacher {
-        // The teacher's own passes (shuttle track, then pose) are the long pole now;
-        // keep the remaining-time estimate moving over the shuttle pass.
-        let started = Instant::now();
-        let mut last_emit = Instant::now();
-        match crate::teacher::segment_recording(path, |processed_ms| {
-            if last_emit.elapsed().as_millis() >= 500 {
-                last_emit = Instant::now();
-                emit_progress(app, id, processed_ms, total_ms, &started);
-            }
-        }) {
-            Ok(rallies) => {
-                return finish_segmentation(
-                    app,
-                    conn,
-                    id,
-                    path,
-                    &samples,
-                    rallies,
-                    segment::Segmenter::Teacher,
-                    &started,
-                );
-            }
-            Err(e) => {
-                log::warn!("media worker: teacher failed for {path}, using the student: {e}");
-                chosen = segment::Segmenter::Student;
-            }
-        }
-    }
-    // The student and v6 read the person-detection track (the teacher runs its own
-    // detector inside the pose pass), so it is extracted only on their path.
     let detections = extract_detections(path);
     let (rallies, segmenter) = run_segmenter(chosen, &samples, &motion, detections.as_ref(), path);
     finish_segmentation(app, conn, id, path, &samples, rallies, segmenter, &started);

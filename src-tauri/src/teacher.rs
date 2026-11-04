@@ -183,20 +183,46 @@ pub fn segment(model: &TeacherModel, track: &[ShuttleFrame], pose: &PoseArrays) 
     )
 }
 
-/// The teacher (ADR 0019): TrackNetV3 shuttle track over the whole recording, then the
-/// players' poses (YOLOX + RTMPose-t at 5 fps, up to 4 people), then the teacher model.
-/// Any failure — a missing model, ort, ffmpeg — is an error (the analysis worker then falls
-/// back to the student), so choosing the teacher never costs a recording its draft.
 /// A day: "to the end" for the pose pass's ffmpeg `-t` (which stops at end of file;
 /// a much larger value overflows ffmpeg's time parsing).
 const WHOLE_RECORDING_MS: i64 = 86_400_000;
 
-pub fn segment_recording(path: &str, on_progress: impl FnMut(i64)) -> Result<Vec<Rally>, String> {
+/// The share of the teacher's wall time its shuttle-track pass takes (the pose pass is
+/// the rest), so one progress scale covers both passes and the remaining-time estimate
+/// does not stall through the pose pass. Measured on a 10-minute recording: the
+/// tracker took 125 s on a GPU (WebGPU, RTX 3080) and ~850 s on CPU; the pose pass
+/// ~70 s either way (CPU on Linux).
+fn shuttle_share(tracker_on_gpu: bool) -> f64 {
+    if tracker_on_gpu {
+        0.65
+    } else {
+        0.92
+    }
+}
+
+/// The teacher (ADR 0019): TrackNetV3 shuttle track over the whole recording, then the
+/// players' poses (YOLOX + RTMPose-t at 5 fps, up to 4 people), then the teacher model.
+/// Any failure — a missing model, ort, ffmpeg — is an error (the analysis worker then falls
+/// back to the student), so choosing the teacher never costs a recording its draft.
+///
+/// `on_progress` reports the analysis's position in footage ms across both passes:
+/// the shuttle pass covers [`shuttle_share`] of the recording's length, the pose pass
+/// the rest, so the analysis worker's processed ÷ elapsed speed holds across them.
+pub fn segment_recording(
+    path: &str,
+    mut on_progress: impl FnMut(i64),
+) -> Result<Vec<Rally>, String> {
     let started = std::time::Instant::now();
     let model = TeacherModel::bundled()?;
     let mut tracker = crate::tracknet::ShuttleTracker::load_vendored()?;
-    let track = crate::tracknet::track_recording(path, &mut tracker, on_progress)?;
+    let share = shuttle_share(!tracker.provider().starts_with("CPU"));
+    let track = crate::tracknet::track_recording(path, &mut tracker, |ms| {
+        on_progress((ms as f64 * share) as i64)
+    })?;
     let tracked = started.elapsed().as_millis();
+    let footage_ms = track.points.len() as i64 * 1000 / i64::from(crate::tracknet::FPS);
+    let shuttle_done = footage_ms as f64 * share;
+    on_progress(shuttle_done as i64);
     let (w, h) = crate::pose::probe_source_dimensions(path)
         .ok_or("could not probe the frame size for pose")?;
     let mut detector = crate::detect::Detector::load(&crate::detect::vendored_model_path()?)?;
@@ -212,6 +238,7 @@ pub fn segment_recording(path: &str, on_progress: impl FnMut(i64)) -> Result<Vec
         POSE_K,
         &mut detector,
         &mut estimator,
+        &mut |ms| on_progress((shuttle_done + ms as f64 * (1.0 - share)) as i64),
     )?;
     let pose = PoseArrays::from_window(&window);
     let frames: Vec<ShuttleFrame> = track
