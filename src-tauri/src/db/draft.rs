@@ -118,18 +118,38 @@ pub(crate) fn write_draft(
     Ok(())
 }
 
-/// Drop recording `id`'s draft so the worker draws it again: no rallies, `unknown`,
-/// and nothing the draft brought (duration, waveform, stamp). `probe_state` stays —
-/// the bytes did not change. Every path that discards a draft goes through here, so
-/// none can leave a stale stamp on an undrawn row.
-pub(crate) fn clear_draft(conn: &Connection, id: i64) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
+/// Which recordings' drafts [`clear_drafts`] drops.
+pub(crate) enum Drafts<'a> {
+    /// The one recording with this row id.
+    Of(i64),
+    /// Every recording in the library of this kind — Re-analyze all, two statements
+    /// however large the library.
+    InLibrary(&'a str),
+}
+
+/// Drop drafts so the worker draws them again: no rallies, `unknown`, and nothing
+/// the draft brought (duration, waveform, stamp). `probe_state` stays — the bytes
+/// did not change. Every path that discards a draft goes through here, so none can
+/// leave a stale stamp on an undrawn row.
+pub(crate) fn clear_drafts(conn: &Connection, which: Drafts) -> rusqlite::Result<()> {
+    let (filter, param): (&str, &dyn rusqlite::ToSql) = match &which {
+        Drafts::Of(id) => ("id = ?1", id),
+        Drafts::InLibrary(kind) => ("library = ?1", kind),
+    };
     conn.execute(
-        "UPDATE recordings
-         SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
-             segmenter_version = NULL, segmenter_id = NULL
-         WHERE id = ?1",
-        [id],
+        &format!(
+            "DELETE FROM rallies WHERE recording_id IN (SELECT id FROM recordings WHERE {filter})"
+        ),
+        [param],
+    )?;
+    conn.execute(
+        &format!(
+            "UPDATE recordings
+             SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
+                 segmenter_version = NULL, segmenter_id = NULL
+             WHERE {filter}"
+        ),
+        [param],
     )?;
     Ok(())
 }

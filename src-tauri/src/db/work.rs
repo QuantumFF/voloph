@@ -5,7 +5,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::draft::{clear_draft, write_draft, DraftStamp};
+use super::draft::{clear_drafts, write_draft, DraftStamp, Drafts};
 use super::{
     absolute, active_kind, is_hand_touched, library_path_of, pending_bundle_paths, stored_key,
 };
@@ -186,7 +186,7 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
         )
         .optional()?;
     match id {
-        Some(id) => clear_draft(conn, id),
+        Some(id) => clear_drafts(conn, Drafts::Of(id)),
         None => Ok(()),
     }
 }
@@ -198,17 +198,7 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
 /// manual corrections (ADR 0002).
 pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
     let kind = active_kind(conn)?;
-    let ids: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT id FROM recordings WHERE library = ?1")?;
-        let ids = stmt
-            .query_map([&kind], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        ids
-    };
-    for id in ids {
-        clear_draft(conn, id)?;
-    }
-    Ok(())
+    clear_drafts(conn, Drafts::InLibrary(&kind))
 }
 
 /// Silently re-queue every **untouched** recording whose draft an outranked
@@ -235,7 +225,7 @@ pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
 /// version of the same one. So switching a library's segmenter re-derives its
 /// untouched drafts, and a hand-touched one keeps the segmenter that drew it.
 pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
-    let rows: Vec<(i64, String, Option<String>, i64)> = {
+    let rows: Vec<(i64, String, Option<String>, Option<i64>)> = {
         let mut stmt = tx.prepare(
             "SELECT id, library, segmenter_id, segmenter_version FROM recordings
              WHERE segment_state = 'ready'
@@ -257,8 +247,7 @@ pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite:
                 s
             }
         };
-        // The query admits only stamped rows, so every row has a stamp.
-        if DraftStamp::from_row(seg_id, Some(version)).is_some_and(|s| !s.is_current_for(active)) {
+        if DraftStamp::from_row(seg_id, version).is_some_and(|s| !s.is_current_for(active)) {
             stale.push(id);
         }
     }
@@ -267,7 +256,7 @@ pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite:
         if is_hand_touched(tx, id)? {
             continue;
         }
-        clear_draft(tx, id)?;
+        clear_drafts(tx, Drafts::Of(id))?;
     }
     Ok(())
 }

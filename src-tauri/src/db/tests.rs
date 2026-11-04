@@ -35,18 +35,13 @@ fn save_rallies(
     )
 }
 
-/// The Analysis file name a draft by segmenter `id` at `version` publishes as.
-fn analysis_file_name_for(quick_hash: &str, file_size: i64, id: &str, version: u32) -> String {
+/// The stamp of a draft by segmenter `id` at `version`; `.file_name(..)` gives the
+/// Analysis file it publishes as.
+fn stamp(id: &str, version: u32) -> DraftStamp {
     DraftStamp {
         id: id.to_string(),
         version,
     }
-    .file_name(quick_hash, file_size)
-}
-
-/// The Analysis file name a v6 draft at `version` publishes as.
-fn analysis_file_name(quick_hash: &str, file_size: i64, version: u32) -> String {
-    analysis_file_name_for(quick_hash, file_size, "v6", version)
 }
 
 /// An in-memory DB with the schema and one segmented recording carrying the
@@ -1855,7 +1850,7 @@ fn declining_after_adoption_keeps_the_draft_and_runs_no_analysis() {
 fn read_published_analysis(root: &Path, abs: &Path) -> Option<Analysis> {
     let meta = std::fs::metadata(abs).unwrap();
     let hash = quick_hash(abs, meta.len()).unwrap();
-    let name = analysis_file_name(&hash, meta.len() as i64, crate::segment::SEGMENTER_VERSION);
+    let name = stamp("v6", crate::segment::SEGMENTER_VERSION).file_name(&hash, meta.len() as i64);
     let path = root.join(".voloph").join("analysis").join(name);
     std::fs::read(path)
         .ok()
@@ -2189,7 +2184,7 @@ fn publish_test_analysis(lib: &TempLib, abs: &Path, rallies: Vec<AnalysisRally>)
     std::fs::create_dir_all(&dir).unwrap();
     // At the active version's file name, mirroring where a real publish lands
     // (and where `read_published_analysis` looks).
-    let name = analysis_file_name(&hash, meta.len() as i64, crate::segment::SEGMENTER_VERSION);
+    let name = stamp("v6", crate::segment::SEGMENTER_VERSION).file_name(&hash, meta.len() as i64);
     std::fs::write(dir.join(name), serde_json::to_vec(&analysis).unwrap()).unwrap();
 }
 
@@ -2405,7 +2400,7 @@ fn publish_versioned_analysis(
         waveform: vec![],
         rallies,
     };
-    let name = analysis_file_name(&hash, meta.len() as i64, segmenter_version);
+    let name = stamp("v6", segmenter_version).file_name(&hash, meta.len() as i64);
     let dir = lib.0.join(".voloph").join("analysis");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(&name), serde_json::to_vec(&analysis).unwrap()).unwrap();
@@ -2705,7 +2700,7 @@ fn publish_writes_alongside_without_deleting_the_older_version() {
     publish_analysis(&conn, id);
     let meta = std::fs::metadata(&abs).unwrap();
     let hash = quick_hash(&abs, meta.len()).unwrap();
-    let v1_name = analysis_file_name(&hash, meta.len() as i64, 1);
+    let v1_name = stamp("v6", 1).file_name(&hash, meta.len() as i64);
     let dir = lib.0.join(".voloph").join("analysis");
     assert!(dir.join(&v1_name).exists());
 
@@ -2717,7 +2712,7 @@ fn publish_writes_alongside_without_deleting_the_older_version() {
     .unwrap();
     publish_analysis(&conn, id);
 
-    let v2_name = analysis_file_name(&hash, meta.len() as i64, 2);
+    let v2_name = stamp("v6", 2).file_name(&hash, meta.len() as i64);
     assert!(dir.join(&v2_name).exists(), "v2 published alongside");
     assert!(dir.join(&v1_name).exists(), "v1 left in place");
 }
@@ -2945,14 +2940,11 @@ fn switching_segmenter_rederives_only_untouched_drafts_made_by_another() {
 
 #[test]
 fn a_learned_segmenters_analysis_file_is_invisible_to_older_builds() {
-    let name = analysis_file_name_for("abc", 42, "student", 1);
+    let name = stamp("student", 1).file_name("abc", 42);
     assert_eq!(name, "abc_42.student1.vanalysis");
     // Older builds adopt `{key}.vanalysis` or `{key}_s*.vanalysis` only.
     assert!(name != "abc_42.vanalysis" && !name.starts_with("abc_42_s"));
-    assert_eq!(
-        analysis_file_name_for("abc", 42, "v6", 6),
-        "abc_42_s6.vanalysis"
-    );
+    assert_eq!(stamp("v6", 6).file_name("abc", 42), "abc_42_s6.vanalysis");
 }
 
 /// A shared library adopts only Analyses its own segmenter made, and records which.
@@ -2999,7 +2991,7 @@ fn adoption_takes_only_the_librarys_segmenter() {
             confidence: 0.8,
         }],
     };
-    let name = analysis_file_name_for(&hash, meta.len() as i64, "student", crate::student::VERSION);
+    let name = stamp("student", crate::student::VERSION).file_name(&hash, meta.len() as i64);
     std::fs::write(
         lib.0.join(".voloph").join("analysis").join(name),
         serde_json::to_vec(&analysis).unwrap(),
@@ -3050,12 +3042,7 @@ fn a_student_draft_publishes_under_its_own_name() {
         .0
         .join(".voloph")
         .join("analysis")
-        .join(analysis_file_name_for(
-            &hash,
-            meta.len() as i64,
-            "student",
-            crate::student::VERSION,
-        ));
+        .join(stamp("student", crate::student::VERSION).file_name(&hash, meta.len() as i64));
     let a: Analysis = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(
         (a.segmenter.as_str(), a.segmenter_version),
