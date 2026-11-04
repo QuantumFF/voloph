@@ -66,8 +66,8 @@ export const PADDING_PRESETS = [
   { id: "none", label: "None", lead_ms: 0, tail_ms: 0 },
   { id: "short", label: "Short", lead_ms: 500, tail_ms: 1000 },
   {
-    id: "standard",
-    label: "Standard",
+    id: "normal",
+    label: "Normal",
     lead_ms: DEFAULT_PADDING.lead_ms,
     tail_ms: DEFAULT_PADDING.tail_ms,
   },

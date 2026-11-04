@@ -86,7 +86,7 @@ describe("usePlaybackPadding", () => {
 
 describe("padding presets", () => {
   it("names the preset a padding matches, else custom", () => {
-    expect(paddingPresetId(DEFAULT_PADDING)).toBe("standard")
+    expect(paddingPresetId(DEFAULT_PADDING)).toBe("normal")
     expect(paddingPresetId({ lead_ms: 0, tail_ms: 0 })).toBe("none")
     expect(paddingPresetId({ lead_ms: 750, tail_ms: 1500 })).toBe("custom")
   })

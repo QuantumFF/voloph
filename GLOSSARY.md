@@ -37,11 +37,11 @@ The machine that drafts a recording's timeline. There are three — the **studen
 _Avoid_: model, detector, algorithm (when you mean the whole drafting step); "rally detection" is the UI's name for the choice
 
 **Student**:
-The default segmenter: learned from the teacher's drafts and hand-verified timelines, it reads only the cheap signals v6 already uses (sound, motion, where people stand), so it drafts quickly on any machine. Shown as "Learned".
+The default segmenter: learned from the teacher's drafts and hand-verified timelines, it reads only the cheap signals v6 already uses (sound, motion, where people stand), so it drafts quickly on any machine. Shown as "Standard".
 _Avoid_: fast model, small model
 
 **Teacher**:
-The most accurate segmenter: it tracks the shuttle and the players' poses through the whole recording, so it is slow without a GPU. Its drafts trained the student. Shown as "Learned, high accuracy".
+The most accurate segmenter: it tracks the shuttle and the players' poses through the whole recording, so it is slow without a GPU. Its drafts trained the student. Shown as "Precise".
 _Avoid_: big model, accurate model, shuttle tracker (that is one of its parts)
 
 **Analysis**:

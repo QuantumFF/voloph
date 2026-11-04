@@ -204,27 +204,27 @@ export function LibraryHeader({
                 value="student"
                 className="flex-col items-start gap-0"
               >
-                <span>Learned</span>
+                <span>Standard</span>
                 <span className="text-xs text-muted-foreground">
-                  Rarely invents rallies
+                  Fast on any computer
                 </span>
               </DropdownMenuRadioItem>
               <DropdownMenuRadioItem
                 value="teacher"
                 className="flex-col items-start gap-0"
               >
-                <span>Learned, high accuracy</span>
+                <span>Precise</span>
                 <span className="text-xs text-muted-foreground">
-                  Tracks the shuttle — slow without a GPU
+                  Tracks the shuttle; best with a GPU
                 </span>
               </DropdownMenuRadioItem>
               <DropdownMenuRadioItem
                 value="v6"
                 className="flex-col items-start gap-0"
               >
-                <span>Classic (v6)</span>
+                <span>Classic</span>
                 <span className="text-xs text-muted-foreground">
-                  Catches more very short rallies
+                  Catches more very short rallies, but invents more
                 </span>
               </DropdownMenuRadioItem>
             </DropdownMenuRadioGroup>
