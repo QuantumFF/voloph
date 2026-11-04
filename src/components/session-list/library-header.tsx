@@ -21,13 +21,21 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
+import type { Padding } from "@/components/recording-player-transport"
+import {
+  describePadding,
+  PADDING_PRESETS,
+  paddingPresetId,
+} from "@/components/recording-player/use-playback-padding"
+
 import { kindLabel } from "./recording-state"
 import type { Library } from "./types"
 
 /**
  * The thin top bar (issue #48): app identity, the library switcher, and the
  * library actions — browse moments, refresh, designate libraries, receive a
- * bundle, pick the rally detector (ADR 0019), and re-analyze all.
+ * bundle, pick the rally detector (ADR 0019) and the clip padding (ADR 0020),
+ * and re-analyze all.
  */
 export function LibraryHeader({
   libraries,
@@ -39,6 +47,8 @@ export function LibraryHeader({
   reanalyzingAll,
   segmenter,
   onSegmenter,
+  padding,
+  onPadding,
   onBrowse,
   onSwitch,
   onRefresh,
@@ -55,6 +65,8 @@ export function LibraryHeader({
   reanalyzingAll: boolean
   segmenter: string
   onSegmenter: (id: string) => void
+  padding: Padding
+  onPadding: (padding: Padding) => void
   onBrowse: () => void
   onSwitch: (kind: string) => void
   onRefresh: () => void
@@ -215,6 +227,48 @@ export function LibraryHeader({
                   Catches more very short rallies
                 </span>
               </DropdownMenuRadioItem>
+            </DropdownMenuRadioGroup>
+            {/* Clip padding (ADR 0020): rallies are stored tight, serve to
+                landing; playback and export add this lead-in and tail. One
+                setting for every library; changing it re-analyzes nothing. A
+                value set outside these presets shows as "Custom". */}
+            <DropdownMenuLabel>Clip padding</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              value={paddingPresetId(padding)}
+              onValueChange={(id) => {
+                const preset = PADDING_PRESETS.find((p) => p.id === id)
+                if (preset) {
+                  onPadding({
+                    lead_ms: preset.lead_ms,
+                    tail_ms: preset.tail_ms,
+                  })
+                }
+              }}
+            >
+              {PADDING_PRESETS.map((p) => (
+                <DropdownMenuRadioItem
+                  key={p.id}
+                  value={p.id}
+                  className="flex-col items-start gap-0"
+                >
+                  <span>{p.label}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {describePadding(p)}
+                  </span>
+                </DropdownMenuRadioItem>
+              ))}
+              {paddingPresetId(padding) === "custom" ? (
+                <DropdownMenuRadioItem
+                  value="custom"
+                  disabled
+                  className="flex-col items-start gap-0"
+                >
+                  <span>Custom</span>
+                  <span className="text-xs text-muted-foreground">
+                    {describePadding(padding)}
+                  </span>
+                </DropdownMenuRadioItem>
+              ) : null}
             </DropdownMenuRadioGroup>
             <DropdownMenuLabel>All recordings</DropdownMenuLabel>
             <DropdownMenuItem

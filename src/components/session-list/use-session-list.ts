@@ -3,6 +3,11 @@ import { listen } from "@tauri-apps/api/event"
 import { open, save } from "@tauri-apps/plugin-dialog"
 
 import { trackedInvoke } from "@/lib/tauri"
+import type { Padding } from "@/components/recording-player-transport"
+import {
+  setPlaybackPadding,
+  usePlaybackPadding,
+} from "@/components/recording-player/use-playback-padding"
 
 import {
   remainingByRecording as deriveRemaining,
@@ -41,6 +46,9 @@ export function useSessionList(rescanOnMount: boolean) {
   // Which segmenter draws the active library's drafts (ADR 0019): "student" (the
   // learned default) or "v6" (the classic heuristic).
   const [segmenter, setSegmenter] = useState<string>("student")
+  // The lead-in and tail playback and export add around each rally (ADR 0020);
+  // one app-wide setting, not per library.
+  const padding = usePlaybackPadding()
   // Which bulk action is awaiting confirmation in the dialog, if any.
   const [confirmAction, setConfirmAction] = useState<"reanalyze" | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -435,6 +443,12 @@ export function useSessionList(rescanOnMount: boolean) {
     })
   }
 
+  // Change the playback/export padding (ADR 0020). Presentation only — stored
+  // rallies are unchanged, so nothing is re-analyzed.
+  function handlePadding(next: Padding) {
+    return guard(() => setPlaybackPadding(next))
+  }
+
   // Run whichever bulk action the confirmation dialog is open for, then close it.
   function handleConfirm() {
     if (confirmAction === "reanalyze") void runReanalyzeAll()
@@ -564,6 +578,8 @@ export function useSessionList(rescanOnMount: boolean) {
     reanalyzingAll,
     segmenter,
     handleSegmenter,
+    padding,
+    handlePadding,
     confirmAction,
     setConfirmAction,
     error,
