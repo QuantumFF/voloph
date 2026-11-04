@@ -8,7 +8,10 @@ Reads the checkout's pretrained checkpoints and writes
     tracknet_v3.onnx    TrackNet   x (N, 27, 288, 512) float32 -> y (N, 8, 288, 512)  sigmoid heatmaps
     inpaintnet_v3.onnx  InpaintNet x (N, 16, 2), m (N, 16, 1) float32 -> y (N, 16, 2)  sigmoid coords
 
-with a dynamic batch dimension (opset 17), then checks each file with ONNX Runtime
+with a dynamic batch dimension (opset 17). TrackNet's first convolution is then
+widened to 28 input channels behind an in-graph zero Pad (pad_input_channels): the
+same arithmetic, but ONNX Runtime's WebGPU provider computes a 27-input-channel
+convolution wrongly (ADR 0021). The input contract stays 27 channels. It then checks each file with ONNX Runtime
 (CPU) against torch on random input at two batch sizes, and prints the SHA-256s for
 src-tauri/models/README.md. The I/O contract is consumed by src-tauri/src/tracknet.rs.
 
@@ -50,6 +53,32 @@ def check(path: Path, model, make_inputs, names, tol: float) -> None:
             sys.exit(f"{path.name}: ONNX output does not match torch (tolerance {tol})")
 
 
+def pad_input_channels(path: Path, to: int) -> None:
+    """Widen the convolution reading input `x` to `to` input channels, in place: a
+    zero-filled Pad of `x` feeds it and its weights gain zero input-channel slices, so
+    every output is the same sum plus zero terms. Works around ONNX Runtime's WebGPU
+    provider computing a 27-input-channel convolution wrongly (ADR 0021)."""
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    m = onnx.load(str(path))
+    g = m.graph
+    convs = [n for n in g.node if n.op_type == "Conv" and n.input[0] == "x"]
+    assert len(convs) == 1, f"expected one Conv reading x, found {len(convs)}"
+    conv = convs[0]
+    inits = {i.name: i for i in g.initializer}
+    w = numpy_helper.to_array(inits[conv.input[1]])
+    extra = to - w.shape[1]
+    assert extra > 0, f"conv already has {w.shape[1]} input channels"
+    w = np.concatenate([w, np.zeros((w.shape[0], extra) + w.shape[2:], w.dtype)], 1)
+    inits[conv.input[1]].CopyFrom(numpy_helper.from_array(w, conv.input[1]))
+    g.initializer.append(helper.make_tensor("x_pad", TensorProto.INT64, [8], [0, 0, 0, 0, 0, extra, 0, 0]))
+    g.node.insert(0, helper.make_node("Pad", ["x", "x_pad"], ["x_padded"], mode="constant"))
+    conv.input[0] = "x_padded"
+    onnx.checker.check_model(m)
+    onnx.save(m, str(path))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tracknet", type=Path, default=Path.home() / ".cache" / "voloph-teacher" / "TrackNetV3")
@@ -86,6 +115,7 @@ def main() -> None:
         input_names=["x"], output_names=["y"], opset_version=17,
         dynamic_axes={"x": {0: "n"}, "y": {0: "n"}}, dynamo=False,
     )
+    pad_input_channels(tn_path, 28)
     check(tn_path, tracknet, lambda n: (torch.rand(n, in_ch, HEIGHT, WIDTH),), ["x"], 1e-4)
 
     print(f"InpaintNet (seq_len {inpaint_len}) -> {ip_path}")

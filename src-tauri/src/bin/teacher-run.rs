@@ -4,8 +4,13 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(e) = tauri_native_lib::eval::teacher_run_cli(args) {
-        eprintln!("teacher-run: {e}");
-        std::process::exit(1);
-    }
+    let code = match tauri_native_lib::eval::teacher_run_cli(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("teacher-run: {e}");
+            1
+        }
+    };
+    // Through gpu::exit: a plain exit segfaults in ONNX Runtime's teardown after WebGPU.
+    tauri_native_lib::gpu::exit(code);
 }

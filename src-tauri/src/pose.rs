@@ -118,15 +118,17 @@ pub struct PoseWindow {
 pub struct PoseEstimator {
     session: Session,
     input_name: String,
+    _in_use: crate::gpu::SessionInUse,
 }
 
 impl PoseEstimator {
     /// Load the vendored RTMPose-t model into an inference session. Errors only when
     /// the model file itself cannot be loaded, never for a missing GPU.
     pub fn load(model_path: &std::path::Path) -> Result<PoseEstimator, String> {
+        crate::gpu::init_environment();
         let session = Session::builder()
             .map_err(|e| format!("ort session builder: {e}"))?
-            .with_execution_providers(detect::gpu_execution_providers())
+            .with_execution_providers(crate::gpu::general_providers())
             .map_err(|e| format!("ort execution providers: {e}"))?
             .with_intra_threads(4)
             .map_err(|e| format!("ort intra threads: {e}"))?
@@ -140,6 +142,7 @@ impl PoseEstimator {
         Ok(PoseEstimator {
             session,
             input_name,
+            _in_use: crate::gpu::SessionInUse::acquire(false),
         })
     }
 

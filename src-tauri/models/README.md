@@ -98,8 +98,12 @@ own `predict.py --eval_mode nonoverlap` runs them offline
   checkpoint zip linked in the project README.
 - **Export:** `scripts/export-tracknet-onnx.py` (torch 2.11, legacy TorchScript
   exporter, opset 17, dynamic batch); it checks each file with ONNX Runtime against
-  torch on random input (max abs difference ~1e-6).
-- **`tracknet_v3.onnx` SHA-256:** `dd80c50e3c2d068ef507925a78ec7e5fe5409a3324d93530b69781e243fae1e7`
+  torch on random input (max abs difference ~1e-6). TrackNet's first convolution
+  is widened to 28 input channels behind an in-graph zero `Pad` of `x` (the same
+  sums plus zero terms; the input stays 27 channels) because ONNX Runtime's WebGPU
+  provider computes a 27-input-channel convolution wrongly (ADR 0021). Against the
+  unpadded export it differs by < 1e-6 on CPU.
+- **`tracknet_v3.onnx` SHA-256:** `f58666df173a461396865d07282e14d7f2cce9238564cf2bd21c5f1d1ea57e1f`
 - **`inpaintnet_v3.onnx` SHA-256:** `40aa41beaf3d15aed95ea31673f540db28f210a1828d8e221384a285ff8283ee`
 
 ### Input / output contract (implemented in `src/tracknet.rs`)

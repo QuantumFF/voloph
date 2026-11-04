@@ -84,8 +84,8 @@ const IN_CH: usize = (SEQ_LEN + 1) * 3;
 const INPAINT_LEN: usize = 16;
 /// TrackNet windows per inference call. Kept modest — the full-resolution U-Net
 /// activations of one window run to hundreds of MB, and the GPU may be shared — and
-/// every call is padded to this size so the CUDA EP never re-tunes its convolutions
-/// for a ragged last batch.
+/// every call is padded to this size so a GPU provider never re-plans its
+/// convolutions for a ragged last batch.
 const TRACKNET_BATCH: usize = 4;
 /// InpaintNet windows per call (a chunk is 225 windows of 16 tiny vectors).
 const INPAINT_BATCH: usize = 64;
@@ -119,15 +119,24 @@ pub struct ShuttleTrack {
     pub points: Vec<ShuttlePoint>,
 }
 
-/// The two loaded networks. Built like [`crate::detect::Detector`]: the GPU execution
-/// providers for this OS are tried ahead of CPU, falling back silently — and, unlike a
-/// bare `ort` fallback, also when a GPU provider *registers* but cannot create the
-/// session (CUDA libraries installed, no usable device).
+/// The two loaded networks. The shuttle tracker's GPU providers for this OS
+/// ([`crate::gpu::shuttle_providers`]: WebGPU on Linux, DirectML on Windows) are tried
+/// ahead of CPU, falling back to CPU when none registers, when one registers but cannot
+/// create the session, or when the GPU's answers fail the once-per-process self-check
+/// against CPU (ADR 0021).
 pub struct ShuttleTracker {
     tracknet: Session,
     inpaintnet: Session,
     provider: String,
+    _in_use: crate::gpu::SessionInUse,
 }
+
+/// Largest TrackNet heatmap difference (sigmoid, 0..1) the GPU may show against CPU on
+/// the self-check input. A healthy GPU agrees to ~1e-6; the WebGPU 27-channel
+/// convolution bug this guards against was off by 0.27.
+const SELF_CHECK_TRACKNET_TOL: f32 = 1e-3;
+/// The same for InpaintNet's sigmoid coordinates.
+const SELF_CHECK_INPAINT_TOL: f32 = 1e-4;
 
 impl ShuttleTracker {
     /// Load both vendored models (see [`crate::detect::vendored_model_file`]).
@@ -140,30 +149,51 @@ impl ShuttleTracker {
     /// Load the two models from explicit paths. `gpu` false builds CPU-only sessions
     /// (the dev CLI's `--cpu`, for timing the fallback path on a GPU machine).
     pub fn load(tracknet: &Path, inpaintnet: &Path, gpu: bool) -> Result<ShuttleTracker, String> {
-        if gpu {
+        let why_cpu = if !gpu {
+            "CPU (forced)".to_string()
+        } else {
             let built = build_session(tracknet, true)
                 .and_then(|t| Ok((t, build_session(inpaintnet, true)?)));
             match built {
-                Ok((tracknet, inpaintnet)) => {
-                    return Ok(ShuttleTracker {
-                        tracknet,
-                        inpaintnet,
-                        provider: probe_execution_provider(),
-                    })
+                Ok((tn, ip)) => {
+                    let provider = probe_execution_provider();
+                    if provider.starts_with("CPU") {
+                        // No GPU provider took: these sessions already run on CPU.
+                        return Ok(ShuttleTracker::new(tn, ip, provider));
+                    }
+                    let mut on_gpu = ShuttleTracker::new(tn, ip, provider);
+                    match self_check_cached(&mut on_gpu, tracknet, inpaintnet) {
+                        Ok(()) => return Ok(on_gpu),
+                        Err(e) => {
+                            log::warn!(
+                                "shuttle tracker: {} failed its self-check against CPU, using CPU: {e}",
+                                on_gpu.provider
+                            );
+                            format!("CPU (GPU self-check failed: {e})")
+                        }
+                    }
                 }
-                Err(e) => log::warn!("shuttle tracker: GPU session failed, using CPU: {e}"),
+                Err(e) => {
+                    log::warn!("shuttle tracker: GPU session failed, using CPU: {e}");
+                    "CPU (GPU session failed)".to_string()
+                }
             }
+        };
+        Ok(ShuttleTracker::new(
+            build_session(tracknet, false)?,
+            build_session(inpaintnet, false)?,
+            why_cpu,
+        ))
+    }
+
+    fn new(tracknet: Session, inpaintnet: Session, provider: String) -> ShuttleTracker {
+        let webgpu = crate::gpu::is_webgpu(&provider);
+        ShuttleTracker {
+            tracknet,
+            inpaintnet,
+            provider,
+            _in_use: crate::gpu::SessionInUse::acquire(webgpu),
         }
-        Ok(ShuttleTracker {
-            tracknet: build_session(tracknet, false)?,
-            inpaintnet: build_session(inpaintnet, false)?,
-            provider: if gpu {
-                "CPU (GPU session failed)"
-            } else {
-                "CPU (forced)"
-            }
-            .to_string(),
-        })
     }
 
     /// The execution provider the sessions run on, for diagnostics: a GPU provider's
@@ -242,10 +272,11 @@ fn build_session(model: &Path, gpu: bool) -> Result<Session, String> {
         .map(|n| n.get())
         .unwrap_or(4)
         .min(8);
+    crate::gpu::init_environment();
     let mut builder = Session::builder().map_err(|e| format!("ort session builder: {e}"))?;
     if gpu {
         builder = builder
-            .with_execution_providers(crate::detect::gpu_execution_providers())
+            .with_execution_providers(crate::gpu::shuttle_providers())
             .map_err(|e| format!("ort execution providers: {e}"))?;
     }
     builder
@@ -258,11 +289,11 @@ fn build_session(model: &Path, gpu: bool) -> Result<Session, String> {
 /// Which execution provider a GPU-enabled session gets on this machine: the name of
 /// the first GPU provider that registers (probed on a throwaway builder with
 /// `error_on_failure`), else `"CPU"` with each GPU provider's registration error (e.g.
-/// a missing CUDA 12 runtime). Diagnostic only — the real sessions keep `ort`'s silent
-/// fallback.
+/// no Vulkan driver). Diagnostic only — the real sessions keep `ort`'s silent fallback.
 pub fn probe_execution_provider() -> String {
+    crate::gpu::init_environment();
     let mut why = Vec::new();
-    for ep in crate::detect::gpu_execution_providers() {
+    for ep in crate::gpu::shuttle_providers() {
         let name = format!("{ep:?}");
         let name = name.split_whitespace().next().unwrap_or("GPU").to_string();
         match Session::builder()
@@ -276,6 +307,113 @@ pub fn probe_execution_provider() -> String {
         "CPU".to_string()
     } else {
         format!("CPU ({})", why.join("; "))
+    }
+}
+
+/// [`self_check`], run once per process per model pair; later loads reuse the verdict.
+fn self_check_cached(
+    on_gpu: &mut ShuttleTracker,
+    tracknet: &Path,
+    inpaintnet: &Path,
+) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Verdicts = Mutex<HashMap<(PathBuf, PathBuf), Result<(), String>>>;
+    static VERDICTS: OnceLock<Verdicts> = OnceLock::new();
+    let key = (tracknet.to_path_buf(), inpaintnet.to_path_buf());
+    let verdicts = VERDICTS.get_or_init(Default::default);
+    if let Some(v) = verdicts.lock().map_err(|e| e.to_string())?.get(&key) {
+        return v.clone();
+    }
+    let started = std::time::Instant::now();
+    let verdict = self_check(on_gpu, tracknet, inpaintnet);
+    log::info!(
+        "shuttle tracker: {} self-check {} in {} ms",
+        on_gpu.provider,
+        if verdict.is_ok() { "passed" } else { "failed" },
+        started.elapsed().as_millis()
+    );
+    verdicts
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(key, verdict.clone());
+    verdict
+}
+
+/// Run both networks on a fixed pseudo-random input on the GPU sessions and on fresh
+/// CPU sessions, and fail when the outputs differ beyond tolerance. A GPU provider can
+/// register, run, and still compute wrong numbers (ONNX Runtime's WebGPU provider did,
+/// for a 27-input-channel convolution — ADR 0021); this keeps such a GPU from silently
+/// corrupting the shuttle track. Costs one CPU TrackNet batch (~1–2 s).
+fn self_check(
+    on_gpu: &mut ShuttleTracker,
+    tracknet: &Path,
+    inpaintnet: &Path,
+) -> Result<(), String> {
+    let mut on_cpu = ShuttleTracker::new(
+        build_session(tracknet, false)?,
+        build_session(inpaintnet, false)?,
+        "CPU".to_string(),
+    );
+    let mut rng = SplitMix64(0x5eed_7ac4);
+    let x: Vec<f32> = (0..IN_CH * PLANE).map(|_| rng.unit()).collect();
+    let d = max_abs_diff(
+        &on_gpu.run_tracknet(x.clone(), 1)?,
+        &on_cpu.run_tracknet(x, 1)?,
+    );
+    if !within(d, SELF_CHECK_TRACKNET_TOL) {
+        return Err(format!("TrackNet output differs by {d:.4}"));
+    }
+    let n = 4;
+    let x: Vec<f32> = (0..n * INPAINT_LEN * 2).map(|_| rng.unit()).collect();
+    let m: Vec<f32> = (0..n * INPAINT_LEN)
+        .map(|_| if rng.unit() < 0.5 { 1.0 } else { 0.0 })
+        .collect();
+    let d = max_abs_diff(
+        &on_gpu.run_inpaintnet(x.clone(), m.clone(), n)?,
+        &on_cpu.run_inpaintnet(x, m, n)?,
+    );
+    if !within(d, SELF_CHECK_INPAINT_TOL) {
+        return Err(format!("InpaintNet output differs by {d:.6}"));
+    }
+    Ok(())
+}
+
+/// The largest elementwise `|a - b|`: infinite when the lengths differ, NaN when any
+/// difference is NaN.
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return f32::INFINITY;
+    }
+    a.iter()
+        .zip(b)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0, |m, d| {
+            if d.is_nan() || m.is_nan() {
+                f32::NAN
+            } else {
+                m.max(d)
+            }
+        })
+}
+
+/// `d` is a real difference no larger than `tol` (NaN and infinity fail).
+fn within(d: f32, tol: f32) -> bool {
+    d.is_finite() && d <= tol
+}
+
+/// A tiny deterministic generator for the self-check input (no `rand` dependency).
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    /// The next value, uniform in `[0, 1)`.
+    fn unit(&mut self) -> f32 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z >> 40) as f32 / (1u64 << 24) as f32
     }
 }
 
@@ -991,5 +1129,32 @@ mod tests {
                 y: 0
             }
         );
+    }
+
+    #[test]
+    fn self_check_tolerance_rejects_wrong_lengths_and_nan() {
+        assert_eq!(max_abs_diff(&[0.1, 0.5], &[0.1, 0.25]), 0.25);
+        assert!(within(max_abs_diff(&[0.1, 0.5], &[0.1, 0.5005]), 1e-3));
+        // The WebGPU 27-channel bug's size of error fails the TrackNet tolerance.
+        assert!(!within(
+            max_abs_diff(&[0.0], &[0.27]),
+            SELF_CHECK_TRACKNET_TOL
+        ));
+        assert!(!within(max_abs_diff(&[0.0, 1.0], &[0.0]), 1.0));
+        assert!(!within(max_abs_diff(&[0.0, 1.0], &[f32::NAN, 1.0]), 1.0));
+        assert!(!within(max_abs_diff(&[f32::NAN, 1.0], &[0.0, 0.0]), 10.0));
+    }
+
+    #[test]
+    fn self_check_input_is_deterministic_and_in_unit_range() {
+        let draw = || {
+            let mut r = SplitMix64(0x5eed_7ac4);
+            (0..1000).map(|_| r.unit()).collect::<Vec<f32>>()
+        };
+        let a = draw();
+        assert_eq!(a, draw());
+        assert!(a.iter().all(|v| (0.0..1.0).contains(v)));
+        let mean = a.iter().sum::<f32>() / a.len() as f32;
+        assert!((mean - 0.5).abs() < 0.05, "mean {mean}");
     }
 }

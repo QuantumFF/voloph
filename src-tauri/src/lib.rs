@@ -7,6 +7,9 @@ pub mod detect;
 /// hand-corrected timelines. Public so the `eval-harness` bin can drive it.
 pub mod eval;
 mod export;
+/// Where the ONNX models run (ADR 0021): per-OS GPU providers, the ONNX Runtime
+/// environment, and a clean exit after WebGPU. Public for the dev CLIs' exit.
+pub mod gpu;
 /// Shared pieces of the learned segmenters (ADR 0019).
 mod learned;
 mod media;
@@ -751,7 +754,7 @@ pub fn run() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([
@@ -849,6 +852,11 @@ pub fn run() {
                 let _ = webview.window().show();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    // Run until the last window closes (Tauri cleans up on the way out), then end the
+    // process through gpu::exit, which avoids ONNX Runtime's crashing static teardown
+    // after WebGPU was used (ADR 0021).
+    let code = app.run_return(|_, _| {});
+    gpu::exit(code);
 }

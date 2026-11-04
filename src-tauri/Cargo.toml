@@ -106,10 +106,16 @@ strip = true      # Ensures debug symbols are removed.
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 glib = "0.18"
-# CUDA execution provider for the occupancy detector (issue #83). A build-time
-# feature only: it lets ort *probe* for an NVIDIA GPU at runtime; with none present
-# ort falls back to CPU silently, so this never becomes a runtime requirement.
-ort = { version = "=2.0.0-rc.10", features = ["cuda"] }
+# WebGPU execution provider for the shuttle tracker (ADR 0021): Dawn over the
+# system's Vulkan driver, so any GPU works with no CUDA install. It links
+# libwebgpu_dawn.so (13 MB), which ort-sys copies beside the build output and the
+# Linux bundles ship (tauri.conf.json `bundle.linux`; rpath in build.rs). Without a
+# usable Vulkan device ort falls back to CPU silently. The detector and pose model
+# stay on CPU on Linux (src/gpu.rs).
+ort = { version = "=2.0.0-rc.10", features = ["webgpu"] }
+# `_exit` for gpu::exit, which skips ONNX Runtime's crashing static teardown when the
+# app quits mid-analysis after using WebGPU.
+libc = "0.2"
 
 # Embedded libmpv playback on Windows (ADR 0014): the same client API, linked
 # from libmpv-2.dll via `raw-dylib` (no import library) and rendered by mpv
