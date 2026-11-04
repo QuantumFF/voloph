@@ -20,7 +20,7 @@
 //! handled exactly as `predict.py` handles one proxy video:
 //! 1. the background is `np.median` over **every** frame of the chunk (the in-memory
 //!    `Shuttlecock_Trajectory_Dataset` path; `max_sample_num` only applies to
-//!    `--large_video`), truncated to `u8` — [`median_frame`];
+//!    `--large_video`), truncated to `u8` — [`MedianAccumulator`];
 //! 2. TrackNet runs on non-overlapping 8-frame windows, the last one padded by
 //!    repeating the chunk's last frame — [`windows`];
 //! 3. each heatmap is thresholded at `> 0.5` and reduced to the centre of the bounding
@@ -44,10 +44,14 @@
 //! windows fall, so the two tracks agree on visibility but not frame-for-frame.
 //!
 //! **Memory.** The median needs every frame of a chunk before the chunk's first window
-//! can run, so up to one chunk of frames (3600 x 442 KB ≈ 1.6 GB) is held at once. The
-//! frame buffers are pooled: as windows of chunk `k` are consumed their buffers go back
-//! to the decoder thread for chunk `k + 1`, so decoding overlaps inference without a
-//! second chunk in memory.
+//! can run. Rather than hold a chunk of frames (3600 x 442 KB ≈ 1.6 GB), the recording
+//! is decoded twice, concurrently, with identical ffmpeg arguments: one decode feeds a
+//! streaming per-pixel histogram (226 MB) that yields each chunk's median one chunk
+//! ahead, the other feeds TrackNet's windows through a small pool of frame buffers.
+//! Decoding at 512x288 runs ~20x real time, far ahead of TrackNet, so the second decode
+//! costs little wall-clock. Each chunk's frame count from the two decodes is checked to
+//! agree. On CPU TrackNet runs one window per call ([`CPU_BATCH`]): the same output,
+//! ~6 % slower, and ~2 GB less of ONNX Runtime's activation memory.
 //!
 //! **Testing (as ADR 0015).** Model quality is judged on real footage (`tracknet-dump`
 //! against the offline CSVs); the pure pieces — median, heatmap → point, inpaint mask,
@@ -82,15 +86,22 @@ const SEQ_LEN: usize = 8;
 const IN_CH: usize = (SEQ_LEN + 1) * 3;
 /// InpaintNet window (its checkpoint's `seq_len`).
 const INPAINT_LEN: usize = 16;
-/// TrackNet windows per inference call. Kept modest — the full-resolution U-Net
-/// activations of one window run to hundreds of MB, and the GPU may be shared — and
-/// every call is padded to this size so a GPU provider never re-plans its
+/// TrackNet windows per inference call on a GPU. Kept modest — the full-resolution
+/// U-Net activations of one window run to hundreds of MB, and the GPU may be shared —
+/// and every call is padded to this size so a GPU provider never re-plans its
 /// convolutions for a ragged last batch.
-const TRACKNET_BATCH: usize = 4;
+const GPU_BATCH: usize = 4;
+/// TrackNet windows per call on CPU: batching buys CPU almost nothing (batch 4 is ~6 %
+/// faster on a 10-minute recording) and nearly doubles peak memory (4.2 GB → 2.3 GB at
+/// one window, before the streaming median); the track is identical either way.
+const CPU_BATCH: usize = 1;
 /// InpaintNet windows per call (a chunk is 225 windows of 16 tiny vectors).
 const INPAINT_BATCH: usize = 64;
-/// Frame buffers in the decode pool: one chunk plus a few batches of read-ahead.
-const POOL_FRAMES: usize = CHUNK_FRAMES + 4 * TRACKNET_BATCH * SEQ_LEN;
+/// Frame buffers in the TrackNet decode's pool: a few GPU batches of read-ahead.
+const POOL_FRAMES: usize = 4 * GPU_BATCH * SEQ_LEN;
+/// Frames the median decode adds to its histogram at a time (one cache-friendly pass
+/// over each band of the histogram per group).
+const MEDIAN_GROUP: usize = 32;
 
 /// One frame of the shuttle track, in TrackNet's 512x288 input pixels. `x == y == 0`
 /// exactly when `visible` is false (TrackNetV3's convention: `Visibility = 0` iff the
@@ -128,6 +139,8 @@ pub struct ShuttleTracker {
     tracknet: Session,
     inpaintnet: Session,
     provider: String,
+    /// TrackNet windows per call: [`GPU_BATCH`] or [`CPU_BATCH`].
+    batch: usize,
     _in_use: crate::gpu::SessionInUse,
 }
 
@@ -188,10 +201,16 @@ impl ShuttleTracker {
 
     fn new(tracknet: Session, inpaintnet: Session, provider: String) -> ShuttleTracker {
         let webgpu = crate::gpu::is_webgpu(&provider);
+        let batch = if provider.starts_with("CPU") {
+            CPU_BATCH
+        } else {
+            GPU_BATCH
+        };
         ShuttleTracker {
             tracknet,
             inpaintnet,
             provider,
+            batch,
             _in_use: crate::gpu::SessionInUse::acquire(webgpu),
         }
     }
@@ -202,18 +221,14 @@ impl ShuttleTracker {
         &self.provider
     }
 
-    /// TrackNet on `n` windows of `IN_CH x HEIGHT x WIDTH` input, padded to
-    /// [`TRACKNET_BATCH`]; returns the `n x SEQ_LEN x HEIGHT x WIDTH` heatmaps.
+    /// TrackNet on `n <= batch` windows of `IN_CH x HEIGHT x WIDTH` input, padded to
+    /// the tracker's batch; returns the `n x SEQ_LEN x HEIGHT x WIDTH` heatmaps.
     fn run_tracknet(&mut self, mut x: Vec<f32>, n: usize) -> Result<Vec<f32>, String> {
         let per = IN_CH * PLANE;
         debug_assert_eq!(x.len(), n * per);
-        x.resize(TRACKNET_BATCH * per, 0.0);
-        let shape = vec![
-            TRACKNET_BATCH as i64,
-            IN_CH as i64,
-            HEIGHT as i64,
-            WIDTH as i64,
-        ];
+        let batch = self.batch.max(n);
+        x.resize(batch * per, 0.0);
+        let shape = vec![batch as i64, IN_CH as i64, HEIGHT as i64, WIDTH as i64];
         let tensor = Tensor::from_array((shape, x)).map_err(|e| format!("ort tensor: {e}"))?;
         let input: SessionInputValue<'_> = tensor.into();
         let outputs = self
@@ -419,45 +434,94 @@ impl SplitMix64 {
 
 // ── Pure pieces (unit-tested against TrackNetV3's Python) ───────────────────────
 
-/// The per-pixel, per-channel median of `frames` (each `FRAME_BYTES`-long RGB), as
-/// `np.median(frames, 0).astype('uint8')`: the middle value for an odd count, the
-/// truncated mean of the two middle values for an even count. Exact, via a 256-bin
-/// histogram per element, computed in row bands across threads.
-pub(crate) fn median_frame(frames: &[&[u8]], frame_bytes: usize) -> Vec<u8> {
-    let n = frames.len();
-    let mut out = vec![0u8; frame_bytes];
-    if n == 0 {
-        return out;
+/// The per-pixel, per-channel median of a stream of frames (each `frame_bytes` long),
+/// as `np.median(frames, 0).astype('uint8')` over every frame added: the middle value
+/// for an odd count, the truncated mean of the two middle values for an even count.
+/// Exact, via a 256-bin histogram per element (`frame_bytes x 256` counts), so frames
+/// need not be kept; groups of frames are added in row bands across threads.
+pub(crate) struct MedianAccumulator {
+    hist: Vec<u16>,
+    frame_bytes: usize,
+    n: usize,
+    /// Elements per thread, a multiple of [`MEDIAN_BAND`].
+    per_thread: usize,
+}
+
+/// Elements per histogram band: one 512 px RGB row (a 768 KB band of counts, which
+/// stays in cache while a group of frames is added to it).
+const MEDIAN_BAND: usize = 1536;
+
+impl MedianAccumulator {
+    pub(crate) fn new(frame_bytes: usize) -> MedianAccumulator {
+        let threads = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(4)
+            .min(8);
+        MedianAccumulator {
+            hist: vec![0u16; frame_bytes * 256],
+            frame_bytes,
+            n: 0,
+            per_thread: frame_bytes.div_ceil(threads).div_ceil(MEDIAN_BAND).max(1) * MEDIAN_BAND,
+        }
     }
-    assert!(n <= u16::MAX as usize, "median over more than 65535 frames");
-    const BAND: usize = 1536; // one 512 px RGB row
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(4)
-        .min(8);
-    let per_thread = frame_bytes.div_ceil(threads).div_ceil(BAND) * BAND;
-    std::thread::scope(|s| {
-        for (t, out_part) in out.chunks_mut(per_thread.max(1)).enumerate() {
-            let base = t * per_thread.max(1);
-            s.spawn(move || {
-                let mut hist = vec![0u16; BAND * 256];
-                for (b, out_band) in out_part.chunks_mut(BAND).enumerate() {
-                    let off = base + b * BAND;
-                    let len = out_band.len();
-                    hist[..len * 256].iter_mut().for_each(|c| *c = 0);
-                    for f in frames {
-                        for (e, &v) in f[off..off + len].iter().enumerate() {
-                            hist[e * 256 + v as usize] += 1;
+
+    /// Frames added since the last [`MedianAccumulator::take_median`].
+    pub(crate) fn len(&self) -> usize {
+        self.n
+    }
+
+    pub(crate) fn add(&mut self, frames: &[&[u8]]) {
+        assert!(
+            self.n + frames.len() <= u16::MAX as usize,
+            "median over more than 65535 frames"
+        );
+        let per = self.per_thread;
+        std::thread::scope(|s| {
+            for (t, part) in self.hist.chunks_mut(per * 256).enumerate() {
+                let base = t * per;
+                s.spawn(move || {
+                    for (b, band) in part.chunks_mut(MEDIAN_BAND * 256).enumerate() {
+                        let off = base + b * MEDIAN_BAND;
+                        let len = band.len() / 256;
+                        for f in frames {
+                            for (e, &v) in f[off..off + len].iter().enumerate() {
+                                band[e * 256 + v as usize] += 1;
+                            }
                         }
                     }
-                    for (e, o) in out_band.iter_mut().enumerate() {
-                        *o = median_of_hist(&hist[e * 256..(e + 1) * 256], n);
-                    }
+                });
+            }
+        });
+        self.n += frames.len();
+    }
+
+    /// The median of every frame added so far; empties the accumulator.
+    pub(crate) fn take_median(&mut self) -> Vec<u8> {
+        let (n, per) = (self.n, self.per_thread);
+        let mut out = vec![0u8; self.frame_bytes];
+        if n > 0 {
+            std::thread::scope(|s| {
+                for (out_part, part) in out.chunks_mut(per).zip(self.hist.chunks_mut(per * 256)) {
+                    s.spawn(move || {
+                        for (o, h) in out_part.iter_mut().zip(part.chunks_mut(256)) {
+                            *o = median_of_hist(h, n);
+                            h.fill(0);
+                        }
+                    });
                 }
             });
         }
-    });
-    out
+        self.n = 0;
+        out
+    }
+}
+
+/// [`MedianAccumulator`] over a slice of frames at once.
+#[cfg(test)]
+pub(crate) fn median_frame(frames: &[&[u8]], frame_bytes: usize) -> Vec<u8> {
+    let mut acc = MedianAccumulator::new(frame_bytes);
+    acc.add(frames);
+    acc.take_median()
 }
 
 /// The median of `n` values given their histogram, as `np.median(...).astype(uint8)`.
@@ -696,30 +760,67 @@ pub fn track_recording_chunked(
     mut on_progress: impl FnMut(i64),
 ) -> Result<ShuttleTrack, String> {
     let first_chunk = first_chunk.max(1);
-    let pool_frames = POOL_FRAMES.max(first_chunk + POOL_FRAMES - CHUNK_FRAMES);
     let duration_s = probe_duration_s(path);
-    let vf = format!("fps={FPS},scale={WIDTH}:{HEIGHT}");
-    let mut child = Command::new(sidecar_path("ffmpeg"))
-        .args([
-            "-v", "error", "-nostats", "-i", path, "-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt",
-            "rgb24", "-",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ffmpeg could not run: {e}"))?;
-    let mut stdout = child.stdout.take().ok_or("ffmpeg gave no stdout")?;
+    // Two decodes of the same stream with the same arguments (see the module doc's
+    // **Memory**): `median_child` feeds the per-chunk background, `frames_child`
+    // TrackNet's windows.
+    let mut frames_child = spawn_frame_decoder(path)?;
+    let mut median_child = match spawn_frame_decoder(path) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = frames_child.kill();
+            let _ = frames_child.wait();
+            return Err(e);
+        }
+    };
+    let (Some(mut frames_out), Some(mut median_out)) =
+        (frames_child.stdout.take(), median_child.stdout.take())
+    else {
+        for c in [&mut frames_child, &mut median_child] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        return Err("ffmpeg gave no stdout".to_string());
+    };
 
-    // Decoder thread: fills pooled frame buffers, hands them over in order.
-    let (filled_tx, filled_rx) = mpsc::sync_channel::<Vec<u8>>(pool_frames);
+    // Median thread: each chunk's background and frame count, one chunk ahead of the
+    // windows (the channel holds one finished median while the next accumulates).
+    let (median_tx, median_rx) = mpsc::sync_channel::<(Vec<u8>, usize)>(1);
+    let median_thread = std::thread::spawn(move || {
+        let mut acc = MedianAccumulator::new(FRAME_BYTES);
+        let mut group: Vec<Vec<u8>> = (0..MEDIAN_GROUP).map(|_| vec![0u8; FRAME_BYTES]).collect();
+        let mut target = first_chunk;
+        loop {
+            let want = MEDIAN_GROUP.min(target - acc.len());
+            let mut got = 0;
+            while got < want && median_out.read_exact(&mut group[got]).is_ok() {
+                got += 1;
+            }
+            let refs: Vec<&[u8]> = group[..got].iter().map(|f| f.as_slice()).collect();
+            acc.add(&refs);
+            let end = got < want; // end of stream (a partial last frame is dropped)
+            if acc.len() == target || (end && acc.len() > 0) {
+                let n = acc.len();
+                if median_tx.send((acc.take_median(), n)).is_err() {
+                    return; // consumer gone
+                }
+                target = CHUNK_FRAMES;
+            }
+            if end {
+                return;
+            }
+        }
+    });
+
+    // Frame thread: fills pooled frame buffers, hands them over in order.
+    let (filled_tx, filled_rx) = mpsc::sync_channel::<Vec<u8>>(POOL_FRAMES);
     let (free_tx, free_rx) = mpsc::channel::<Vec<u8>>();
-    let decoder = std::thread::spawn(move || {
+    let frame_thread = std::thread::spawn(move || {
         let mut allocated = 0usize;
         loop {
             let mut buf = match free_rx.try_recv() {
                 Ok(b) => b,
-                Err(_) if allocated < pool_frames => {
+                Err(_) if allocated < POOL_FRAMES => {
                     allocated += 1;
                     vec![0u8; FRAME_BYTES]
                 }
@@ -728,7 +829,7 @@ pub fn track_recording_chunked(
                     Err(_) => return, // consumer gone
                 },
             };
-            if stdout.read_exact(&mut buf).is_err() || filled_tx.send(buf).is_err() {
+            if frames_out.read_exact(&mut buf).is_err() || filled_tx.send(buf).is_err() {
                 return; // end of stream (a partial last frame is dropped), or consumer gone
             }
         }
@@ -736,44 +837,42 @@ pub fn track_recording_chunked(
 
     let result = (|| -> Result<Vec<ShuttlePoint>, String> {
         let mut points: Vec<ShuttlePoint> = Vec::new();
-        let mut chunk: Vec<Vec<u8>> = Vec::with_capacity(CHUNK_FRAMES);
         let lut = unit_lut();
-        loop {
-            let next = filled_rx.recv().ok();
-            let end = next.is_none();
-            if let Some(f) = next {
-                chunk.push(f);
-            }
-            let target = if points.is_empty() {
-                first_chunk
-            } else {
-                CHUNK_FRAMES
+        while let Ok((median, n)) = median_rx.recv() {
+            let base = points.len();
+            let frames = ChunkFrames {
+                filled: &filled_rx,
+                free: &free_tx,
             };
-            if chunk.len() == target || (end && !chunk.is_empty()) {
-                let base = points.len();
-                let tn = tracknet_chunk(tracker, &mut chunk, &lut, &free_tx, |done| {
-                    on_progress((base + done) as i64 * 1000 / i64::from(FPS))
-                })?;
-                points.extend(inpaint_chunk(&tn, |x, m, n| {
-                    tracker.run_inpaintnet(x, m, n)
-                })?);
-                chunk.clear();
-            }
-            if end {
-                return Ok(points);
-            }
+            let tn = tracknet_chunk(tracker, &median, n, frames, &lut, |done| {
+                on_progress((base + done) as i64 * 1000 / i64::from(FPS))
+            })?;
+            points.extend(inpaint_chunk(&tn, |x, m, n| {
+                tracker.run_inpaintnet(x, m, n)
+            })?);
         }
+        // The median decode has ended; the frame decode must end at the same frame.
+        if filled_rx.recv().is_ok() {
+            return Err("the two decodes of the recording disagree on its length".to_string());
+        }
+        Ok(points)
     })();
 
-    // Unblock the decoder if we bailed out early: it may be waiting to send, for a free
-    // buffer, or on ffmpeg's pipe.
+    // Unblock both decode threads if we bailed out early: they may be waiting to send,
+    // for a free buffer, or on ffmpeg's pipe.
+    drop(median_rx);
     drop(filled_rx);
     drop(free_tx);
     if result.is_err() {
-        let _ = child.kill();
+        let _ = frames_child.kill();
+        let _ = median_child.kill();
     }
-    let _ = decoder.join();
-    let waited = crate::media::wait_ffmpeg(&mut child, "ffmpeg failed to decode frames");
+    let _ = frame_thread.join();
+    let _ = median_thread.join();
+    let waited =
+        crate::media::wait_ffmpeg(&mut frames_child, "ffmpeg failed to decode frames").and(
+            crate::media::wait_ffmpeg(&mut median_child, "ffmpeg failed to decode frames"),
+        );
     let mut points = result?;
     waited?;
     if points.is_empty() {
@@ -801,50 +900,83 @@ pub fn track_recording_chunked(
     })
 }
 
-/// TrackNet over one chunk: median background, non-overlapping padded windows in
-/// batches, each heatmap reduced to a point. Frame buffers are handed back to the
-/// decoder through `free` as soon as their windows are built. `progress` gets the
-/// number of chunk frames done.
+/// The recording at `fps=30,scale=512:288` as raw RGB on the child's stdout.
+fn spawn_frame_decoder(path: &str) -> Result<std::process::Child, String> {
+    let vf = format!("fps={FPS},scale={WIDTH}:{HEIGHT}");
+    Command::new(sidecar_path("ffmpeg"))
+        .args([
+            "-v", "error", "-nostats", "-i", path, "-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt",
+            "rgb24", "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ffmpeg could not run: {e}"))
+}
+
+/// The frame decode's two ends: decoded frames in order, and the pool to return
+/// their buffers to.
+struct ChunkFrames<'a> {
+    filled: &'a mpsc::Receiver<Vec<u8>>,
+    free: &'a mpsc::Sender<Vec<u8>>,
+}
+
+/// TrackNet over one `n`-frame chunk whose background is `median`: non-overlapping
+/// 8-frame windows as [`windows`] lays them out (the last padded by repeating the
+/// chunk's last frame), taken from `frames` as they decode, run in batches of the
+/// tracker's size, each heatmap reduced to a point. Each buffer goes back to the pool
+/// once its window is built. `progress` gets the number of chunk frames done.
 fn tracknet_chunk(
     tracker: &mut ShuttleTracker,
-    chunk: &mut [Vec<u8>],
+    median: &[u8],
+    n: usize,
+    frames: ChunkFrames<'_>,
     lut: &[f32; 256],
-    free: &mpsc::Sender<Vec<u8>>,
     mut progress: impl FnMut(usize),
 ) -> Result<Vec<ShuttlePoint>, String> {
-    let n = chunk.len();
-    let median = {
-        let refs: Vec<&[u8]> = chunk.iter().map(|f| f.as_slice()).collect();
-        median_frame(&refs, FRAME_BYTES)
-    };
     let mut median_planes = Vec::with_capacity(3 * PLANE);
-    push_planes(&mut median_planes, &median, lut);
-
-    let wins = windows(n, SEQ_LEN);
+    push_planes(&mut median_planes, median, lut);
+    let batch = tracker.batch;
     let mut points = Vec::with_capacity(n);
-    for batch in wins.chunks(TRACKNET_BATCH) {
-        let mut x = Vec::with_capacity(TRACKNET_BATCH * IN_CH * PLANE);
-        for win in batch {
-            x.extend_from_slice(&median_planes);
-            for &f in win {
-                push_planes(&mut x, &chunk[f], lut);
+    let mut x = Vec::with_capacity(batch * IN_CH * PLANE);
+    let mut kept_per_window: Vec<usize> = Vec::with_capacity(batch);
+    let mut taken = 0;
+    while taken < n {
+        let kept = SEQ_LEN.min(n - taken);
+        x.extend_from_slice(&median_planes);
+        let mut last = None;
+        for _ in 0..kept {
+            let f = frames
+                .filled
+                .recv()
+                .map_err(|_| "the two decodes of the recording disagree on its length")?;
+            push_planes(&mut x, &f, lut);
+            if let Some(prev) = last.replace(f) {
+                let _ = frames.free.send(prev);
             }
         }
-        // Every frame of these windows is now in `x`: recycle the buffers.
-        for win in batch {
-            for &f in &win[..kept(win)] {
-                let _ = free.send(std::mem::take(&mut chunk[f]));
+        if let Some(f) = last {
+            for _ in kept..SEQ_LEN {
+                push_planes(&mut x, &f, lut);
             }
+            let _ = frames.free.send(f);
         }
-        let y = tracker.run_tracknet(x, batch.len())?;
-        for (b, win) in batch.iter().enumerate() {
-            for f in 0..kept(win) {
-                let off = (b * SEQ_LEN + f) * PLANE;
-                let (px, py) = heatmap_point(&y[off..off + PLANE], WIDTH, HEIGHT);
-                points.push(ShuttlePoint::at(px, py));
+        kept_per_window.push(kept);
+        taken += kept;
+        if kept_per_window.len() == batch || taken == n {
+            let full = std::mem::replace(&mut x, Vec::with_capacity(batch * IN_CH * PLANE));
+            let y = tracker.run_tracknet(full, kept_per_window.len())?;
+            for (b, &k) in kept_per_window.iter().enumerate() {
+                for f in 0..k {
+                    let off = (b * SEQ_LEN + f) * PLANE;
+                    let (px, py) = heatmap_point(&y[off..off + PLANE], WIDTH, HEIGHT);
+                    points.push(ShuttlePoint::at(px, py));
+                }
             }
+            kept_per_window.clear();
+            progress(points.len());
         }
-        progress(points.len());
     }
     Ok(points)
 }
@@ -965,6 +1097,28 @@ mod tests {
         //   -> [3.5, 8.0, 1.5, 150.0] -> [3, 8, 1, 150]
         let d = [0u8, 255, 2, 255];
         assert_eq!(median_frame(&[&a, &b, &c, &d], 4), vec![3, 8, 1, 150]);
+    }
+
+    #[test]
+    fn median_streams_in_groups_and_restarts_after_take() {
+        // Frames added a few at a time give the median of all of them, and
+        // `take_median` empties the accumulator for the next chunk.
+        let frame = |k: usize| -> Vec<u8> {
+            (0..FRAME_BYTES)
+                .map(|e| ((e * 13 + k * k * 7) % 256) as u8)
+                .collect()
+        };
+        let all: Vec<Vec<u8>> = (0..7).map(frame).collect();
+        let refs: Vec<&[u8]> = all.iter().map(|f| f.as_slice()).collect();
+        let mut acc = MedianAccumulator::new(FRAME_BYTES);
+        acc.add(&refs[..3]);
+        acc.add(&refs[3..4]);
+        acc.add(&refs[4..]);
+        assert_eq!(acc.len(), 7);
+        assert_eq!(acc.take_median(), median_frame(&refs, FRAME_BYTES));
+        assert_eq!(acc.len(), 0);
+        acc.add(&refs[2..4]);
+        assert_eq!(acc.take_median(), median_frame(&refs[2..4], FRAME_BYTES));
     }
 
     #[test]
