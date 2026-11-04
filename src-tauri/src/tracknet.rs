@@ -152,10 +152,10 @@ const SELF_CHECK_TRACKNET_TOL: f32 = 1e-3;
 const SELF_CHECK_INPAINT_TOL: f32 = 1e-4;
 
 impl ShuttleTracker {
-    /// Load both vendored models (see [`crate::detect::vendored_model_file`]).
+    /// Load both vendored models (see [`crate::gpu::vendored_model_file`]).
     pub fn load_vendored() -> Result<ShuttleTracker, String> {
-        let tn = crate::detect::vendored_model_file("tracknet_v3.onnx", "TrackNet")?;
-        let ip = crate::detect::vendored_model_file("inpaintnet_v3.onnx", "InpaintNet")?;
+        let tn = crate::gpu::vendored_model_file("tracknet_v3.onnx", "TrackNet")?;
+        let ip = crate::gpu::vendored_model_file("inpaintnet_v3.onnx", "InpaintNet")?;
         ShuttleTracker::load(&tn, &ip, true)
     }
 
@@ -287,18 +287,13 @@ fn build_session(model: &Path, gpu: bool) -> Result<Session, String> {
         .map(|n| n.get())
         .unwrap_or(4)
         .min(8);
-    crate::gpu::init_environment();
-    let mut builder = Session::builder().map_err(|e| format!("ort session builder: {e}"))?;
-    if gpu {
-        builder = builder
-            .with_execution_providers(crate::gpu::shuttle_providers())
-            .map_err(|e| format!("ort execution providers: {e}"))?;
-    }
-    builder
-        .with_intra_threads(threads)
-        .map_err(|e| format!("ort intra threads: {e}"))?
-        .commit_from_file(model)
-        .map_err(|e| format!("ort could not load {}: {e}", model.display()))
+    // No providers is plain CPU, the reference the GPU's answers are checked against.
+    let providers = if gpu {
+        crate::gpu::shuttle_providers()
+    } else {
+        Vec::new()
+    };
+    crate::gpu::build_session(model, providers, threads)
 }
 
 /// Which execution provider a GPU-enabled session gets on this machine: the name of
@@ -306,12 +301,11 @@ fn build_session(model: &Path, gpu: bool) -> Result<Session, String> {
 /// `error_on_failure`), else `"CPU"` with each GPU provider's registration error (e.g.
 /// no Vulkan driver). Diagnostic only — the real sessions keep `ort`'s silent fallback.
 pub fn probe_execution_provider() -> String {
-    crate::gpu::init_environment();
     let mut why = Vec::new();
     for ep in crate::gpu::shuttle_providers() {
         let name = format!("{ep:?}");
         let name = name.split_whitespace().next().unwrap_or("GPU").to_string();
-        match Session::builder()
+        match crate::gpu::session_builder()
             .and_then(|b| b.with_execution_providers([ep.clone().error_on_failure()]))
         {
             Ok(_) => return name,
@@ -1045,8 +1039,8 @@ pub fn dump_cli(args: Vec<String>) -> Result<(), String> {
     let (tn, ip) = match &models {
         Some(dir) => (dir.join("tracknet_v3.onnx"), dir.join("inpaintnet_v3.onnx")),
         None => (
-            crate::detect::vendored_model_file("tracknet_v3.onnx", "TrackNet")?,
-            crate::detect::vendored_model_file("inpaintnet_v3.onnx", "InpaintNet")?,
+            crate::gpu::vendored_model_file("tracknet_v3.onnx", "TrackNet")?,
+            crate::gpu::vendored_model_file("inpaintnet_v3.onnx", "InpaintNet")?,
         ),
     };
     let mut tracker = ShuttleTracker::load(&tn, &ip, !cpu)?;

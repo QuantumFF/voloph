@@ -7,6 +7,7 @@ mod annotations;
 mod bundle;
 mod capture_day;
 mod carry;
+mod draft;
 mod library;
 mod scan;
 mod schema;

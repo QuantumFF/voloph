@@ -120,6 +120,16 @@ export const NO_PADDING: Padding = { lead_ms: 0, tail_ms: 0 }
 export const DEFAULT_PADDING: Padding = { lead_ms: 1000, tail_ms: 1500 }
 
 /**
+ * Where a strict rally's padded lead-in opens, recording-local: `pad.lead_ms`
+ * before its start, never before the start of its own recording (#104). The one
+ * place the lead-in is clamped — play intervals, session lead-ins and the moment
+ * browser's jump all read it.
+ */
+export function leadInMs(startMs: number, pad: Padding): number {
+  return Math.max(0, startMs - pad.lead_ms)
+}
+
+/**
  * The intervals playback actually plays: each strict rally widened by `pad`,
  * clamped to the recording, and merged where the padding makes neighbours
  * overlap. Input and output are start-ascending. A merged interval keeps the first
@@ -132,7 +142,7 @@ export function playIntervals(
 ): Rally[] {
   const out: Rally[] = []
   for (const r of rallies) {
-    const start = Math.max(0, r.start_ms - pad.lead_ms)
+    const start = leadInMs(r.start_ms, pad)
     const padded = r.end_ms + pad.tail_ms
     const end = durationMs != null ? Math.min(durationMs, padded) : padded
     const last = out[out.length - 1]
@@ -153,7 +163,54 @@ export function playIntervals(
  */
 export function rallyLeadInMs(r: SessionRally, pad: Padding): number {
   const recordingStart = r.globalStart - r.localStart
-  return Math.max(recordingStart, r.globalStart - pad.lead_ms)
+  return recordingStart + leadInMs(r.localStart, pad)
+}
+
+/** A play interval (see `playIntervals`) lifted onto the session-global axis. */
+export interface SessionPlayInterval {
+  recordingIndex: number
+  globalStart: number
+  globalEnd: number
+}
+
+/**
+ * The whole session's play intervals on the session axis (#104): every placed
+ * recording's `playIntervals` — its strict rallies padded, clamped to *that*
+ * recording and merged where they overlap — offset onto the strip. A rally's
+ * tail never spills into the next recording, nor its lead-in into the previous
+ * one, so a moment just past a recording's end is the next recording's gap, not
+ * the last rally's tail. Ascending; intervals never cross a recording boundary.
+ */
+export function sessionPlayIntervals(
+  session: SessionModel,
+  pad: Padding
+): SessionPlayInterval[] {
+  const out: SessionPlayInterval[] = []
+  for (const seg of session.segments) {
+    if (seg.durationMs == null || !seg.timeline) continue
+    for (const r of playIntervals(seg.timeline.rallies, pad, seg.durationMs)) {
+      out.push({
+        recordingIndex: seg.index,
+        globalStart: seg.offsetMs + r.start_ms,
+        globalEnd: seg.offsetMs + r.end_ms,
+      })
+    }
+  }
+  return out
+}
+
+/**
+ * Whether session-global `globalMs` is in a padded play interval — playback
+ * would play it rather than skip it. Half-open, like a rally: an interval's end
+ * is already outside it.
+ */
+export function inPlayInterval(
+  intervals: SessionPlayInterval[],
+  globalMs: number
+): boolean {
+  return intervals.some(
+    (i) => globalMs >= i.globalStart && globalMs < i.globalEnd
+  )
 }
 
 /** Result of the `recording_timeline` command (see `src-tauri/src/db.rs`). */
@@ -299,6 +356,65 @@ export interface SessionRally {
   confidence: number
   /** Whether the user flagged this rally as one that matters (issue #10). */
   flagged: boolean
+}
+
+/**
+ * A rally's stable identity across re-renders and timeline refreshes: row ids
+ * are only unique within their recording, so the key pairs the id with the path.
+ */
+export function rallyKey(r: Pick<SessionRally, "path" | "id">): string {
+  return `${r.path}:${r.id}`
+}
+
+/**
+ * Whether session-global `globalMs` falls inside a rally's strict span — the
+ * half-open `[globalStart, globalEnd)`, so the instant a rally ends belongs to
+ * the gap after it. The one "rally containing this moment" rule (glossary: a
+ * rally owns the annotations in its span); padding never widens it, so the
+ * playhead in a lead-in or tail is in no rally.
+ */
+export function rallyContains(r: SessionRally, globalMs: number): boolean {
+  return globalMs >= r.globalStart && globalMs < r.globalEnd
+}
+
+/**
+ * The index of the rally containing session-global `globalMs` (the first, if
+ * hand edits made rallies overlap), or -1 in a gap.
+ */
+export function rallyIndexAt(
+  rallies: SessionRally[],
+  globalMs: number
+): number {
+  return rallies.findIndex((r) => rallyContains(r, globalMs))
+}
+
+/** The rally containing session-global `globalMs`, or `null` in a gap. */
+export function rallyAt(
+  rallies: SessionRally[],
+  globalMs: number
+): SessionRally | null {
+  return rallies[rallyIndexAt(rallies, globalMs)] ?? null
+}
+
+/**
+ * Each annotation grouped under the rally that owns it (`rallyAt` its moment),
+ * keyed by `rallyKey`. Annotations in a gap belong to no rally and are dropped;
+ * each group keeps the input order.
+ */
+export function annotationsByRally(
+  rallies: SessionRally[],
+  annotations: SessionAnnotation[]
+): Map<string, SessionAnnotation[]> {
+  const out = new Map<string, SessionAnnotation[]>()
+  for (const a of annotations) {
+    const rally = rallyAt(rallies, a.globalMs)
+    if (!rally) continue
+    const key = rallyKey(rally)
+    const group = out.get(key)
+    if (group) group.push(a)
+    else out.set(key, [a])
+  }
+  return out
 }
 
 /** The whole session stitched onto one continuous axis. */
@@ -680,4 +796,43 @@ export function mergeRallyEdit(
       { command: "delete_rally", path: first.path, rallyId: second.id },
     ],
   }
+}
+
+/** What the split/merge controls may do for an edit target (see `editAffordances`). */
+export interface EditAffordances {
+  /** The rally an edit acts on, or `null` when there is none. */
+  target: SessionRally | null
+  /** The rally a merge folds into `target`: the next one, same recording only. */
+  mergeTarget: SessionRally | null
+  /** Whether splitting `target` at the playhead would be accepted. */
+  canSplit: boolean
+  /** Whether merging `target` with `mergeTarget` would be accepted. */
+  canMerge: boolean
+}
+
+/**
+ * Which inline edits the rally at `targetIndex` affords right now (issue #7):
+ * split at the session-global playhead, and merge with the next rally. Read off
+ * `splitRallyEdit`/`mergeRallyEdit` themselves, so a control is enabled exactly
+ * when its edit would pass the integrity guards — the hotkeys and the toolbar
+ * both ask here. `targetIndex` -1 (no target) affords nothing.
+ */
+export function editAffordances(
+  rallies: SessionRally[],
+  targetIndex: number,
+  playheadMs: number | null
+): EditAffordances {
+  const target = rallies[targetIndex] ?? null
+  if (!target) {
+    return { target, mergeTarget: null, canSplit: false, canMerge: false }
+  }
+  const next = rallies[targetIndex + 1] ?? null
+  const mergeTarget =
+    next && mergeRallyEdit(target, next).kind === "ops" ? next : null
+  // The rally's own recording offset: its global start minus its local one.
+  const offset = target.globalStart - target.localStart
+  const canSplit =
+    playheadMs !== null &&
+    splitRallyEdit(target, playheadMs, offset).kind === "ops"
+  return { target, mergeTarget, canSplit, canMerge: mergeTarget !== null }
 }

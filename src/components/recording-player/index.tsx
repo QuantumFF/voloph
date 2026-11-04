@@ -12,10 +12,14 @@ import {
   buildSessionAnnotations,
   buildSessionModel,
   clamp,
+  editAffordances,
+  leadInMs,
+  rallyContains,
+  rallyIndexAt,
+  rallyKey,
   rallyLeadInMs,
   type PlaylistRecording,
   type SessionModel,
-  type SessionRally,
   type Verdict,
 } from "@/components/recording-player-transport"
 import { useMpvSurface } from "@/components/use-mpv-surface"
@@ -59,11 +63,12 @@ interface RecordingPlayerProps {
   /** Index of the recording to open first (defaults to the session's start). */
   startIndex?: number
   /**
-   * Recording-local time (ms) to open the first recording at — a jump from the
-   * cross-session filter to a specific moment (issue #11). Omitted for a normal
-   * session review, which starts from the first rally.
+   * Recording-local strict start (ms) of the rally to open the first recording
+   * on — a jump from the cross-session filter to a specific moment (issue #11).
+   * Playback opens on its padded lead-in (#104). Omitted for a normal session
+   * review, which starts from the first rally.
    */
-  startMs?: number
+  rallyStartMs?: number
   /** The session's capture day, shown in the top bar. */
   day?: string
   /** Return to the session list. */
@@ -96,7 +101,7 @@ interface RecordingPlayerProps {
 export function RecordingPlayer({
   recordings,
   startIndex = 0,
-  startMs,
+  rallyStartMs,
   day,
   onBack,
 }: RecordingPlayerProps) {
@@ -137,7 +142,6 @@ export function RecordingPlayer({
     () => buildSessionModel(recordings, timelines),
     [recordings, timelines]
   )
-  const rallyKey = useCallback((r: SessionRally) => `${r.path}:${r.id}`, [])
 
   // Offset of a recording on the session axis (0 if it isn't placed yet).
   const segmentOffset = useCallback(
@@ -167,7 +171,8 @@ export function RecordingPlayer({
   } = useSessionPlayback({
     recordings,
     startIndex,
-    startMs,
+    // Read once, at mount: the jump opens on the rally's lead-in.
+    startMs: rallyStartMs != null ? leadInMs(rallyStartMs, padding) : undefined,
     timelines,
     session,
     segmentOffset,
@@ -250,10 +255,7 @@ export function RecordingPlayer({
   const currentRallyIndex =
     globalPlayheadMs == null
       ? -1
-      : session.rallies.findIndex(
-          (r) =>
-            globalPlayheadMs >= r.globalStart && globalPlayheadMs < r.globalEnd
-        )
+      : rallyIndexAt(session.rallies, globalPlayheadMs)
   const currentRally =
     currentRallyIndex >= 0 ? session.rallies[currentRallyIndex] : null
   const selectedIndex = session.rallies.findIndex(
@@ -261,21 +263,17 @@ export function RecordingPlayer({
   )
   const selectedRally =
     selectedIndex >= 0 ? session.rallies[selectedIndex] : null
-  const editTargetIndex = selectedIndex >= 0 ? selectedIndex : currentRallyIndex
-  const editTarget = selectedRally ?? currentRally
-  const mergeTarget =
-    editTarget && editTargetIndex >= 0
-      ? (session.rallies[editTargetIndex + 1] ?? null)
-      : null
-  const canSplitEditTarget =
-    editTarget !== null &&
-    globalPlayheadMs !== null &&
-    globalPlayheadMs > editTarget.globalStart &&
-    globalPlayheadMs < editTarget.globalEnd
-  const canMergeEditTarget =
-    editTarget !== null &&
-    mergeTarget !== null &&
-    mergeTarget.recordingIndex === editTarget.recordingIndex
+  // The hotkeys edit the selected rally, else the one under the playhead.
+  const {
+    target: editTarget,
+    mergeTarget,
+    canSplit: canSplitEditTarget,
+    canMerge: canMergeEditTarget,
+  } = editAffordances(
+    session.rallies,
+    selectedIndex >= 0 ? selectedIndex : currentRallyIndex,
+    globalPlayheadMs
+  )
 
   const toggleTimelineEditing = useCallback(() => {
     setEditing((e) => {
@@ -383,10 +381,8 @@ export function RecordingPlayer({
   // (glossary: a rally owns the annotations in its span), for the inspector.
   const rallyAnnotations = useMemo(() => {
     if (!currentRally) return []
-    return sessionAnnotations.filter(
-      (a) =>
-        a.globalMs >= currentRally.globalStart &&
-        a.globalMs < currentRally.globalEnd
+    return sessionAnnotations.filter((a) =>
+      rallyContains(currentRally, a.globalMs)
     )
   }, [currentRally, sessionAnnotations])
 

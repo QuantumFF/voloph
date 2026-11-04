@@ -22,12 +22,16 @@ import {
 } from "@/components/ui/dropdown-menu"
 
 import type { Padding } from "@/components/recording-player-transport"
+
 import {
   describePadding,
   PADDING_PRESETS,
+  paddingForPreset,
   paddingPresetId,
-} from "@/components/recording-player/use-playback-padding"
-
+  SEGMENTERS,
+  segmenterId,
+  type SegmenterId,
+} from "./library-settings"
 import { kindLabel } from "./recording-state"
 import type { Library } from "./types"
 
@@ -63,8 +67,9 @@ export function LibraryHeader({
   scanning: boolean
   refreshing: boolean
   reanalyzingAll: boolean
-  segmenter: string
-  onSegmenter: (id: string) => void
+  /** Null when the backend names a segmenter the menu doesn't list. */
+  segmenter: SegmenterId | null
+  onSegmenter: (id: SegmenterId) => void
   padding: Padding
   onPadding: (padding: Padding) => void
   onBrowse: () => void
@@ -197,36 +202,24 @@ export function LibraryHeader({
                 their timelines. */}
             <DropdownMenuLabel>Rally detection</DropdownMenuLabel>
             <DropdownMenuRadioGroup
-              value={segmenter}
-              onValueChange={onSegmenter}
+              value={segmenter ?? ""}
+              onValueChange={(value) => {
+                const id = segmenterId(value)
+                if (id) onSegmenter(id)
+              }}
             >
-              <DropdownMenuRadioItem
-                value="student"
-                className="flex-col items-start gap-0"
-              >
-                <span>Standard</span>
-                <span className="text-xs text-muted-foreground">
-                  Fast on any computer
-                </span>
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem
-                value="teacher"
-                className="flex-col items-start gap-0"
-              >
-                <span>Precise</span>
-                <span className="text-xs text-muted-foreground">
-                  Tracks the shuttle; best with a GPU
-                </span>
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem
-                value="v6"
-                className="flex-col items-start gap-0"
-              >
-                <span>Classic</span>
-                <span className="text-xs text-muted-foreground">
-                  Catches more very short rallies, but invents more
-                </span>
-              </DropdownMenuRadioItem>
+              {SEGMENTERS.map((s) => (
+                <DropdownMenuRadioItem
+                  key={s.id}
+                  value={s.id}
+                  className="flex-col items-start gap-0"
+                >
+                  <span>{s.label}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {s.hint}
+                  </span>
+                </DropdownMenuRadioItem>
+              ))}
             </DropdownMenuRadioGroup>
             {/* Clip padding (ADR 0020): rallies are stored strict, serve to
                 landing; playback and export add this lead-in and tail. One
@@ -236,13 +229,8 @@ export function LibraryHeader({
             <DropdownMenuRadioGroup
               value={paddingPresetId(padding)}
               onValueChange={(id) => {
-                const preset = PADDING_PRESETS.find((p) => p.id === id)
-                if (preset) {
-                  onPadding({
-                    lead_ms: preset.lead_ms,
-                    tail_ms: preset.tail_ms,
-                  })
-                }
+                const next = paddingForPreset(id)
+                if (next) onPadding(next)
               }}
             >
               {PADDING_PRESETS.map((p) => (

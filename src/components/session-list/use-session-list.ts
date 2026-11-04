@@ -13,6 +13,11 @@ import {
   remainingByRecording as deriveRemaining,
   type AnalysisProgress,
 } from "./analysis-progress"
+import {
+  DEFAULT_SEGMENTER,
+  segmenterId,
+  type SegmenterId,
+} from "./library-settings"
 import { isProcessing } from "./recording-state"
 import type {
   Browsing,
@@ -45,8 +50,10 @@ export function useSessionList(rescanOnMount: boolean) {
   const [reanalyzingAll, setReanalyzingAll] = useState(false)
   // Which segmenter draws the active library's drafts (ADR 0019): "student" (the
   // learned default), "teacher" (the accurate, GPU-hungry one) or "v6" (the
-  // classic heuristic).
-  const [segmenter, setSegmenter] = useState<string>("student")
+  // classic heuristic). Null when the backend names one this build doesn't know.
+  const [segmenter, setSegmenter] = useState<SegmenterId | null>(
+    DEFAULT_SEGMENTER
+  )
   // The lead-in and tail playback and export add around each rally (ADR 0020);
   // one app-wide setting, not per library.
   const padding = usePlaybackPadding()
@@ -126,7 +133,7 @@ export function useSessionList(rescanOnMount: boolean) {
       setCarryOffers(offers)
       setSharerLabel(label ?? "")
       setBundleOffers(bundles)
-      setSegmenter(seg)
+      setSegmenter(segmenterId(seg))
     } catch (e) {
       setError(String(e))
     }
@@ -436,7 +443,7 @@ export function useSessionList(rescanOnMount: boolean) {
   // Switch the active library's segmenter (ADR 0019). Untouched recordings another
   // segmenter drew are re-analyzed in the background; hand-edited ones keep their
   // timelines, so no confirmation is needed.
-  function handleSegmenter(id: string) {
+  function handleSegmenter(id: SegmenterId) {
     return guard(async () => {
       await trackedInvoke<number>("set_active_segmenter", { segmenter: id })
       setSegmenter(id)

@@ -16,7 +16,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::{is_hand_touched, library_path_of, parse_waveform, waveform_to_json};
+use super::draft::{is_analysis_file_of, write_draft, DraftStamp};
+use super::{is_hand_touched, library_path_of, parse_waveform};
 
 /// The on-disk Analysis format tag and current version — the `format`/`version`
 /// envelope (like `.vbundle`) that keeps the file backward-readable across format
@@ -51,53 +52,18 @@ pub struct Analysis {
     pub rallies: Vec<AnalysisRally>,
 }
 
-/// The Analysis file's name in `.voloph/analysis/` for a given segmenter version
-/// (ADR 0013/0015). The base is quick hash + file size — the recording's existing
-/// content-key identity, surviving renames and moves and deduping copies. Version 1
-/// keeps the bare `{key}.vanalysis` name it has always used, so older Voloph builds
-/// (segmenter v1) still find and adopt it; a newer version gets a `_s{N}` suffix so
-/// it is **published alongside** the stale one rather than overwriting it — nothing
-/// in shared storage is ever deleted, and adoption prefers the highest version.
-pub(crate) fn analysis_file_name(
-    quick_hash: &str,
-    file_size: i64,
-    segmenter_version: u32,
-) -> String {
-    if segmenter_version <= 1 {
-        format!("{quick_hash}_{file_size}.vanalysis")
-    } else {
-        format!("{quick_hash}_{file_size}_s{segmenter_version}.vanalysis")
-    }
-}
-
-/// The Analysis file name for any segmenter (ADR 0019). v6 keeps
-/// [`analysis_file_name`]'s names, so older builds still find their files; a learned
-/// segmenter publishes as `{key}.{id}{N}.vanalysis` — a name older builds' `{key}_s*`
-/// match never picks up, so they cannot mistake a student draft for a v6 one.
-pub(crate) fn analysis_file_name_for(
-    quick_hash: &str,
-    file_size: i64,
-    segmenter: &str,
-    version: u32,
-) -> String {
-    if segmenter == "v6" {
-        analysis_file_name(quick_hash, file_size, version)
-    } else {
-        format!("{quick_hash}_{file_size}.{segmenter}{version}.vanalysis")
-    }
-}
-
 fn v6_id() -> String {
-    "v6".to_string()
+    crate::segment::Segmenter::V6.id().to_string()
 }
 
-/// The content-key filename prefix shared by every version's Analysis for one
-/// recording — the base `{quick_hash}_{file_size}` (ADR 0013/0015). Used to
-/// enumerate all published versions of a recording's Analysis when adopting the
-/// highest one; anything after this prefix is either `.vanalysis` (v1) or
-/// `_s{N}.vanalysis` (a later version).
-fn analysis_key_prefix(quick_hash: &str, file_size: i64) -> String {
-    format!("{quick_hash}_{file_size}")
+impl Analysis {
+    /// Which segmenter drew this Analysis's draft (ADR 0019).
+    pub fn stamp(&self) -> DraftStamp {
+        DraftStamp {
+            id: self.segmenter.clone(),
+            version: self.segmenter_version,
+        }
+    }
 }
 
 struct AnalysisRow {
@@ -180,19 +146,19 @@ fn analysis_of_impl(
         }
     };
 
+    // The segmenter that actually drew this draft (ADR 0013/0019), so the published
+    // file names and describes itself honestly — a draft adopted from an older
+    // Analysis republishes as that older version, not as the active one. A `ready`
+    // row with no stamp (pre-versioning, or registered from a bundle or a carried
+    // copy, which never stamp — and never set an id either) counts as current v6,
+    // as the stale path counts it.
+    let stamp = DraftStamp::from_row(row.segmenter_id, row.segmenter_version)
+        .unwrap_or_else(|| DraftStamp::of(crate::segment::Segmenter::V6));
     let analysis = Analysis {
         format: ANALYSIS_FORMAT.to_string(),
         version: ANALYSIS_VERSION,
-        segmenter: row.segmenter_id.unwrap_or_else(v6_id),
-        // The version that actually produced this draft (ADR 0013/0015), so the
-        // published file names and describes itself honestly — a draft adopted from
-        // an older Analysis republishes as that older version, not as the active one.
-        // A row with no stamp (only unsegmented rows, which never reach here) falls
-        // back to the active version.
-        segmenter_version: row
-            .segmenter_version
-            .map(|v| v as u32)
-            .unwrap_or(crate::segment::SEGMENTER_VERSION),
+        segmenter: stamp.id,
+        segmenter_version: stamp.version,
         capture_day: row.capture_day,
         duration_ms: row.duration_ms,
         waveform: parse_waveform(row.waveform_json.as_deref()),
@@ -216,12 +182,7 @@ pub fn publish_analysis(conn: &Connection, id: i64) {
         return; // shared library not designated on this device
     };
     let dir = Path::new(&root).join(".voloph").join("analysis");
-    let name = analysis_file_name_for(
-        &quick_hash,
-        file_size,
-        &analysis.segmenter,
-        analysis.segmenter_version,
-    );
+    let name = analysis.stamp().file_name(&quick_hash, file_size);
     if let Err(e) = write_analysis(&dir, &name, &analysis) {
         // Silent to the user (ADR 0013): the analysis is already in the DB.
         log::warn!("analysis: could not publish {name}: {e}");
@@ -286,12 +247,7 @@ pub fn publish_missing_analyses(conn: &Connection) {
         // stale one under its own name rather than checking for any file — so a bump
         // backfills the superseding file without touching the older sibling. Present
         // and readable → leave it alone; missing or unreadable (truncated) → rewrite.
-        let name = analysis_file_name_for(
-            &quick_hash,
-            file_size,
-            &analysis.segmenter,
-            analysis.segmenter_version,
-        );
+        let name = analysis.stamp().file_name(&quick_hash, file_size);
         if read_analysis_file(&dir.join(&name)).is_some() {
             continue;
         }
@@ -350,27 +306,16 @@ fn read_best_analysis(
     segmenter: crate::segment::Segmenter,
 ) -> Option<Analysis> {
     let dir = Path::new(root).join(".voloph").join("analysis");
-    let prefix = analysis_key_prefix(quick_hash, file_size);
     let mut best: Option<Analysis> = None;
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Match this recording's content key exactly: either the bare v1 name or a
-        // `_s{N}` versioned sibling. The `_` guard stops `<hash>_<size>` from also
-        // matching a longer size that happens to start with these digits.
-        // A learned segmenter's file is `{prefix}.{id}{N}.vanalysis` (ADR 0019).
-        let is_ours = name == format!("{prefix}.vanalysis")
-            || (name.starts_with(&format!("{prefix}_s"))
-                || name.starts_with(&format!("{prefix}.")))
-                && name.ends_with(".vanalysis");
-        if !is_ours {
+        if !is_analysis_file_of(&entry.file_name().to_string_lossy(), quick_hash, file_size) {
             continue;
         }
         let Some(analysis) = read_analysis_file(&entry.path()) else {
             continue;
         };
-        if analysis.segmenter != segmenter.id() || analysis.segmenter_version < segmenter.version()
-        {
+        // The file's own stamp decides, not its name.
+        if !analysis.stamp().is_current_for(segmenter) {
             continue;
         }
         if best
@@ -425,33 +370,25 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
         let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size, segmenter) else {
             continue;
         };
-        tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO rallies (recording_id, start_ms, end_ms, confidence)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for r in &analysis.rallies {
-                stmt.execute(rusqlite::params![id, r.start_ms, r.end_ms, r.confidence])?;
-            }
-        }
+        // Carry the Analysis's stamp onto the row (#80, ADR 0019) so a later bump or
+        // switch can tell an adopted draft is stale exactly as it tells a locally
+        // drawn one — and so republishing this draft names itself by who made it.
+        write_draft(
+            tx,
+            id,
+            &analysis.stamp(),
+            analysis.duration_ms,
+            &analysis.waveform,
+            analysis
+                .rallies
+                .iter()
+                .map(|r| (r.start_ms, r.end_ms, r.confidence)),
+        )?;
         // Playable straight away, like a bundle-registered recording: the draft came
         // from the Analysis, so probe + segment are both satisfied (ADR 0008/0013).
-        // Carry the Analysis's segmenter version onto the row (#80) so a later bump
-        // can tell an adopted draft is stale exactly as it tells a locally produced
-        // one — and so republishing this draft names itself by the version that made it.
         tx.execute(
-            "UPDATE recordings
-             SET probe_state = 'ready', segment_state = 'ready', duration_ms = ?1, waveform = ?2,
-                 segmenter_version = ?3, segmenter_id = ?4
-             WHERE id = ?5",
-            rusqlite::params![
-                analysis.duration_ms,
-                waveform_to_json(&analysis.waveform),
-                analysis.segmenter_version,
-                analysis.segmenter,
-                id
-            ],
+            "UPDATE recordings SET probe_state = 'ready' WHERE id = ?1",
+            [id],
         )?;
     }
     Ok(())
@@ -479,14 +416,15 @@ mod tests {
                 confidence: 0.9,
             }],
         };
-        let name = analysis_file_name("abc123", 4242, 1);
+        let v6 = |version| DraftStamp {
+            id: "v6".to_string(),
+            version,
+        };
+        let name = v6(1).file_name("abc123", 4242);
         assert_eq!(name, "abc123_4242.vanalysis");
         // A later segmenter version is published alongside under a `_s{N}` name so
         // it never overwrites the v1 sibling (ADR 0013/0015).
-        assert_eq!(
-            analysis_file_name("abc123", 4242, 2),
-            "abc123_4242_s2.vanalysis"
-        );
+        assert_eq!(v6(2).file_name("abc123", 4242), "abc123_4242_s2.vanalysis");
 
         write_analysis(&dir, &name, &analysis).unwrap();
 
@@ -503,5 +441,129 @@ mod tests {
         assert!(leftovers.is_empty(), "a temp file was left behind");
 
         std::fs::remove_dir_all(&tmpdir).ok();
+    }
+
+    /// Every Analysis file name a build publishes (ADR 0013/0019). These live in
+    /// users' shared folders and older builds look for them by name, so any change
+    /// here strands published drafts.
+    #[test]
+    fn analysis_file_names_are_pinned() {
+        let cases = [
+            ("v6", 0, "abc_42.vanalysis"),
+            ("v6", 1, "abc_42.vanalysis"),
+            ("v6", 2, "abc_42_s2.vanalysis"),
+            ("v6", 6, "abc_42_s6.vanalysis"),
+            ("v6", 7, "abc_42_s7.vanalysis"),
+            ("v6", 12, "abc_42_s12.vanalysis"),
+            ("student", 1, "abc_42.student1.vanalysis"),
+            ("student", 2, "abc_42.student2.vanalysis"),
+            ("teacher", 1, "abc_42.teacher1.vanalysis"),
+            // An id written by a newer build republishes under its own name.
+            ("coach", 3, "abc_42.coach3.vanalysis"),
+        ];
+        for (id, version, want) in cases {
+            assert_eq!(
+                DraftStamp {
+                    id: id.to_string(),
+                    version
+                }
+                .file_name("abc", 42),
+                want,
+                "{id} v{version}"
+            );
+        }
+        // The shipping segmenters at their current versions.
+        use crate::segment::Segmenter;
+        let current: Vec<_> = Segmenter::ALL
+            .into_iter()
+            .map(|s| DraftStamp::of(s).file_name("abc", 42))
+            .collect();
+        assert_eq!(
+            current,
+            [
+                "abc_42.student1.vanalysis",
+                "abc_42.teacher1.vanalysis",
+                "abc_42_s7.vanalysis"
+            ]
+        );
+    }
+
+    fn analysis_by(segmenter: &str, segmenter_version: u32, duration_ms: i64) -> Analysis {
+        Analysis {
+            format: ANALYSIS_FORMAT.to_string(),
+            version: ANALYSIS_VERSION,
+            segmenter: segmenter.to_string(),
+            segmenter_version,
+            capture_day: "2026-01-01".to_string(),
+            duration_ms: Some(duration_ms),
+            waveform: vec![],
+            rallies: vec![],
+        }
+    }
+
+    /// Adoption's read side: only this content key's files, only the library's
+    /// segmenter at its current version or newer, the highest version winning. A key
+    /// that is a prefix of another (`abc_12` vs `abc_123`) never reads the other's.
+    #[test]
+    fn adoption_reads_only_its_own_content_keys_files() {
+        use crate::segment::Segmenter;
+        let root = std::env::temp_dir().join(format!(
+            "voloph-analysis-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = root.join(".voloph").join("analysis");
+        let put = |name: &str, a: &Analysis| write_analysis(&dir, name, a).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let best = |size: i64, s: Segmenter| {
+            read_best_analysis(&root_s, "abc", size, s).and_then(|a| a.duration_ms)
+        };
+
+        // The longer key's files, for every segmenter.
+        put("abc_123_s9.vanalysis", &analysis_by("v6", 9, 1239));
+        put(
+            "abc_123.student5.vanalysis",
+            &analysis_by("student", 5, 1235),
+        );
+        put(
+            "abc_123.teacher5.vanalysis",
+            &analysis_by("teacher", 5, 1236),
+        );
+        for s in Segmenter::ALL {
+            assert_eq!(best(12, s), None, "{s:?} read another key's file");
+        }
+
+        // v6: the legacy bare name and a stale `_s6` are too old; the highest wins.
+        put("abc_12.vanalysis", &analysis_by("v6", 1, 1));
+        put("abc_12_s6.vanalysis", &analysis_by("v6", 6, 6));
+        assert_eq!(best(12, Segmenter::V6), None);
+        put("abc_12_s7.vanalysis", &analysis_by("v6", 7, 7));
+        put("abc_12_s8.vanalysis", &analysis_by("v6", 8, 8));
+        assert_eq!(best(12, Segmenter::V6), Some(8));
+        // Temp and foreign files beside them are never read.
+        put(".abc_12_s9.vanalysis.tmp", &analysis_by("v6", 9, 9));
+        put("abc_12_s9.vanalysis.bak", &analysis_by("v6", 9, 9));
+        assert_eq!(best(12, Segmenter::V6), Some(8));
+
+        // The learned segmenters read only their own.
+        assert_eq!(best(12, Segmenter::Student), None);
+        put("abc_12.student1.vanalysis", &analysis_by("student", 1, 101));
+        put("abc_12.teacher1.vanalysis", &analysis_by("teacher", 1, 201));
+        assert_eq!(best(12, Segmenter::Student), Some(101));
+        assert_eq!(best(12, Segmenter::Teacher), Some(201));
+        assert_eq!(best(12, Segmenter::V6), Some(8));
+        // A newer build's student draft is preferred; an unknown id is never taken.
+        put("abc_12.student2.vanalysis", &analysis_by("student", 2, 102));
+        put("abc_12.coach1.vanalysis", &analysis_by("coach", 1, 301));
+        assert_eq!(best(12, Segmenter::Student), Some(102));
+        // The file's contents decide, not its name.
+        put("abc_12_s20.vanalysis", &analysis_by("student", 3, 103));
+        assert_eq!(best(12, Segmenter::Student), Some(103));
+        assert_eq!(best(12, Segmenter::V6), Some(8));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -1,15 +1,13 @@
 // @vitest-environment jsdom
 /**
  * The playback/export padding store (ADR 0020): one app-wide value that the
- * library menu changes and the player and moment browser follow without a reload.
+ * library menu changes and the player follows without a reload.
  */
 import { act, renderHook, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { DEFAULT_PADDING } from "@/components/recording-player-transport"
 import {
-  describePadding,
-  paddingPresetId,
   resetPlaybackPaddingForTests,
   setPlaybackPadding,
   usePlaybackPadding,
@@ -81,22 +79,5 @@ describe("usePlaybackPadding", () => {
       setPlaybackPadding({ lead_ms: 2000, tail_ms: 3000 })
     ).rejects.toThrow("locked")
     expect(result.current).toEqual(DEFAULT_PADDING)
-  })
-})
-
-describe("padding presets", () => {
-  it("names the preset a padding matches, else custom", () => {
-    expect(paddingPresetId(DEFAULT_PADDING)).toBe("normal")
-    expect(paddingPresetId({ lead_ms: 0, tail_ms: 0 })).toBe("none")
-    expect(paddingPresetId({ lead_ms: 750, tail_ms: 1500 })).toBe("custom")
-  })
-
-  it("describes a padding in seconds", () => {
-    expect(describePadding({ lead_ms: 1000, tail_ms: 1500 })).toBe(
-      "1 s before, 1.5 s after"
-    )
-    expect(describePadding({ lead_ms: 0, tail_ms: 0 })).toBe(
-      "The rally only, serve to landing"
-    )
   })
 })

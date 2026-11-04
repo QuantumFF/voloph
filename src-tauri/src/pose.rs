@@ -125,15 +125,7 @@ impl PoseEstimator {
     /// Load the vendored RTMPose-t model into an inference session. Errors only when
     /// the model file itself cannot be loaded, never for a missing GPU.
     pub fn load(model_path: &std::path::Path) -> Result<PoseEstimator, String> {
-        crate::gpu::init_environment();
-        let session = Session::builder()
-            .map_err(|e| format!("ort session builder: {e}"))?
-            .with_execution_providers(crate::gpu::general_providers())
-            .map_err(|e| format!("ort execution providers: {e}"))?
-            .with_intra_threads(4)
-            .map_err(|e| format!("ort intra threads: {e}"))?
-            .commit_from_file(model_path)
-            .map_err(|e| format!("ort could not load {}: {e}", model_path.display()))?;
+        let session = crate::gpu::build_session(model_path, crate::gpu::general_providers(), 4)?;
         let input_name = session
             .inputs
             .first()
@@ -353,7 +345,7 @@ fn build_pose_input(frame: &[u8], src_w: usize, src_h: usize, crop: &CropRect) -
 /// Resolve the vendored RTMPose-t model, probing the same dev/release layouts as the
 /// detector ([`crate::detect::vendored_model_path`]).
 pub fn vendored_pose_model_path() -> Result<PathBuf, String> {
-    detect::vendored_model_file("rtmpose_t.onnx", "pose")
+    crate::gpu::vendored_model_file("rtmpose_t.onnx", "pose")
 }
 
 /// Probe the pose pass's *decoded* source frame size — width/height parsed

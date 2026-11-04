@@ -12,6 +12,8 @@ import { fileName, formatClock } from "@/lib/format"
 import {
   UNCERTAIN_CONFIDENCE,
   VERDICTS,
+  annotationsByRally,
+  rallyKey,
   type PlaylistRecording,
   type SessionAnnotation,
   type SessionModel,
@@ -54,14 +56,12 @@ export function RallyRail({
   // the annotations in its span), so the rail summarises what's been marked.
   const verdictsByRally = useMemo(() => {
     const map = new Map<string, Record<Verdict, number>>()
-    for (const a of annotations) {
-      const rally = session.rallies.find(
-        (r) => a.globalMs >= r.globalStart && a.globalMs < r.globalEnd
-      )
-      if (!rally) continue
-      const key = `${rally.path}:${rally.id}`
-      const counts = map.get(key) ?? { good: 0, bad: 0, mistake: 0 }
-      counts[a.verdict] += 1
+    for (const [key, owned] of annotationsByRally(
+      session.rallies,
+      annotations
+    )) {
+      const counts = { good: 0, bad: 0, mistake: 0 }
+      for (const a of owned) counts[a.verdict] += 1
       map.set(key, counts)
     }
     return map
@@ -88,12 +88,10 @@ export function RallyRail({
                 {rows.map(({ rally, number }) => {
                   const active = number === currentRallyIndex
                   const durationMs = rally.localEnd - rally.localStart
-                  const verdicts = verdictsByRally.get(
-                    `${rally.path}:${rally.id}`
-                  )
+                  const verdicts = verdictsByRally.get(rallyKey(rally))
                   return (
                     <li
-                      key={`${rally.path}:${rally.id}`}
+                      key={rallyKey(rally)}
                       ref={active ? activeRef : undefined}
                     >
                       <button

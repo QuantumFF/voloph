@@ -7,17 +7,18 @@ import { trackedInvoke } from "@/lib/tauri"
 import {
   clamp,
   gapSkipAction,
+  inPlayInterval,
   nextRallyMs,
   nextUncertainMs,
   NO_PADDING,
   playIntervals,
   prevRallyAction,
-  rallyLeadInMs,
   resumeEntersFreePlay,
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
   seekTickSettled,
+  sessionPlayIntervals,
   type Padding,
   type PlaylistRecording,
   type Resume,
@@ -161,6 +162,12 @@ export function useSessionPlayback({
         : [],
     [timeline, padding]
   )
+  // The same padded intervals over the whole session axis, each clamped to its
+  // own recording: what a session seek checks to tell a rally from a gap.
+  const sessionIntervals = useMemo(
+    () => sessionPlayIntervals(session, padding),
+    [session, padding]
+  )
 
   // Session-global playhead: the current recording's offset plus the local time.
   // Null until the current recording is placed (its predecessors are segmented).
@@ -240,13 +247,10 @@ export function useSessionPlayback({
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect -- resuming a crossed-into recording seeks (which sets state), the whole point of the effect */
     if (pendingSeek == null || typeof pendingSeek === "object") return
-    if (rallies.length === 0) {
-      // Wait for this recording's draft; until then it plays from the top.
-      return
-    }
-    const target =
-      pendingSeek === "start" ? rallies[0] : rallies[rallies.length - 1]
-    seekTo(target.start_ms)
+    const target = resumeStartMs(pendingSeek, rallies)
+    // Null until this recording's draft arrives; until then it plays from the top.
+    if (target == null) return
+    seekTo(target)
     setPendingSeek(null)
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [pendingSeek, rallies, seekTo])
@@ -403,7 +407,7 @@ export function useSessionPlayback({
   // Seek the session to a global position: find the recording that owns it and
   // either seek within the current recording or cross into it. A seek landing in
   // a gap means "let me watch from here" → free play; one landing inside a rally
-  // keeps gap-free.
+  // (or its padding, which never reaches past its own recording) keeps gap-free.
   const seekSession = useCallback(
     (globalMs: number) => {
       const target = clamp(globalMs, 0, session.totalMs)
@@ -416,18 +420,14 @@ export function useSessionPlayback({
         ) ?? session.segments[session.placedCount - 1]
       if (!seg) return
       const localMs = clamp(target - seg.offsetMs, 0, seg.durationMs ?? target)
-      freePlayRef.current = !session.rallies.some(
-        (r) =>
-          target >= rallyLeadInMs(r, padding) &&
-          target < r.globalEnd + padding.tail_ms
-      )
+      freePlayRef.current = !inPlayInterval(sessionIntervals, target)
       if (seg.index === index) {
         seekTo(localMs)
       } else {
         goToRecording(seg.index, { atMs: localMs })
       }
     },
-    [session, index, seekTo, goToRecording, padding]
+    [session, sessionIntervals, index, seekTo, goToRecording]
   )
 
   // Manual rally-to-rally navigation, across recording boundaries. A jump is an

@@ -4,23 +4,33 @@ import {
   SPEED_LADDER,
   addAtPlayheadEdit,
   adjustRallyEdit,
+  annotationsByRally,
   buildSessionAnnotations,
   buildSessionModel,
   clampVolume,
+  editAffordances,
   gapSkipAction,
+  inPlayInterval,
+  leadInMs,
   mergeRallyEdit,
   nextRallyMs,
   nextUncertainMs,
   prevRallyAction,
+  rallyAt,
+  rallyContains,
+  rallyIndexAt,
+  rallyKey,
   rallyLeadInMs,
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
+  sessionPlayIntervals,
   speedIndexForValue,
   splitRallyEdit,
   stepSpeedIndex,
   stripScrollTarget,
   type Rally,
+  type SessionAnnotation,
   type SessionRally,
   type Timeline,
 } from "./recording-player-transport"
@@ -674,5 +684,199 @@ describe("playIntervals (presentation padding, #104)", () => {
     expect(playIntervals([r(1, 5000, 6000)], NO_PADDING)).toEqual([
       r(1, 5000, 6000),
     ])
+  })
+})
+
+describe("leadInMs", () => {
+  it.each([
+    // [strict start, lead-in, opens at]
+    [5000, 1000, 4000],
+    [600, 1000, 0], // clamped to the recording's start
+    [5000, 0, 5000],
+  ])("a rally at %i with a %i ms lead-in opens at %i", (start, lead, want) => {
+    expect(leadInMs(start, { lead_ms: lead, tail_ms: 0 })).toBe(want)
+  })
+})
+
+describe("sessionPlayIntervals (#104)", () => {
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+  const edges = (model: ReturnType<typeof buildSessionModel>) =>
+    sessionPlayIntervals(model, pad).map((i) => [
+      i.recordingIndex,
+      i.globalStart,
+      i.globalEnd,
+    ])
+
+  it.each([
+    {
+      name: "a tail stops at its own recording's end, never spilling into the next",
+      a: [rally(1, 2000, 9500)],
+      b: [rally(2, 5000, 6000)],
+      want: [
+        [0, 1000, 10000],
+        [1, 14000, 17500],
+      ],
+    },
+    {
+      name: "a lead-in stops at its own recording's start, never reaching back",
+      a: [rally(1, 2000, 3000)],
+      b: [rally(2, 300, 2000)],
+      want: [
+        [0, 1000, 4500],
+        [1, 10000, 13500],
+      ],
+    },
+    {
+      name: "the first lead-in and the last tail clamp to the session's ends",
+      a: [rally(1, 400, 3000)],
+      b: [rally(2, 5000, 9800)],
+      want: [
+        [0, 0, 4500],
+        [1, 14000, 20000],
+      ],
+    },
+    {
+      name: "rallies the padding makes overlap merge within a recording",
+      a: [rally(1, 2000, 3000), rally(2, 5000, 6000)],
+      b: [rally(3, 5000, 6000)],
+      want: [
+        [0, 1000, 7500],
+        [1, 14000, 17500],
+      ],
+    },
+  ])("$name", ({ a, b, want }) => {
+    const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": timeline(10000, a),
+      "b.mp4": timeline(10000, b),
+    })
+    expect(edges(model)).toEqual(want)
+  })
+
+  it("skips a recording that isn't placed yet", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": timeline(10000, [rally(1, 2000, 3000)]),
+    })
+    expect(edges(model)).toEqual([[0, 1000, 4500]])
+  })
+
+  it("is half-open: a moment just past a recording's end is the next one's gap", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": timeline(10000, [rally(1, 2000, 9500)]),
+      "b.mp4": timeline(10000, [rally(2, 5000, 6000)]),
+    })
+    const intervals = sessionPlayIntervals(model, pad)
+    expect(inPlayInterval(intervals, 9999)).toBe(true)
+    expect(inPlayInterval(intervals, 10000)).toBe(false)
+    expect(inPlayInterval(intervals, 10500)).toBe(false)
+    expect(inPlayInterval(intervals, 14000)).toBe(true)
+  })
+})
+
+describe("rally containing a moment", () => {
+  const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+    "a.mp4": timeline(10000, [rally(1, 1000, 2000), rally(2, 2000, 3000)]),
+    "b.mp4": timeline(10000, [rally(1, 500, 1500)]),
+  })
+
+  it.each([
+    // [session-global ms, owning rally index or -1]
+    [999, -1],
+    [1000, 0], // a rally's start is inside it
+    [1999, 0],
+    [2000, 1], // its end is not — it belongs to whatever comes next
+    [3000, -1],
+    [10500, 2],
+    [11500, -1],
+  ])("at %i ms the rally index is %i", (ms, want) => {
+    expect(rallyIndexAt(model.rallies, ms)).toBe(want)
+    expect(rallyAt(model.rallies, ms)).toBe(model.rallies[want] ?? null)
+    for (const [i, r] of model.rallies.entries()) {
+      expect(rallyContains(r, ms)).toBe(i === want)
+    }
+  })
+
+  it("keys a rally by recording and id, since ids repeat across recordings", () => {
+    expect(model.rallies.map(rallyKey)).toEqual([
+      "a.mp4:1",
+      "a.mp4:2",
+      "b.mp4:1",
+    ])
+  })
+
+  it("groups annotations under the rally that owns them, dropping gap ones", () => {
+    const note = (id: number, globalMs: number): SessionAnnotation => ({
+      id,
+      recordingIndex: 0,
+      path: "a.mp4",
+      verdict: "good",
+      aspect: null,
+      note: null,
+      globalMs,
+    })
+    const groups = annotationsByRally(model.rallies, [
+      note(1, 1500),
+      note(2, 2000),
+      note(3, 5000),
+      note(4, 1999),
+      note(5, 11000),
+    ])
+    expect(
+      [...groups].map(([key, owned]) => [key, owned.map((a) => a.id)])
+    ).toEqual([
+      ["a.mp4:1", [1, 4]],
+      ["a.mp4:2", [2]],
+      ["b.mp4:1", [5]],
+    ])
+  })
+})
+
+describe("editAffordances", () => {
+  // Two rallies in a.mp4, one in b.mp4 (b starts at 10 s on the session axis).
+  const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+    "a.mp4": timeline(10000, [rally(1, 1000, 2000), rally(2, 4000, 5000)]),
+    "b.mp4": timeline(10000, [rally(3, 1000, 2000)]),
+  })
+  const [first, second, third] = model.rallies
+
+  it("affords nothing without a target", () => {
+    expect(editAffordances(model.rallies, -1, 1500)).toEqual({
+      target: null,
+      mergeTarget: null,
+      canSplit: false,
+      canMerge: false,
+    })
+  })
+
+  it.each([
+    // [playhead, can split] — strictly inside the rally, as splitRallyEdit guards
+    [null, false],
+    [1000, false],
+    [1001, true],
+    [1999, true],
+    [2000, false],
+    [4500, false],
+  ])("splits the first rally with the playhead at %s: %s", (ms, want) => {
+    expect(editAffordances(model.rallies, 0, ms).canSplit).toBe(want)
+  })
+
+  it("splits a later recording's rally against its own offset", () => {
+    expect(editAffordances(model.rallies, 2, 11500).canSplit).toBe(true)
+    expect(editAffordances(model.rallies, 2, 1500).canSplit).toBe(false)
+  })
+
+  it("merges only with the next rally in the same recording", () => {
+    const within = editAffordances(model.rallies, 0, null)
+    expect(within.target).toBe(first)
+    expect(within.mergeTarget).toBe(second)
+    expect(within.canMerge).toBe(true)
+
+    const across = editAffordances(model.rallies, 1, null)
+    expect(across.target).toBe(second)
+    expect(across.mergeTarget).toBeNull()
+    expect(across.canMerge).toBe(false)
+
+    const last = editAffordances(model.rallies, 2, null)
+    expect(last.target).toBe(third)
+    expect(last.canMerge).toBe(false)
   })
 })

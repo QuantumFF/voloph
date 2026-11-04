@@ -1,6 +1,7 @@
 //! Tests for the metadata database. Kept in one module so `use super::*`
 //! reaches every submodule's re-exported API and its `pub(crate)` helpers.
 
+use super::draft::DraftStamp;
 use super::*;
 use rusqlite::Connection;
 use std::path::Path;
@@ -32,6 +33,15 @@ fn save_rallies(
         waveform,
         crate::segment::Segmenter::V6,
     )
+}
+
+/// The stamp of a draft by segmenter `id` at `version`; `.file_name(..)` gives the
+/// Analysis file it publishes as.
+fn stamp(id: &str, version: u32) -> DraftStamp {
+    DraftStamp {
+        id: id.to_string(),
+        version,
+    }
 }
 
 /// An in-memory DB with the schema and one segmented recording carrying the
@@ -1840,7 +1850,7 @@ fn declining_after_adoption_keeps_the_draft_and_runs_no_analysis() {
 fn read_published_analysis(root: &Path, abs: &Path) -> Option<Analysis> {
     let meta = std::fs::metadata(abs).unwrap();
     let hash = quick_hash(abs, meta.len()).unwrap();
-    let name = analysis_file_name(&hash, meta.len() as i64, crate::segment::SEGMENTER_VERSION);
+    let name = stamp("v6", crate::segment::SEGMENTER_VERSION).file_name(&hash, meta.len() as i64);
     let path = root.join(".voloph").join("analysis").join(name);
     std::fs::read(path)
         .ok()
@@ -2174,7 +2184,7 @@ fn publish_test_analysis(lib: &TempLib, abs: &Path, rallies: Vec<AnalysisRally>)
     std::fs::create_dir_all(&dir).unwrap();
     // At the active version's file name, mirroring where a real publish lands
     // (and where `read_published_analysis` looks).
-    let name = analysis_file_name(&hash, meta.len() as i64, crate::segment::SEGMENTER_VERSION);
+    let name = stamp("v6", crate::segment::SEGMENTER_VERSION).file_name(&hash, meta.len() as i64);
     std::fs::write(dir.join(name), serde_json::to_vec(&analysis).unwrap()).unwrap();
 }
 
@@ -2390,7 +2400,7 @@ fn publish_versioned_analysis(
         waveform: vec![],
         rallies,
     };
-    let name = analysis_file_name(&hash, meta.len() as i64, segmenter_version);
+    let name = stamp("v6", segmenter_version).file_name(&hash, meta.len() as i64);
     let dir = lib.0.join(".voloph").join("analysis");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(&name), serde_json::to_vec(&analysis).unwrap()).unwrap();
@@ -2690,7 +2700,7 @@ fn publish_writes_alongside_without_deleting_the_older_version() {
     publish_analysis(&conn, id);
     let meta = std::fs::metadata(&abs).unwrap();
     let hash = quick_hash(&abs, meta.len()).unwrap();
-    let v1_name = analysis_file_name(&hash, meta.len() as i64, 1);
+    let v1_name = stamp("v6", 1).file_name(&hash, meta.len() as i64);
     let dir = lib.0.join(".voloph").join("analysis");
     assert!(dir.join(&v1_name).exists());
 
@@ -2702,7 +2712,7 @@ fn publish_writes_alongside_without_deleting_the_older_version() {
     .unwrap();
     publish_analysis(&conn, id);
 
-    let v2_name = analysis_file_name(&hash, meta.len() as i64, 2);
+    let v2_name = stamp("v6", 2).file_name(&hash, meta.len() as i64);
     assert!(dir.join(&v2_name).exists(), "v2 published alongside");
     assert!(dir.join(&v1_name).exists(), "v1 left in place");
 }
@@ -2930,14 +2940,11 @@ fn switching_segmenter_rederives_only_untouched_drafts_made_by_another() {
 
 #[test]
 fn a_learned_segmenters_analysis_file_is_invisible_to_older_builds() {
-    let name = analysis_file_name_for("abc", 42, "student", 1);
+    let name = stamp("student", 1).file_name("abc", 42);
     assert_eq!(name, "abc_42.student1.vanalysis");
     // Older builds adopt `{key}.vanalysis` or `{key}_s*.vanalysis` only.
     assert!(name != "abc_42.vanalysis" && !name.starts_with("abc_42_s"));
-    assert_eq!(
-        analysis_file_name_for("abc", 42, "v6", 6),
-        analysis_file_name("abc", 42, 6)
-    );
+    assert_eq!(stamp("v6", 6).file_name("abc", 42), "abc_42_s6.vanalysis");
 }
 
 /// A shared library adopts only Analyses its own segmenter made, and records which.
@@ -2984,7 +2991,7 @@ fn adoption_takes_only_the_librarys_segmenter() {
             confidence: 0.8,
         }],
     };
-    let name = analysis_file_name_for(&hash, meta.len() as i64, "student", crate::student::VERSION);
+    let name = stamp("student", crate::student::VERSION).file_name(&hash, meta.len() as i64);
     std::fs::write(
         lib.0.join(".voloph").join("analysis").join(name),
         serde_json::to_vec(&analysis).unwrap(),
@@ -3035,12 +3042,7 @@ fn a_student_draft_publishes_under_its_own_name() {
         .0
         .join(".voloph")
         .join("analysis")
-        .join(analysis_file_name_for(
-            &hash,
-            meta.len() as i64,
-            "student",
-            crate::student::VERSION,
-        ));
+        .join(stamp("student", crate::student::VERSION).file_name(&hash, meta.len() as i64));
     let a: Analysis = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(
         (a.segmenter.as_str(), a.segmenter_version),
@@ -3075,4 +3077,135 @@ fn switch_segmenter_queues_untouched_drafts_without_a_rescan() {
         switch_segmenter(&mut conn, "local", Segmenter::Student).unwrap(),
         0
     );
+}
+
+/// Which ready drafts the stale path re-derives (ADR 0019): a draft is current only
+/// when its library's segmenter made it, at that segmenter's version or newer. A
+/// NULL id is the legacy v6; a NULL version is pre-versioning and never stale; an id
+/// from a newer build is never the library's choice, so it is stale.
+#[test]
+fn staleness_is_pinned_per_stamp_and_library_segmenter() {
+    use crate::segment::{Segmenter, SEGMENTER_VERSION as V6};
+    let (student, teacher) = (crate::student::VERSION, crate::teacher::VERSION);
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = super::open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    let cases: &[(Option<&str>, Option<u32>, Segmenter, bool)] = &[
+        (None, Some(V6), Segmenter::V6, false),
+        (None, Some(V6 - 1), Segmenter::V6, true),
+        (None, Some(V6), Segmenter::Student, true),
+        (None, None, Segmenter::Student, false),
+        (Some("v6"), None, Segmenter::Student, false),
+        (Some("v6"), Some(V6), Segmenter::V6, false),
+        (Some("v6"), Some(V6 + 1), Segmenter::V6, false),
+        (Some("v6"), Some(V6 - 1), Segmenter::V6, true),
+        (Some("v6"), Some(V6), Segmenter::Teacher, true),
+        (Some("student"), Some(student), Segmenter::Student, false),
+        (
+            Some("student"),
+            Some(student + 1),
+            Segmenter::Student,
+            false,
+        ),
+        (Some("student"), Some(student - 1), Segmenter::Student, true),
+        (Some("student"), Some(student), Segmenter::V6, true),
+        (Some("student"), Some(student), Segmenter::Teacher, true),
+        (Some("teacher"), Some(teacher), Segmenter::Teacher, false),
+        (Some("teacher"), Some(teacher), Segmenter::Student, true),
+        (Some("coach"), Some(99), Segmenter::Student, true),
+        (Some("coach"), Some(99), Segmenter::V6, true),
+    ];
+    for &(made_by, version, library, stale) in cases {
+        set_library_segmenter(&conn, "local", library).unwrap();
+        save_rallies(&mut conn, id, 60000, &one_rally(), &[0.5]).unwrap();
+        conn.execute(
+            "UPDATE recordings SET segmenter_id = ?1, segmenter_version = ?2 WHERE id = ?3",
+            rusqlite::params![made_by, version, id],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        resegment_stale_untouched(&tx).unwrap();
+        tx.commit().unwrap();
+        let want = if stale {
+            (None, None, "unknown".to_string())
+        } else {
+            (
+                made_by.map(String::from),
+                version.map(i64::from),
+                "ready".to_string(),
+            )
+        };
+        assert_eq!(
+            segmenter_stamp(&conn, id),
+            want,
+            "{made_by:?} v{version:?} in a {library:?} library"
+        );
+    }
+}
+
+/// What every way of dropping a draft leaves on the row (re-analyze one, re-analyze
+/// all, the stale path): no rallies, `unknown`, and no duration, waveform or stamp —
+/// while the probe stays `ready` (the bytes did not change).
+#[test]
+fn every_draft_reset_clears_the_same_columns() {
+    use crate::segment::Segmenter;
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = super::open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    scan_library(&mut conn).unwrap();
+    let path = abs.to_string_lossy().into_owned();
+    let id = recording_id(&conn, &path).unwrap().unwrap();
+    let row = |conn: &Connection| -> (String, String, Option<i64>, Option<String>, i64) {
+        conn.query_row(
+            "SELECT probe_state, segment_state, duration_ms, waveform,
+                    (SELECT COUNT(*) FROM rallies WHERE recording_id = ?1)
+             FROM recordings WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    };
+    let cleared = ("ready".to_string(), "unknown".to_string(), None, None, 0);
+    let draft = |conn: &mut Connection| {
+        conn.execute(
+            "UPDATE recordings SET probe_state = 'ready' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        super::save_rallies(conn, id, 60000, &one_rally(), &[0.5], Segmenter::V6).unwrap();
+        assert_eq!(
+            row(conn),
+            (
+                "ready".to_string(),
+                "ready".to_string(),
+                Some(60000),
+                Some("[0.50]".to_string()),
+                1
+            )
+        );
+    };
+
+    draft(&mut conn);
+    reset_segmentation(&conn, &path).unwrap();
+    assert_eq!(row(&conn), cleared);
+    assert_eq!(segmenter_stamp(&conn, id), (None, None, "unknown".into()));
+
+    draft(&mut conn);
+    reset_all_segmentation(&conn).unwrap();
+    assert_eq!(row(&conn), cleared);
+    assert_eq!(segmenter_stamp(&conn, id), (None, None, "unknown".into()));
+
+    draft(&mut conn);
+    set_library_segmenter(&conn, "local", Segmenter::Student).unwrap();
+    let tx = conn.transaction().unwrap();
+    resegment_stale_untouched(&tx).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(row(&conn), cleared);
+    assert_eq!(segmenter_stamp(&conn, id), (None, None, "unknown".into()));
 }
