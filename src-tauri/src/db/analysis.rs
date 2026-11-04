@@ -40,6 +40,10 @@ pub struct AnalysisRally {
 pub struct Analysis {
     pub format: String,
     pub version: u32,
+    /// Which segmenter made the draft (ADR 0019). Absent in files written before it,
+    /// which v6 made; older builds ignore the field.
+    #[serde(default = "v6_id")]
+    pub segmenter: String,
     pub segmenter_version: u32,
     pub capture_day: String,
     pub duration_ms: Option<i64>,
@@ -66,6 +70,27 @@ pub(crate) fn analysis_file_name(
     }
 }
 
+/// The Analysis file name for any segmenter (ADR 0019). v6 keeps
+/// [`analysis_file_name`]'s names, so older builds still find their files; a learned
+/// segmenter publishes as `{key}.{id}{N}.vanalysis` — a name older builds' `{key}_s*`
+/// match never picks up, so they cannot mistake a student draft for a v6 one.
+pub(crate) fn analysis_file_name_for(
+    quick_hash: &str,
+    file_size: i64,
+    segmenter: &str,
+    version: u32,
+) -> String {
+    if segmenter == "v6" {
+        analysis_file_name(quick_hash, file_size, version)
+    } else {
+        format!("{quick_hash}_{file_size}.{segmenter}{version}.vanalysis")
+    }
+}
+
+fn v6_id() -> String {
+    "v6".to_string()
+}
+
 /// The content-key filename prefix shared by every version's Analysis for one
 /// recording — the base `{quick_hash}_{file_size}` (ADR 0013/0015). Used to
 /// enumerate all published versions of a recording's Analysis when adopting the
@@ -83,6 +108,7 @@ struct AnalysisRow {
     duration_ms: Option<i64>,
     waveform_json: Option<String>,
     segmenter_version: Option<i64>,
+    segmenter_id: Option<String>,
 }
 
 /// Read the DB row + rallies for recording `id` and assemble its pristine machine
@@ -109,7 +135,7 @@ fn analysis_of_impl(
     let row = conn
         .query_row(
             "SELECT library, file_size, quick_hash, capture_day, duration_ms, waveform,
-                    segmenter_version
+                    segmenter_version, segmenter_id
              FROM recordings WHERE id = ?1",
             [id],
             |r| {
@@ -121,6 +147,7 @@ fn analysis_of_impl(
                     duration_ms: r.get(4)?,
                     waveform_json: r.get(5)?,
                     segmenter_version: r.get(6)?,
+                    segmenter_id: r.get(7)?,
                 })
             },
         )
@@ -156,6 +183,7 @@ fn analysis_of_impl(
     let analysis = Analysis {
         format: ANALYSIS_FORMAT.to_string(),
         version: ANALYSIS_VERSION,
+        segmenter: row.segmenter_id.unwrap_or_else(v6_id),
         // The version that actually produced this draft (ADR 0013/0015), so the
         // published file names and describes itself honestly — a draft adopted from
         // an older Analysis republishes as that older version, not as the active one.
@@ -188,7 +216,12 @@ pub fn publish_analysis(conn: &Connection, id: i64) {
         return; // shared library not designated on this device
     };
     let dir = Path::new(&root).join(".voloph").join("analysis");
-    let name = analysis_file_name(&quick_hash, file_size, analysis.segmenter_version);
+    let name = analysis_file_name_for(
+        &quick_hash,
+        file_size,
+        &analysis.segmenter,
+        analysis.segmenter_version,
+    );
     if let Err(e) = write_analysis(&dir, &name, &analysis) {
         // Silent to the user (ADR 0013): the analysis is already in the DB.
         log::warn!("analysis: could not publish {name}: {e}");
@@ -253,7 +286,12 @@ pub fn publish_missing_analyses(conn: &Connection) {
         // stale one under its own name rather than checking for any file — so a bump
         // backfills the superseding file without touching the older sibling. Present
         // and readable → leave it alone; missing or unreadable (truncated) → rewrite.
-        let name = analysis_file_name(&quick_hash, file_size, analysis.segmenter_version);
+        let name = analysis_file_name_for(
+            &quick_hash,
+            file_size,
+            &analysis.segmenter,
+            analysis.segmenter_version,
+        );
         if read_analysis_file(&dir.join(&name)).is_some() {
             continue;
         }
@@ -299,7 +337,18 @@ fn read_analysis_file(path: &Path) -> Option<Analysis> {
 /// enumerates them and prefers the one the highest segmenter produced — the best
 /// draft, which is what adoption should carry. A malformed or wrong-format sibling
 /// is skipped silently, never blocking a good one.
-fn read_best_analysis(root: &str, quick_hash: &str, file_size: i64) -> Option<Analysis> {
+///
+/// Only Analyses from `segmenter` count (ADR 0019): a library adopts drafts from the
+/// segmenter it uses, never another one's. One older than that segmenter's current
+/// version is skipped too, as the stale path would re-derive it on the next scan
+/// anyway — and a pre-v7 v6 draft has the old 1.2 s padding baked in, which
+/// playback would then pad again (ADR 0020).
+fn read_best_analysis(
+    root: &str,
+    quick_hash: &str,
+    file_size: i64,
+    segmenter: crate::segment::Segmenter,
+) -> Option<Analysis> {
     let dir = Path::new(root).join(".voloph").join("analysis");
     let prefix = analysis_key_prefix(quick_hash, file_size);
     let mut best: Option<Analysis> = None;
@@ -309,14 +358,21 @@ fn read_best_analysis(root: &str, quick_hash: &str, file_size: i64) -> Option<An
         // Match this recording's content key exactly: either the bare v1 name or a
         // `_s{N}` versioned sibling. The `_` guard stops `<hash>_<size>` from also
         // matching a longer size that happens to start with these digits.
+        // A learned segmenter's file is `{prefix}.{id}{N}.vanalysis` (ADR 0019).
         let is_ours = name == format!("{prefix}.vanalysis")
-            || name.starts_with(&format!("{prefix}_s")) && name.ends_with(".vanalysis");
+            || (name.starts_with(&format!("{prefix}_s"))
+                || name.starts_with(&format!("{prefix}.")))
+                && name.ends_with(".vanalysis");
         if !is_ours {
             continue;
         }
         let Some(analysis) = read_analysis_file(&entry.path()) else {
             continue;
         };
+        if analysis.segmenter != segmenter.id() || analysis.segmenter_version < segmenter.version()
+        {
+            continue;
+        }
         if best
             .as_ref()
             .is_none_or(|b| analysis.segmenter_version > b.segmenter_version)
@@ -340,6 +396,7 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
     let Ok(Some(root)) = library_path_of(tx, "shared") else {
         return Ok(()); // shared library not designated — nothing to adopt into
     };
+    let segmenter = super::library_segmenter(tx, "shared")?;
 
     // Candidates: shared recordings the pipeline has not produced a draft for yet.
     // `ready` is excluded (the compute is spent; ADR 0013 never churns it).
@@ -365,7 +422,7 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
         // Prefer the highest-version Analysis when several are published for these
         // bytes (ADR 0013/0015): every device converges on the best draft, older
         // files stay on disk.
-        let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size) else {
+        let Some(analysis) = read_best_analysis(&root, &quick_hash, file_size, segmenter) else {
             continue;
         };
         tx.execute("DELETE FROM rallies WHERE recording_id = ?1", [id])?;
@@ -386,12 +443,13 @@ pub(crate) fn adopt_analyses(tx: &rusqlite::Transaction) -> rusqlite::Result<()>
         tx.execute(
             "UPDATE recordings
              SET probe_state = 'ready', segment_state = 'ready', duration_ms = ?1, waveform = ?2,
-                 segmenter_version = ?3
-             WHERE id = ?4",
+                 segmenter_version = ?3, segmenter_id = ?4
+             WHERE id = ?5",
             rusqlite::params![
                 analysis.duration_ms,
                 waveform_to_json(&analysis.waveform),
                 analysis.segmenter_version,
+                analysis.segmenter,
                 id
             ],
         )?;
@@ -408,6 +466,7 @@ mod tests {
         let tmpdir = std::env::temp_dir().join(format!("voloph-analysis-{}", std::process::id()));
         let dir = tmpdir.join(".voloph").join("analysis");
         let analysis = Analysis {
+            segmenter: "v6".to_string(),
             format: ANALYSIS_FORMAT.to_string(),
             version: ANALYSIS_VERSION,
             segmenter_version: 1,

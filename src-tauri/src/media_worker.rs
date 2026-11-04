@@ -207,9 +207,11 @@ fn probe_recording(conn: &Mutex<Connection>, id: i64, path: &str) -> &'static st
     state
 }
 
-/// Extract the recording's audio and motion tracks and run the hybrid segmenter
-/// (ADR 0006), persisting the draft timeline. The slow extraction + segmentation
-/// happen unlocked; only the final persist (and the failure mark) takes the lock.
+/// Extract the recording's audio, motion and person-detection tracks and run its
+/// library's segmenter (ADR 0019: the learned student, or the v6 heuristic of ADR
+/// 0006), persisting the draft timeline stamped with the segmenter that made it. The
+/// slow extraction + segmentation happen unlocked; only the segmenter lookup, the
+/// final persist (and the failure mark) take the lock.
 fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &str) {
     // The recording's total duration paces the remaining-time estimate (issue
     // #81): each progress tick reports footage decoded so far out of this total.
@@ -224,6 +226,46 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
             return;
         }
     };
+    let mut chosen = match conn.lock() {
+        Ok(c) => db::recording_segmenter(&c, id).unwrap_or_else(|e| {
+            log::error!("media worker: could not read the segmenter for {path}: {e}");
+            segment::DEFAULT_SEGMENTER
+        }),
+        Err(e) => {
+            log::error!("media worker: db lock poisoned reading the segmenter for {path}: {e}");
+            segment::DEFAULT_SEGMENTER
+        }
+    };
+    if chosen == segment::Segmenter::Teacher {
+        // The teacher reads neither motion nor the detection track (it runs its own
+        // shuttle and pose passes), so they are extracted only if it fails. Its
+        // progress covers both of its passes on one footage scale.
+        let started = Instant::now();
+        let mut last_emit = Instant::now();
+        match crate::teacher::segment_recording(path, |processed_ms| {
+            if last_emit.elapsed().as_millis() >= 500 {
+                last_emit = Instant::now();
+                emit_progress(app, id, processed_ms, total_ms, &started);
+            }
+        }) {
+            Ok(rallies) => {
+                return finish_segmentation(
+                    app,
+                    conn,
+                    id,
+                    path,
+                    &samples,
+                    rallies,
+                    segment::Segmenter::Teacher,
+                    &started,
+                );
+            }
+            Err(e) => {
+                log::warn!("media worker: teacher failed for {path}, using the student: {e}");
+                chosen = segment::Segmenter::Student;
+            }
+        }
+    }
     // Motion extraction is the long pole of analysis; report footage decoded as
     // frames stream in, throttled to avoid flooding the frontend with events. The
     // wall clock starts here, at the phase the ticks measure, so the frontend's
@@ -256,42 +298,45 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
     // ffmpeg, inference — is logged and swallowed, yielding `None`. The seam then falls
     // back to motion-proposes (pre-#84 behavior); a failed detector must never turn into
     // deleted play, so analysis still completes with a full draft timeline.
-    let occupancy = extract_occupancy_track(path);
-    let segmentation = segment::segment(
-        &samples,
-        media::SEGMENT_SAMPLE_RATE,
-        &motion,
-        occupancy.as_ref(),
-    );
-    let rallies = segmentation.rallies;
-    // Per-span gate verdicts (ADR 0015 Stage 0): one line per candidate span the
-    // segmenter weighed, so running a bad recording shows which gate ate a rally.
-    // Diagnostic only — the draft above is unaffected.
-    for v in &segmentation.verdicts {
-        log::info!(
-            "media worker: gate verdict {} for span {}-{} ms of {path}",
-            v.verdict.label(),
-            v.start_ms,
-            v.end_ms
-        );
-    }
+    let detections = extract_detections(path);
+    let (rallies, segmenter) = run_segmenter(chosen, &samples, &motion, detections.as_ref(), path);
+    finish_segmentation(app, conn, id, path, &samples, rallies, segmenter, &started);
+}
+
+/// Persist a finished draft (shared tail of every segmenter path): waveform, duration,
+/// the final progress tick, then save + publish under the lock.
+#[allow(clippy::too_many_arguments)]
+fn finish_segmentation(
+    app: &AppHandle,
+    conn: &Mutex<Connection>,
+    id: i64,
+    path: &str,
+    samples: &[f32],
+    rallies: Vec<segment::Rally>,
+    segmenter: segment::Segmenter,
+    started: &Instant,
+) {
     // The displayed waveform for the timeline strip (issue #6), reduced from the
     // same samples while we still hold them in memory.
-    let waveform = segment::waveform(&samples);
+    let waveform = segment::waveform(samples);
     let duration_ms = (samples.len() as f64 / media::SEGMENT_SAMPLE_RATE as f64 * 1000.0) as i64;
     // Final tick: the pass is done, so processed == total. The waveform-derived
     // duration is the authoritative length, so report it as both (the container
     // probe can be slightly off). The UI clears the estimate once the row flips
     // to `ready` on its next poll; this just avoids a stale mid-pass number.
-    emit_progress(app, id, duration_ms, Some(duration_ms), &started);
+    emit_progress(app, id, duration_ms, Some(duration_ms), started);
     log::info!(
-        "media worker: segmented {path} into {} rallies ({duration_ms} ms)",
-        rallies.len()
+        "media worker: segmented {path} into {} rallies ({duration_ms} ms, {} v{})",
+        rallies.len(),
+        segmenter.id(),
+        segmenter.version()
     );
 
     match conn.lock() {
         Ok(mut c) => {
-            if let Err(e) = db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform) {
+            if let Err(e) =
+                db::save_rallies(&mut c, id, duration_ms, &rallies, &waveform, segmenter)
+            {
                 log::error!("media worker: could not save timeline for {path}: {e}");
             } else {
                 // Publish the pristine machine Analysis for adoption by other users
@@ -304,16 +349,87 @@ fn segment_recording(app: &AppHandle, conn: &Mutex<Connection>, id: i64, path: &
     }
 }
 
-/// Compute the occupancy detection track for a recording (ADR 0015 Stage 2, issue #84)
-/// and hand back the pure [`segment::OccupancyTrack`] fusion consumes. Loads the
+/// Run the chosen segmenter (ADR 0019) and say which one actually drew the draft.
+///
+/// The student needs the person detections (with scores) and its bundled model; if
+/// either is missing it falls back to v6, which degrades to motion-proposes without
+/// occupancy (ADR 0015) — so a failed detector never costs the recording its draft.
+/// The fallback draft is stamped v6, so the next scan offers it to the student again.
+fn run_segmenter(
+    chosen: segment::Segmenter,
+    samples: &[f32],
+    motion: &segment::MotionTrack,
+    detections: Option<&detect::DetectionTrack>,
+    path: &str,
+) -> (Vec<segment::Rally>, segment::Segmenter) {
+    if chosen == segment::Segmenter::Student {
+        match (crate::student::StudentModel::bundled(), detections) {
+            (Ok(model), Some(detect)) => {
+                let started = Instant::now();
+                let audio = segment::audio_frames(
+                    samples,
+                    media::SEGMENT_SAMPLE_RATE,
+                    &segment::Params::default(),
+                );
+                // Duration as the training pipeline computed it (signals-dump).
+                let footage_s = samples.len() as f64 / f64::from(media::SEGMENT_SAMPLE_RATE);
+                let rallies = crate::student::segment(
+                    model,
+                    &crate::student::Inputs {
+                        duration_ms: (footage_s * 1000.0).round() as i64,
+                        motion_fps: motion.fps,
+                        motion: &motion.energy,
+                        audio_frame_ms: audio.frame_ms,
+                        audio_energy: &audio.energy,
+                        audio_onset: &audio.onset,
+                        detect,
+                    },
+                );
+                log::info!(
+                    "media worker: student segmented {path} in {} ms",
+                    started.elapsed().as_millis()
+                );
+                return (rallies, segment::Segmenter::Student);
+            }
+            (Err(e), _) => {
+                log::warn!("media worker: student model unavailable, using v6 for {path}: {e}")
+            }
+            (_, None) => log::warn!(
+                "media worker: no person detections for {path}; the student needs them, using v6"
+            ),
+        }
+    }
+    let occupancy = detections.map(detect::DetectionTrack::to_occupancy_track);
+    let segmentation = segment::segment(
+        samples,
+        media::SEGMENT_SAMPLE_RATE,
+        motion,
+        occupancy.as_ref(),
+    );
+    // Per-span gate verdicts (ADR 0015 Stage 0): one line per candidate span the
+    // segmenter weighed, so running a bad recording shows which gate ate a rally.
+    // Diagnostic only — the draft is unaffected.
+    for v in &segmentation.verdicts {
+        log::info!(
+            "media worker: gate verdict {} for span {}-{} ms of {path}",
+            v.verdict.label(),
+            v.start_ms,
+            v.end_ms
+        );
+    }
+    (segmentation.rallies, segment::Segmenter::V6)
+}
+
+/// Compute the person-detection track for a recording (ADR 0015 Stage 2, issue #84):
+/// v6 turns it into its occupancy track, the student reads it with scores. Loads the
 /// vendored nano detector (probing a GPU, falling back to CPU silently), runs it over
-/// the recording, converts, and logs a one-line summary of what it saw.
+/// the recording, and logs a one-line summary of what it saw.
 ///
 /// Returns `None` on **every** failure path — the shared degradation policy in
-/// [`detect::detections_or_none`]: the segmenter falls back to motion-proposes when
-/// occupancy is `None`, so a detector that cannot load or run costs precision,
-/// never a rally (ADR 0015).
-fn extract_occupancy_track(path: &str) -> Option<segment::OccupancyTrack> {
+/// [`detect::detections_or_none`]: v6 falls back to motion-proposes when occupancy is
+/// `None`, so a detector that cannot load or run costs precision, never a rally
+/// (ADR 0015).
+fn extract_detections(path: &str) -> Option<detect::DetectionTrack> {
     let started = Instant::now();
     let track = detect::detections_or_none(path, |why| {
         log::warn!("media worker: occupancy disabled for {path}: {why}");
@@ -327,7 +443,7 @@ fn extract_occupancy_track(path: &str) -> Option<segment::OccupancyTrack> {
         track.fps,
         started.elapsed().as_millis(),
     );
-    Some(track.to_occupancy_track())
+    Some(track)
 }
 
 /// Read a recording's embedded capture date with ffprobe and re-home its session

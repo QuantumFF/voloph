@@ -5,6 +5,35 @@ use super::*;
 use rusqlite::Connection;
 use std::path::Path;
 
+/// The DB the pre-ADR-0019 tests were written against: both libraries draw with v6,
+/// so their v6 drafts and Analyses are current. ADR 0019 tests call `super::open`
+/// for the real default (the student).
+fn open(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = super::open(path)?;
+    for kind in ["local", "shared"] {
+        set_library_segmenter(&conn, kind, crate::segment::Segmenter::V6)?;
+    }
+    Ok(conn)
+}
+
+/// The pre-ADR-0019 call shape most tests use: a draft the v6 segmenter made.
+fn save_rallies(
+    conn: &mut Connection,
+    recording_id: i64,
+    duration_ms: i64,
+    rallies: &[crate::segment::Rally],
+    waveform: &[f32],
+) -> rusqlite::Result<()> {
+    super::save_rallies(
+        conn,
+        recording_id,
+        duration_ms,
+        rallies,
+        waveform,
+        crate::segment::Segmenter::V6,
+    )
+}
+
 /// An in-memory DB with the schema and one segmented recording carrying the
 /// given rally intervals — the starting point for an inline-correction test.
 fn db_with_rallies(path: &str, intervals: &[(i64, i64)]) -> (Connection, i64) {
@@ -2132,6 +2161,7 @@ fn publish_test_analysis(lib: &TempLib, abs: &Path, rallies: Vec<AnalysisRally>)
     let meta = std::fs::metadata(abs).unwrap();
     let hash = quick_hash(abs, meta.len()).unwrap();
     let analysis = Analysis {
+        segmenter: "v6".to_string(),
         format: ANALYSIS_FORMAT.to_string(),
         version: ANALYSIS_VERSION,
         segmenter_version: crate::segment::SEGMENTER_VERSION,
@@ -2351,6 +2381,7 @@ fn publish_versioned_analysis(
     let meta = std::fs::metadata(abs).unwrap();
     let hash = quick_hash(abs, meta.len()).unwrap();
     let analysis = Analysis {
+        segmenter: "v6".to_string(),
         format: ANALYSIS_FORMAT.to_string(),
         version: ANALYSIS_VERSION,
         segmenter_version,
@@ -2534,11 +2565,13 @@ fn a_current_version_recording_is_left_alone() {
 fn scan_adopts_the_highest_version_and_keeps_older_files() {
     let lib = TempLib::new();
     let abs = lib.write("game.mp4", b"aaaa");
-    // Two Analyses for the same bytes: an older v1 and a newer v2, side by side.
+    // Two Analyses for the same bytes: the current version and a newer one (a
+    // device on a later build published it), side by side.
+    let cur = crate::segment::SEGMENTER_VERSION;
     let v1_name = publish_versioned_analysis(
         &lib,
         &abs,
-        1,
+        cur,
         vec![AnalysisRally {
             start_ms: 0,
             end_ms: 1000,
@@ -2548,7 +2581,7 @@ fn scan_adopts_the_highest_version_and_keeps_older_files() {
     let v2_name = publish_versioned_analysis(
         &lib,
         &abs,
-        2,
+        cur + 1,
         vec![AnalysisRally {
             start_ms: 5000,
             end_ms: 9000,
@@ -2561,11 +2594,12 @@ fn scan_adopts_the_highest_version_and_keeps_older_files() {
     designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
     scan_library(&mut conn).unwrap();
 
-    // The v2 draft (highest version) was adopted, not v1.
+    // The newer draft (highest version) was adopted, not the current one.
     let tl = recording_timeline(&conn, &abs.to_string_lossy())
         .unwrap()
         .unwrap();
-    assert_eq!(tl.duration_ms, Some(2000)); // publish_versioned_analysis marks v2 → 2000
+    // publish_versioned_analysis marks version N with a duration of N s.
+    assert_eq!(tl.duration_ms, Some(1000 * i64::from(cur + 1)));
     assert_eq!(
         tl.rallies
             .iter()
@@ -2583,12 +2617,43 @@ fn scan_adopts_the_highest_version_and_keeps_older_files() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, Some(2));
+    assert_eq!(v, Some(i64::from(cur + 1)));
 
     // Both files remain on disk — nothing was deleted from shared storage.
     let dir = lib.0.join(".voloph").join("analysis");
     assert!(dir.join(&v1_name).exists(), "older Analysis was deleted");
     assert!(dir.join(&v2_name).exists());
+}
+
+/// An Analysis older than the library segmenter's version is never adopted: the
+/// stale path would re-derive it on the next scan, and a pre-v7 v6 draft carries
+/// the old baked-in padding that playback would pad a second time (ADR 0020). The
+/// recording stays queued for the worker, and the old file stays on disk.
+#[test]
+fn scan_never_adopts_an_analysis_older_than_the_segmenter() {
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let old = publish_versioned_analysis(
+        &lib,
+        &abs,
+        crate::segment::SEGMENTER_VERSION - 1,
+        vec![AnalysisRally {
+            start_ms: 0,
+            end_ms: 1000,
+            confidence: 0.9,
+        }],
+    );
+    let mut conn = open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    // Twice: a rescan must not adopt it either.
+    scan_library(&mut conn).unwrap();
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(tl.segment_state, "unknown");
+    assert!(tl.rallies.is_empty());
+    assert!(lib.0.join(".voloph").join("analysis").join(&old).exists());
 }
 
 /// A newer-version Analysis is published *alongside* a stale one — a bump backfills
@@ -2764,5 +2829,250 @@ fn version_bump_does_not_disturb_bundle_receive() {
             .unwrap()
             .segment_state,
         "ready"
+    );
+}
+
+// --- Selectable segmenters (ADR 0019, issue #105) ------------------------
+//
+// These open the DB through `super::open` so they see the real default (the
+// student), not the v6 pin the older tests use.
+
+fn segmenter_stamp(conn: &Connection, id: i64) -> (Option<String>, Option<i64>, String) {
+    conn.query_row(
+        "SELECT segmenter_id, segmenter_version, segment_state FROM recordings WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap()
+}
+
+fn one_rally() -> Vec<crate::segment::Rally> {
+    vec![crate::segment::Rally {
+        start_ms: 0,
+        end_ms: 4000,
+        confidence: 0.7,
+    }]
+}
+
+#[test]
+fn a_library_defaults_to_the_student_and_remembers_a_choice() {
+    use crate::segment::Segmenter;
+    let conn = super::open(Path::new(":memory:")).unwrap();
+    assert_eq!(
+        library_segmenter(&conn, "local").unwrap(),
+        Segmenter::Student
+    );
+    set_library_segmenter(&conn, "local", Segmenter::V6).unwrap();
+    assert_eq!(library_segmenter(&conn, "local").unwrap(), Segmenter::V6);
+    // Per library: the other one keeps the default.
+    assert_eq!(
+        library_segmenter(&conn, "shared").unwrap(),
+        Segmenter::Student
+    );
+    // An unknown stored id (from a newer build) falls back to the default.
+    meta_set(&conn, "segmenter.shared", "teacher-v9").unwrap();
+    assert_eq!(
+        library_segmenter(&conn, "shared").unwrap(),
+        Segmenter::Student
+    );
+}
+
+/// Switching a library's segmenter re-derives its untouched drafts, never a
+/// hand-touched one, and leaves drafts the chosen segmenter already made alone.
+#[test]
+fn switching_segmenter_rederives_only_untouched_drafts_made_by_another() {
+    use crate::segment::Segmenter;
+    let lib = TempLib::new();
+    let a = lib.write("a.mp4", b"aaaa");
+    let b = lib.write("b.mp4", b"bbbb");
+    let c = lib.write("c.mp4", b"cccc");
+    let mut conn = super::open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    set_library_segmenter(&conn, "local", Segmenter::V6).unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = |p: &Path| recording_id(&conn, &p.to_string_lossy()).unwrap().unwrap();
+    let (ia, ib, ic) = (id(&a), id(&b), id(&c));
+    for i in [ia, ib] {
+        super::save_rallies(&mut conn, i, 60000, &one_rally(), &[], Segmenter::V6).unwrap();
+    }
+    super::save_rallies(&mut conn, ic, 60000, &one_rally(), &[], Segmenter::Student).unwrap();
+    let v6 = Some(i64::from(crate::segment::SEGMENTER_VERSION));
+    assert_eq!(
+        segmenter_stamp(&conn, ia),
+        (Some("v6".into()), v6, "ready".into())
+    );
+    // b is hand-touched: a corrected rally.
+    conn.execute(
+        "UPDATE rallies SET confidence = 1.0 WHERE recording_id = ?1",
+        [ib],
+    )
+    .unwrap();
+
+    set_library_segmenter(&conn, "local", Segmenter::Student).unwrap();
+    scan_library(&mut conn).unwrap();
+
+    // a (untouched, v6) goes back to the worker; b keeps its hand-corrected v6 draft;
+    // c was already the student's.
+    assert_eq!(segmenter_stamp(&conn, ia), (None, None, "unknown".into()));
+    assert_eq!(
+        segmenter_stamp(&conn, ib),
+        (Some("v6".into()), v6, "ready".into())
+    );
+    assert_eq!(
+        segmenter_stamp(&conn, ic),
+        (
+            Some("student".into()),
+            Some(i64::from(crate::student::VERSION)),
+            "ready".into()
+        )
+    );
+}
+
+#[test]
+fn a_learned_segmenters_analysis_file_is_invisible_to_older_builds() {
+    let name = analysis_file_name_for("abc", 42, "student", 1);
+    assert_eq!(name, "abc_42.student1.vanalysis");
+    // Older builds adopt `{key}.vanalysis` or `{key}_s*.vanalysis` only.
+    assert!(name != "abc_42.vanalysis" && !name.starts_with("abc_42_s"));
+    assert_eq!(
+        analysis_file_name_for("abc", 42, "v6", 6),
+        analysis_file_name("abc", 42, 6)
+    );
+}
+
+/// A shared library adopts only Analyses its own segmenter made, and records which.
+#[test]
+fn adoption_takes_only_the_librarys_segmenter() {
+    use crate::segment::Segmenter;
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    // Only a v6 Analysis is published for these bytes.
+    publish_test_analysis(
+        &lib,
+        &abs,
+        vec![AnalysisRally {
+            start_ms: 1000,
+            end_ms: 5000,
+            confidence: 0.4,
+        }],
+    );
+    let mut conn = super::open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tl.segment_state, "unknown",
+        "a student library must not adopt a v6 draft"
+    );
+
+    // Once a student Analysis exists, it is adopted and stamped as the student's.
+    let meta = std::fs::metadata(&abs).unwrap();
+    let hash = quick_hash(&abs, meta.len()).unwrap();
+    let analysis = Analysis {
+        segmenter: "student".to_string(),
+        format: ANALYSIS_FORMAT.to_string(),
+        version: ANALYSIS_VERSION,
+        segmenter_version: crate::student::VERSION,
+        capture_day: "2026-01-01".to_string(),
+        duration_ms: Some(42_000),
+        waveform: vec![],
+        rallies: vec![AnalysisRally {
+            start_ms: 2000,
+            end_ms: 6000,
+            confidence: 0.8,
+        }],
+    };
+    let name = analysis_file_name_for(&hash, meta.len() as i64, "student", crate::student::VERSION);
+    std::fs::write(
+        lib.0.join(".voloph").join("analysis").join(name),
+        serde_json::to_vec(&analysis).unwrap(),
+    )
+    .unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        segmenter_stamp(&conn, id),
+        (
+            Some("student".into()),
+            Some(i64::from(crate::student::VERSION)),
+            "ready".into()
+        )
+    );
+    let tl = recording_timeline(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tl.rallies
+            .iter()
+            .map(|r| (r.start_ms, r.end_ms))
+            .collect::<Vec<_>>(),
+        vec![(2000, 6000)]
+    );
+    let _ = Segmenter::V6;
+}
+
+/// A student draft publishes under the student's name, with its id inside.
+#[test]
+fn a_student_draft_publishes_under_its_own_name() {
+    use crate::segment::Segmenter;
+    let lib = TempLib::new();
+    let abs = lib.write("game.mp4", b"aaaa");
+    let mut conn = super::open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "shared", &lib.0, "network").unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &abs.to_string_lossy())
+        .unwrap()
+        .unwrap();
+    super::save_rallies(&mut conn, id, 60000, &one_rally(), &[], Segmenter::Student).unwrap();
+    publish_analysis(&conn, id);
+    let meta = std::fs::metadata(&abs).unwrap();
+    let hash = quick_hash(&abs, meta.len()).unwrap();
+    let path = lib
+        .0
+        .join(".voloph")
+        .join("analysis")
+        .join(analysis_file_name_for(
+            &hash,
+            meta.len() as i64,
+            "student",
+            crate::student::VERSION,
+        ));
+    let a: Analysis = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        (a.segmenter.as_str(), a.segmenter_version),
+        ("student", crate::student::VERSION)
+    );
+}
+
+/// The switch command's core: stores the choice and queues exactly the untouched
+/// drafts another segmenter made, without a rescan.
+#[test]
+fn switch_segmenter_queues_untouched_drafts_without_a_rescan() {
+    use crate::segment::Segmenter;
+    let lib = TempLib::new();
+    let a = lib.write("a.mp4", b"aaaa");
+    let mut conn = super::open(Path::new(":memory:")).unwrap();
+    designate_library(&mut conn, "local", &lib.0, "local").unwrap();
+    set_library_segmenter(&conn, "local", Segmenter::V6).unwrap();
+    scan_library(&mut conn).unwrap();
+    let id = recording_id(&conn, &a.to_string_lossy()).unwrap().unwrap();
+    super::save_rallies(&mut conn, id, 60000, &one_rally(), &[], Segmenter::V6).unwrap();
+    assert_eq!(
+        switch_segmenter(&mut conn, "local", Segmenter::Student).unwrap(),
+        1
+    );
+    assert_eq!(
+        library_segmenter(&conn, "local").unwrap(),
+        Segmenter::Student
+    );
+    assert_eq!(segmenter_stamp(&conn, id).2, "unknown");
+    // Switching to the segmenter already in use queues nothing.
+    assert_eq!(
+        switch_segmenter(&mut conn, "local", Segmenter::Student).unwrap(),
+        0
     );
 }

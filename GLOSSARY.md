@@ -13,7 +13,7 @@ A single raw video file as it came off the camera, attached to a session. May co
 _Avoid_: VOD, video, clip, game, match
 
 **Rally**:
-A continuous segment of play, roughly serve to point decided. The atomic unit of review — you navigate, annotate, and skip at the granularity of rallies.
+A continuous segment of play, from serve contact to the moment the point is decided (the shuttle touching the floor, or failing at the net). The atomic unit of review — you navigate, annotate, and skip at the granularity of rallies. Its edges are always these strict ones; any lead-in or tail seen on screen is **clip padding**.
 _Avoid_: point, clip, segment (when you mean a rally specifically)
 
 **Gap**:
@@ -31,6 +31,18 @@ _Avoid_: flag, low-confidence marker, suspect
 **Suppressed span**:
 A draft span the segmenter judged to be non-play — off the default timeline, so review and export skip it, but never destroyed: revealed on demand during review and restorable to a rally with one operation. The third tier between "rally on the timeline" and "nothing there": it lets the segmenter fight false positives aggressively while no span of play is ever unrecoverable. Distinct from an **Uncertain region**, which stays visible ("check this"); a suppressed span is hidden ("judged non-play — recoverable if the machine was wrong").
 _Avoid_: deleted rally, hidden span, rejected span, trash, filtered rally
+
+**Segmenter**:
+The machine that drafts a recording's timeline. There are three — the **student**, the **teacher**, and **v6**, the original hand-tuned one — and each library chooses one; every draft records which segmenter made it. Switching re-drafts only recordings nobody has touched.
+_Avoid_: model, detector, algorithm (when you mean the whole drafting step); "rally detection" is the UI's name for the choice
+
+**Student**:
+The default segmenter: learned from the teacher's drafts and hand-verified timelines, it reads only the cheap signals v6 already uses (sound, motion, where people stand), so it drafts quickly on any machine. Shown as "Standard".
+_Avoid_: fast model, small model
+
+**Teacher**:
+The most accurate segmenter: it tracks the shuttle and the players' poses through the whole recording, so it is slow without a GPU. Its drafts trained the student. Shown as "Precise".
+_Avoid_: big model, accurate model, shuttle tracker (that is one of its parts)
 
 **Analysis**:
 The machine-produced output of segmenting one recording, captured the moment segmentation completes — before any human correction: the draft timeline with per-rally confidence (uncertain regions included), the waveform, the duration, and the capture day. Impersonal — a pure function of the recording and the segmenter, carrying no review state and no attribution, which is why another user may adopt it silently. Hand corrections never enter an Analysis; they travel only inside a session bundle.
@@ -55,6 +67,10 @@ _Avoid_: highlight, star, favourite, bookmark
 **Rally length**:
 Every rally is classified **long** or **short** by its duration against a threshold. Purely objective and automatic — derived from the timeline, carrying no judgment of quality. Used to filter and surface rallies (e.g. "show me the long rallies"). Quality (good/bad) is never inferred from length; it is only ever set manually.
 _Avoid_: good/bad, quality, rating
+
+**Clip padding**:
+The lead-in before and tail after each rally that playback and export add, so a rally is seen with a moment of context. A per-device viewing preference over every library, never stored in a rally; changing it re-drafts nothing.
+_Avoid_: rally padding, margin, buffer, handles
 
 **Library**:
 A folder that is the app's whole world of recordings while active — every recording lives under the active library; a video outside it does not exist to the app. There are at most two: one **shared library** on common storage (NAS, cloud-drive mount) that other people and devices reach, and one **local library**, private to this device. A switcher makes one active at a time; the session list, filters, and review all see only the active library, and a session never spans libraries. The user puts files in a library; the app only references them (reference-in-place, ADR 0003, is unchanged). Identity inside a library is by location relative to its folder. For the shared library, each device declares where it is mounted and whether that mount is local or network — per-device knowledge, never shared. Session bundles exist only in the shared library.

@@ -81,6 +81,83 @@ pub fn set_active_kind(conn: &Connection, kind: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The segmenter a library's drafts are drawn with (ADR 0019): the stored per-library
+/// choice, or [`crate::segment::DEFAULT_SEGMENTER`]. Per device, like every `meta` key —
+/// members of a shared library each choose for themselves.
+pub fn library_segmenter(
+    conn: &Connection,
+    kind: &str,
+) -> rusqlite::Result<crate::segment::Segmenter> {
+    Ok(meta_get(conn, &format!("segmenter.{kind}"))?
+        .and_then(|id| crate::segment::Segmenter::from_id(&id))
+        .unwrap_or(crate::segment::DEFAULT_SEGMENTER))
+}
+
+/// The segmenter for recording `id`'s library (ADR 0019).
+pub fn recording_segmenter(
+    conn: &Connection,
+    id: i64,
+) -> rusqlite::Result<crate::segment::Segmenter> {
+    let kind: String =
+        conn.query_row("SELECT library FROM recordings WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })?;
+    library_segmenter(conn, &kind)
+}
+
+/// Store a library's segmenter choice (ADR 0019). Re-deriving the drafts it makes
+/// stale is the caller's job ([`super::resegment_stale_untouched`]).
+pub fn set_library_segmenter(
+    conn: &Connection,
+    kind: &str,
+    segmenter: crate::segment::Segmenter,
+) -> rusqlite::Result<()> {
+    meta_set(conn, &format!("segmenter.{kind}"), segmenter.id())
+}
+
+/// Presentation padding (issue #104): stored rallies are strict (serve contact →
+/// shuttle down); playback and export widen each by a lead-in and a tail so the
+/// viewer sees the serve setup and the point land. One setting drives both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Padding {
+    pub lead_ms: i64,
+    pub tail_ms: i64,
+}
+
+pub const DEFAULT_PADDING: Padding = Padding {
+    lead_ms: 1000,
+    tail_ms: 1500,
+};
+/// Upper bound on either side, so a corrupted setting cannot swallow the gaps.
+const MAX_PADDING_MS: i64 = 10_000;
+
+/// The playback/export padding: the stored setting, or [`DEFAULT_PADDING`].
+pub fn playback_padding(conn: &Connection) -> rusqlite::Result<Padding> {
+    let get = |key: &str, default: i64| -> rusqlite::Result<i64> {
+        Ok(meta_get(conn, key)?
+            .and_then(|v| v.parse::<i64>().ok())
+            .map_or(default, |v| v.clamp(0, MAX_PADDING_MS)))
+    };
+    Ok(Padding {
+        lead_ms: get("padding.lead_ms", DEFAULT_PADDING.lead_ms)?,
+        tail_ms: get("padding.tail_ms", DEFAULT_PADDING.tail_ms)?,
+    })
+}
+
+/// Store the playback/export padding (clamped to 0–10 s per side).
+pub fn set_playback_padding(conn: &Connection, p: Padding) -> rusqlite::Result<()> {
+    meta_set(
+        conn,
+        "padding.lead_ms",
+        &p.lead_ms.clamp(0, MAX_PADDING_MS).to_string(),
+    )?;
+    meta_set(
+        conn,
+        "padding.tail_ms",
+        &p.tail_ms.clamp(0, MAX_PADDING_MS).to_string(),
+    )
+}
+
 /// Read a per-device app-state value from `meta`, or `None` when unset.
 pub fn meta_get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {

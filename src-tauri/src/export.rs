@@ -215,9 +215,49 @@ pub fn export(app: &AppHandle, srcs: &[&str], dest: &str, cuts: &[Cut]) -> Resul
     Ok(())
 }
 
+/// Widen strict rally intervals by the presentation padding (issue #104), clamp them
+/// to the recording, and merge any that now overlap or touch — the intervals a viewer
+/// actually watches. Input must be start-ascending (timeline order); so is the output.
+pub fn pad_intervals(
+    intervals: &[(i64, i64)],
+    pad: crate::db::Padding,
+    duration_ms: Option<i64>,
+) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for &(s, e) in intervals {
+        let start = (s - pad.lead_ms).max(0);
+        let end = duration_ms.map_or(e + pad.tail_ms, |d| (e + pad.tail_ms).min(d));
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padding_widens_clamps_and_merges_rallies() {
+        let pad = crate::db::Padding {
+            lead_ms: 1000,
+            tail_ms: 1500,
+        };
+        // The first rally clamps at 0, the next two now overlap and merge, the last
+        // clamps at the recording's end.
+        let got = pad_intervals(
+            &[(500, 3000), (8000, 9000), (11000, 12000), (19000, 19500)],
+            pad,
+            Some(20000),
+        );
+        assert_eq!(got, vec![(0, 4500), (7000, 13500), (18000, 20000)]);
+        assert_eq!(
+            pad_intervals(&[(5000, 6000)], pad, None),
+            vec![(4000, 7500)]
+        );
+    }
 
     /// An empty selection is a caller error, not a silent empty file.
     #[test]

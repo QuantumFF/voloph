@@ -12,8 +12,8 @@
 //! We keep **class 0 (person)** only, score `= obj * cls_person`, threshold, and NMS.
 //!
 //! **Hardware-adaptive, no user choice (ADR 0015).** [`Detector::load`] registers the
-//! GPU execution providers compiled in for this OS (CUDA on Linux, DirectML on
-//! Windows) *ahead of* CPU. `ort`'s default behavior is a silent fallback: an EP that
+//! GPU execution providers for this OS ([`crate::gpu::general_providers`]: DirectML
+//! on Windows; none on Linux, where it runs on CPU — ADR 0021) *ahead of* CPU. `ort`'s default behavior is a silent fallback: an EP that
 //! fails to register (no GPU, missing driver) is skipped and the next one — ultimately
 //! the always-present CPU provider — runs instead. The detections are identical across
 //! providers; only wall-clock differs, so there is nothing to surface to the user.
@@ -34,7 +34,6 @@ use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use ort::execution_providers::ExecutionProviderDispatch;
 use ort::session::{Session, SessionInputValue};
 use ort::value::Tensor;
 
@@ -145,6 +144,7 @@ impl DetectionTrack {
 pub struct Detector {
     session: Session,
     input_name: String,
+    _in_use: crate::gpu::SessionInUse,
 }
 
 impl Detector {
@@ -155,9 +155,10 @@ impl Detector {
     /// one. Errors only when the model itself cannot be loaded, never for a missing
     /// GPU.
     pub fn load(model_path: &std::path::Path) -> Result<Detector, String> {
+        crate::gpu::init_environment();
         let session = Session::builder()
             .map_err(|e| format!("ort session builder: {e}"))?
-            .with_execution_providers(gpu_execution_providers())
+            .with_execution_providers(crate::gpu::general_providers())
             .map_err(|e| format!("ort execution providers: {e}"))?
             // The recording's motion pass already saturates cores; cap inference
             // threads so the two passes do not thrash the CPU against each other.
@@ -176,6 +177,7 @@ impl Detector {
         Ok(Detector {
             session,
             input_name,
+            _in_use: crate::gpu::SessionInUse::acquire(false),
         })
     }
 
@@ -248,29 +250,6 @@ struct PixelBox {
     x2: f32,
     y2: f32,
     score: f32,
-}
-
-/// The GPU execution providers to try for this OS, most-preferred first. Each is left
-/// on `ort`'s default silent-fallback behavior: if the EP was not compiled in (its
-/// Cargo feature off) or the hardware/driver is absent, `ort` skips it and moves to the
-/// next, ending at the always-present CPU provider — which needs no entry here. The
-/// EP builder types exist in `ort`'s API regardless of the feature flag, so pushing
-/// them unconditionally never fails to compile; only registration is conditional, and
-/// that is handled silently at runtime. On CPU-only machines this list is simply
-/// ignored, and detections are identical either way (ADR 0015 — no user choice).
-pub(crate) fn gpu_execution_providers() -> Vec<ExecutionProviderDispatch> {
-    #[cfg(target_os = "linux")]
-    {
-        vec![ort::execution_providers::CUDAExecutionProvider::default().build()]
-    }
-    #[cfg(target_os = "windows")]
-    {
-        vec![ort::execution_providers::DirectMLExecutionProvider::default().build()]
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        Vec::new()
-    }
 }
 
 /// Decode YOLOX's raw `N x cols` output into scored person boxes in model-input pixel

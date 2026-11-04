@@ -156,7 +156,7 @@ median edge; going below ~10 misses on the current corpus costs a ≥ 4 s median
 | --- | --- | --- |
 | One rally shattered into fragments | `bridge_gap_ms` (2900) | ↑ raise |
 | A rally and the downtime after it fused into one | `bridge_gap_ms` | ↓ lower |
-| Serve or final shot clipped off | `pad_ms` (1200) | ↑ raise |
+| Serve or final shot clipped off *when watching* | the playback/export padding (`db::Padding`, default 1.0 s lead-in / 1.5 s tail), not the segmenter — stored rallies are strict since v7 (ADR 0020); `pad_ms` stays 0 | ↑ raise the padding |
 | Brief movements become "rallies" | `min_rally_ms` (1500) | ↑ raise — effective in whole `block_ms`-grid steps (~512 ms): values that truncate to a single block let any one flickering block through |
 
 The "uncertain" amber styling is controlled separately by `UNCERTAIN_CONFIDENCE`
@@ -172,7 +172,8 @@ seconds of dead air (annoying, recoverable). So when a pass is borderline, bias
 toward over-inclusion:
 
 - keep `motion_active_ratio` and `confirm_onsets_per_sec` on the **low** side, and
-- keep `bridge_gap_ms` / `pad_ms` on the **generous** side.
+- keep `bridge_gap_ms` on the **generous** side (edge generosity now comes from
+  the presentation padding, ADR 0020).
 
 A timeline that occasionally keeps a bit of downtime is a better default than one
 that clips play. The user hand-corrects the draft during review either way.

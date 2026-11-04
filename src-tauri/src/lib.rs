@@ -7,6 +7,11 @@ pub mod detect;
 /// hand-corrected timelines. Public so the `eval-harness` bin can drive it.
 pub mod eval;
 mod export;
+/// Where the ONNX models run (ADR 0021): per-OS GPU providers, the ONNX Runtime
+/// environment, and a clean exit after WebGPU. Public for the dev CLIs' exit.
+pub mod gpu;
+/// Shared pieces of the learned segmenters (ADR 0019).
+mod learned;
 mod media;
 mod media_worker;
 /// Serve-cue pose extraction (ADR 0017, issue #95 round 4): a nano RTMPose-t
@@ -16,6 +21,13 @@ mod media_worker;
 pub mod pose;
 mod segment;
 mod staging;
+/// The learned student segmenter (issue #105): boosted trees on v6's cheap signals.
+mod student;
+/// The learned teacher segmenter (issue #105): TrackNet shuttle track + player pose.
+mod teacher;
+/// TrackNetV3 shuttle tracking (ADR 0019, issue #105): the teacher segmenter's
+/// first stage. Public so the `tracknet-dump` dev CLI can drive it.
+pub mod tracknet;
 
 // Embedded libmpv playback (ADR 0008, ADR 0014). Linux and Windows — it links
 // libmpv and drives the platform's native surface (GTK overlay / child HWND)
@@ -404,6 +416,51 @@ async fn rescan_library(app: AppHandle, db: State<'_, Db>) -> Result<db::ScanRes
     Ok(result)
 }
 
+/// The lead-in and tail playback and export add around each strict rally (#104).
+#[tauri::command]
+async fn playback_padding(db: State<'_, Db>) -> Result<db::Padding, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::playback_padding(&conn).map_err(|e| e.to_string())
+}
+
+/// Store the playback/export padding (#104).
+#[tauri::command]
+async fn set_playback_padding(db: State<'_, Db>, padding: db::Padding) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::set_playback_padding(&conn, padding).map_err(|e| e.to_string())
+}
+
+/// The segmenter the active library draws its drafts with (ADR 0019), as its id.
+#[tauri::command]
+async fn active_segmenter(db: State<'_, Db>) -> Result<String, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let kind = db::active_kind(&conn).map_err(|e| e.to_string())?;
+    Ok(db::library_segmenter(&conn, &kind)
+        .map_err(|e| e.to_string())?
+        .id()
+        .to_string())
+}
+
+/// Switch the active library's segmenter (ADR 0019): untouched drafts another
+/// segmenter made are re-derived in the background; hand-touched recordings keep
+/// theirs. Returns how many recordings were queued.
+#[tauri::command]
+async fn set_active_segmenter(
+    app: AppHandle,
+    db: State<'_, Db>,
+    segmenter: String,
+) -> Result<usize, String> {
+    let segmenter = segment::Segmenter::from_id(&segmenter)
+        .ok_or_else(|| format!("unknown segmenter {segmenter}"))?;
+    let queued = {
+        let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+        let kind = db::active_kind(&conn).map_err(|e| e.to_string())?;
+        db::switch_segmenter(&mut conn, &kind, segmenter).map_err(|e| e.to_string())?
+    };
+    spawn_media_worker(&app);
+    Ok(queued)
+}
+
 /// Re-analyze every recording (ADR 0002) — the bulk counterpart of
 /// [`reanalyze_recording`], for re-segmenting the whole library after a segmenter
 /// change. Discards manual corrections, as a re-analyze does.
@@ -569,19 +626,26 @@ async fn filter_moments(
 /// export cuts, keeping only the selected `rally_ids` (`None` keeps every rally).
 /// Timeline order is already start_ms-ascending, so the cuts come out in timeline
 /// order — appending each recording's cuts in turn yields capture-then-timeline
-/// order across a whole session.
+/// order across a whole session. Each strict rally is widened by the presentation
+/// padding (issue #104), clamped to the recording, and overlapping cuts merged.
 fn selected_cuts(
-    rallies: &[db::TimelineRally],
+    timeline: &db::Timeline,
     src: usize,
     rally_ids: &Option<Vec<i64>>,
+    pad: db::Padding,
 ) -> Vec<export::Cut> {
-    rallies
+    let strict: Vec<(i64, i64)> = timeline
+        .rallies
         .iter()
         .filter(|r| rally_ids.as_ref().is_none_or(|ids| ids.contains(&r.id)))
-        .map(|r| export::Cut {
+        .map(|r| (r.start_ms, r.end_ms))
+        .collect();
+    export::pad_intervals(&strict, pad, timeline.duration_ms)
+        .into_iter()
+        .map(|(start_ms, end_ms)| export::Cut {
             src,
-            start_ms: r.start_ms,
-            end_ms: r.end_ms,
+            start_ms,
+            end_ms,
         })
         .collect()
 }
@@ -600,13 +664,17 @@ async fn export_rallies(
     output: String,
     rally_ids: Option<Vec<i64>>,
 ) -> Result<(), String> {
-    let timeline = {
+    let (timeline, pad) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        db::recording_timeline(&conn, &path)
+        let timeline = db::recording_timeline(&conn, &path)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "recording is not registered".to_string())?
+            .ok_or_else(|| "recording is not registered".to_string())?;
+        (
+            timeline,
+            db::playback_padding(&conn).map_err(|e| e.to_string())?,
+        )
     };
-    let cuts = selected_cuts(&timeline.rallies, 0, &rally_ids);
+    let cuts = selected_cuts(&timeline, 0, &rally_ids, pad);
     export::export(&app, &[&path], &output, &cuts)
 }
 
@@ -629,12 +697,13 @@ async fn export_session(
 ) -> Result<(), String> {
     let cuts: Vec<export::Cut> = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let pad = db::playback_padding(&conn).map_err(|e| e.to_string())?;
         let mut cuts = Vec::new();
         for (src, path) in paths.iter().enumerate() {
             let timeline = db::recording_timeline(&conn, path)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("recording is not registered: {path}"))?;
-            cuts.extend(selected_cuts(&timeline.rallies, src, &rally_ids));
+            cuts.extend(selected_cuts(&timeline, src, &rally_ids, pad));
         }
         cuts
     };
@@ -685,7 +754,7 @@ pub fn run() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([
@@ -749,6 +818,10 @@ pub fn run() {
             reanalyze_recording,
             rescan_library,
             reanalyze_all,
+            active_segmenter,
+            set_active_segmenter,
+            playback_padding,
+            set_playback_padding,
             update_rally,
             add_rally,
             delete_rally,
@@ -779,6 +852,11 @@ pub fn run() {
                 let _ = webview.window().show();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    // Run until the last window closes (Tauri cleans up on the way out), then end the
+    // process through gpu::exit, which avoids ONNX Runtime's crashing static teardown
+    // after WebGPU was used (ADR 0021).
+    let code = app.run_return(|_, _| {});
+    gpu::exit(code);
 }

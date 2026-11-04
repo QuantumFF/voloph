@@ -101,7 +101,7 @@ const TIMELINE: Timeline = {
  */
 const flush = () => act(async () => {})
 
-async function renderPlayback() {
+async function renderPlayback(padding?: { lead_ms: number; tail_ms: number }) {
   const recordings = [{ path: "a.mp4" }]
   const timelines = { "a.mp4": TIMELINE }
   const session = buildSessionModel(recordings, timelines)
@@ -113,6 +113,7 @@ async function renderPlayback() {
         timelines,
         session,
         segmentOffset: (i) => session.segments[i]?.offsetMs ?? 0,
+        padding,
       }),
     // The app mounts under StrictMode (main.tsx), whose dev-mode synchronous
     // setup→cleanup→setup is exactly what exposed the listener leak below —
@@ -132,6 +133,16 @@ beforeEach(() => {
 })
 
 describe("session playback orchestration vs. the async mpv boundary", () => {
+  it("with padding, plays each rally's tail and skips to the next lead-in (#104)", async () => {
+    await renderPlayback({ lead_ms: 1000, tail_ms: 1500 })
+    fileLoaded()
+    tick(34_000) // inside R1
+    tick(36_000) // past R1's strict end, still in its 1.5 s tail
+    expect(seeksSent()).toEqual([])
+    tick(37_000) // out of the tail, into the gap
+    expect(seeksSent()).toEqual([59_000]) // R2's start minus the 1 s lead-in
+  })
+
   it("control: gap-free playback skips a gap to the next rally", async () => {
     await renderPlayback()
     fileLoaded()

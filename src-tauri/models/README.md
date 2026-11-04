@@ -1,4 +1,4 @@
-# Vendored detector weights (ADR 0015 Stage 2, issue #83)
+# Vendored model weights (ADR 0015 Stage 2, issue #83; ADR 0019, issue #105)
 
 The occupancy signal (ADR 0015) is derived from a single **nano-scale person
 detector** run through ONNX Runtime (`ort`) over frames the ffmpeg sidecar
@@ -41,8 +41,9 @@ record the new one), and keep this README and `LICENSE` in sync.
 The **serve cue** (ADR 0017) is a nano-scale **pose** model — a *new signal
 class*, not a bigger detector — run only in densified windows around candidate
 span starts to decide whether a proposal shows a serve. It is observational in
-round 4 (the `eval-harness --serve` mode); the shipped app never runs it until
-the v6 build clears the kill criterion.
+round 4 (the `eval-harness --serve` mode); the v6 segmenter never runs it. Since
+ADR 0019 the **teacher** segmenter runs it in the app over the whole recording for
+its player features (see `teacher-v1.json`).
 
 - **Model:** RTMPose-t (`rtmpose-t_simcc-body7`, OpenMMLab MMPose). Top-down
   17-keypoint (COCO body) SimCC pose estimator, ~3.4M params. Nano-class, and
@@ -74,3 +75,84 @@ the v6 build clears the kill criterion.
 To re-vendor: `scripts/fetch-pose-model.sh` downloads the bundle, verifies the
 bundle SHA, extracts `end2end.onnx` to `models/rtmpose_t.onnx`, and verifies its
 SHA. Keep this README and `LICENSE-rtmpose` in sync with any new weights.
+
+## `tracknet_v3.onnx` and `inpaintnet_v3.onnx` (ADR 0019, issue #105)
+
+The **teacher** rally segmenter (ADR 0019) starts from a per-frame shuttlecock
+track: TrackNetV3's two networks, run by `src/tracknet.rs` exactly as TrackNetV3's
+own `predict.py --eval_mode nonoverlap` runs them offline
+(`scripts/teacher-tracknet.py`).
+
+- **Models:** TrackNetV3 (Chen & Wang, "TrackNetV3: Enhancing ShuttleCock Tracking
+  with Augmentations and Trajectory Rectification", 2023). *TrackNet* is a U-Net
+  heatmap tracker (~11.3M params, `seq_len 8`, `bg_mode 'concat'`); *InpaintNet* a
+  small 1-D conv net (`seq_len 16`) that fills gaps in the predicted trajectory.
+- **License:** **MIT** — see `LICENSE-tracknetv3` in this directory (verbatim copy
+  of the TrackNetV3 repository's LICENSE, which explicitly covers the *pretrained
+  model checkpoints*).
+- **Source project:** https://github.com/qaz812345/TrackNetV3, commit `6eda442`
+  (`6eda442ada1740573f200f836d93edc9a541ee86`).
+- **Checkpoints:** `ckpts/TrackNet_best.pt` (SHA-256
+  `df867641a02712b021f04548ff4b1208ddfdb47f629ab2094ceb978667e83b1a`) and
+  `ckpts/InpaintNet_best.pt` (SHA-256
+  `5749b66b8002f3ad9e0af841604004706fc796df30599e6bf01952696009688c`), from the
+  checkpoint zip linked in the project README.
+- **Export:** `scripts/export-tracknet-onnx.py` (torch 2.11, legacy TorchScript
+  exporter, opset 17, dynamic batch); it checks each file with ONNX Runtime against
+  torch on random input (max abs difference ~1e-6). TrackNet's first convolution
+  is widened to 28 input channels behind an in-graph zero `Pad` of `x` (the same
+  sums plus zero terms; the input stays 27 channels) because ONNX Runtime's WebGPU
+  provider computes a 27-input-channel convolution wrongly (ADR 0021). Against the
+  unpadded export it differs by < 1e-6 on CPU.
+- **`tracknet_v3.onnx` SHA-256:** `f58666df173a461396865d07282e14d7f2cce9238564cf2bd21c5f1d1ea57e1f`
+- **`inpaintnet_v3.onnx` SHA-256:** `40aa41beaf3d15aed95ea31673f540db28f210a1828d8e221384a285ff8283ee`
+
+### Input / output contract (implemented in `src/tracknet.rs`)
+
+- **TrackNet input `x`:** `N x 27 x 288 x 512` float32 (NCHW). 27 channels = the
+  background frame then 8 consecutive frames, **RGB** each, in that order
+  (`[bg_R, bg_G, bg_B, f0_R, f0_G, f0_B, …, f7_B]`), every value `u8 / 255`
+  (no mean/std). The background is the per-pixel median of every frame in the
+  120 s chunk, truncated to `u8`. Frames are the recording at 30 fps scaled to
+  512x288.
+- **TrackNet output `y`:** `N x 8 x 288 x 512` float32 sigmoid heatmaps, one per
+  input frame. A frame's point is the centre of the bounding box of the largest
+  (by box area) 8-connected blob of `y > 0.5`, or "not visible" when none.
+- **InpaintNet inputs:** `x` `N x 16 x 2` float32 — 16 consecutive points as
+  `(x / 512, y / 288)` (an invisible frame is `(0, 0)`); `m` `N x 16 x 1` float32 —
+  1 for frames to inpaint (TrackNetV3's `generate_inpaint_mask`), else 0.
+- **InpaintNet output `y`:** `N x 16 x 2` float32 sigmoid coordinates in the same
+  normalization. Used only where `m = 1`; a point under `COOR_TH` (≈ 0.0851) on
+  both axes means "not visible".
+
+To re-vendor: run `scripts/export-tracknet-onnx.py --tracknet <checkout>` with a
+python that has torch, onnx and onnxruntime, record the new SHA-256s here, and
+keep `LICENSE-tracknetv3` in sync.
+
+## student-v1.json
+
+The learned **student** rally segmenter (ADR 0019, issues #100/#105), read by
+`src/student.rs`. Not a third-party model: trained in this repo by
+`scripts/student.py` (gradient-boosted trees, exported as plain JSON by
+`silver-ctx.export_trees`) on the three signals v6 already computes — motion energy,
+audio level + hit onsets, YOLOX person boxes (`signals-dump`) — with labels from the
+dev gold files plus teacher v3 silver; the gate-v2 test recordings were never used.
+Frozen as `eval/models/student-v1.json` (sha256 `72e88972…`); gate v2 GREEN (span
+precision 0.991, recall ≥ 3 s 0.962, edges ≤ 1 s 81.5 %). The file carries its
+feature layout (`signals`, `windows_s`); the app refuses a layout it does not compute.
+Parity: the Rust port reproduces `scripts/student.py` on all 18 corpus recordings
+(908/908 rallies identical).
+
+## teacher-v1.json
+
+The learned **teacher** rally segmenter (ADR 0019, #105), read by `src/teacher.rs`.
+Trained in this repo by `scripts/silver-ctx.py train --edges` (logistic-regression
+context model + logistic edge refiner, plain JSON) on the shuttle tracks the app itself
+computes (`tracknet-dump`, TrackNetV3 non-overlapping mode, see `tracknet_v3.onnx`) and
+the app's RTMPose-t player poses, with the gate-v2 test recordings held out. Copy kept
+as `eval/models/teacher-v1-app-tracks.json`. On the (already seen) gate-v2 test set:
+span precision 0.976, recall ≥ 3 s 0.971, edges ≤ 1 s 88 % (the blind result for the
+same recipe on offline tracks: 0.992 / 0.971 / 87 %). Parity: identical to Python on
+all 18 recordings given the same track and poses (971/971 rallies); the full in-app
+pipeline matches the offline run on the test recordings (123/127 rallies identical, all
+within 0.5 s).

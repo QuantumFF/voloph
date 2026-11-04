@@ -102,6 +102,60 @@ export interface Rally {
   flagged: boolean
 }
 
+/**
+ * Presentation padding (issue #104): stored rallies are strict — serve contact to
+ * the shuttle going down — and playback widens each by a lead-in and a tail so the
+ * serve setup and the landing are watched. Mirrors `db::Padding`; export applies
+ * the same setting in Rust.
+ */
+export interface Padding {
+  lead_ms: number
+  tail_ms: number
+}
+
+/** No widening: the strict rallies exactly as stored. */
+export const NO_PADDING: Padding = { lead_ms: 0, tail_ms: 0 }
+
+/** The app's default, until the stored setting loads — `db::DEFAULT_PADDING`. */
+export const DEFAULT_PADDING: Padding = { lead_ms: 1000, tail_ms: 1500 }
+
+/**
+ * The intervals playback actually plays: each strict rally widened by `pad`,
+ * clamped to the recording, and merged where the padding makes neighbours
+ * overlap. Input and output are start-ascending. A merged interval keeps the first
+ * rally's id/confidence/flag — navigation reads only the edges.
+ */
+export function playIntervals(
+  rallies: Rally[],
+  pad: Padding,
+  durationMs: number | null = null
+): Rally[] {
+  const out: Rally[] = []
+  for (const r of rallies) {
+    const start = Math.max(0, r.start_ms - pad.lead_ms)
+    const padded = r.end_ms + pad.tail_ms
+    const end = durationMs != null ? Math.min(durationMs, padded) : padded
+    const last = out[out.length - 1]
+    if (last && start <= last.end_ms) {
+      out[out.length - 1] = { ...last, end_ms: Math.max(last.end_ms, end) }
+    } else {
+      out.push({ ...r, start_ms: start, end_ms: end })
+    }
+  }
+  return out
+}
+
+/**
+ * Where playback opens a session rally (#104): its padded lead-in on the
+ * session axis, clamped to the start of the rally's own recording, as
+ * `playIntervals` clamps it, so the lead-in never reaches into the previous
+ * recording's tail.
+ */
+export function rallyLeadInMs(r: SessionRally, pad: Padding): number {
+  const recordingStart = r.globalStart - r.localStart
+  return Math.max(recordingStart, r.globalStart - pad.lead_ms)
+}
+
 /** Result of the `recording_timeline` command (see `src-tauri/src/db.rs`). */
 export interface Timeline {
   segment_state: "unknown" | "ready" | "failed"
@@ -482,13 +536,16 @@ export function resumeEntersFreePlay(
  */
 export function nextUncertainMs(
   rallies: SessionRally[],
-  hereMs: number
+  hereMs: number,
+  pad: Padding = NO_PADDING
 ): number | null {
   const uncertain = rallies.filter((r) => r.confidence < UNCERTAIN_CONFIDENCE)
   if (uncertain.length === 0) return null
+  // Compare lead-ins, not strict starts: after a jump the playhead sits on the
+  // rally's lead-in, before its start, and must not find the same rally again.
   const target =
-    uncertain.find((r) => r.globalStart > hereMs + 1) ?? uncertain[0]
-  return target.globalStart
+    uncertain.find((r) => rallyLeadInMs(r, pad) > hereMs + 1) ?? uncertain[0]
+  return rallyLeadInMs(target, pad)
 }
 
 /**

@@ -52,7 +52,54 @@
 /// recordings on this bump. (The motion-envelope end-edge placement scoped into #96
 /// was measured RED against its acceptance bar — it cut boundary median but raised
 /// hard misses above budget — and was not shipped; see ADR 0018 / #96.)
-pub const SEGMENTER_VERSION: u32 = 6;
+///
+/// v7 (issue #104, ADR 0020): rallies are stored **strict** — `pad_ms` defaults to 0,
+/// so v6's 1.2 s lead-in/tail is no longer baked into the draft. Padding is now a
+/// presentation setting applied by playback and export to every segmenter's strict
+/// rallies alike. Untouched v6 drafts re-derive on this bump; hand-touched ones keep
+/// the edges a person drew.
+pub const SEGMENTER_VERSION: u32 = 7;
+
+/// Which segmenter draws a library's drafts (ADR 0019): the v6 heuristic in this
+/// module, the learned student ([`crate::student`]), or the teacher
+/// ([`crate::teacher`]). Each has its own version, and
+/// a draft records both, so switching re-derives exactly the untouched drafts another
+/// segmenter (or an older version) made, and a shared Analysis says who made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segmenter {
+    V6,
+    Student,
+    Teacher,
+}
+
+impl Segmenter {
+    pub const ALL: [Segmenter; 3] = [Segmenter::Student, Segmenter::Teacher, Segmenter::V6];
+
+    /// The stable id stored in the DB and Analysis files. A NULL / absent id is `v6`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Segmenter::V6 => "v6",
+            Segmenter::Student => "student",
+            Segmenter::Teacher => "teacher",
+        }
+    }
+
+    pub fn version(self) -> u32 {
+        match self {
+            Segmenter::V6 => SEGMENTER_VERSION,
+            Segmenter::Student => crate::student::VERSION,
+            Segmenter::Teacher => crate::teacher::VERSION,
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Segmenter> {
+        Segmenter::ALL.into_iter().find(|s| s.id() == id)
+    }
+}
+
+/// A library with no stored choice uses the student: it beat v6 on the rally-level
+/// gate (#100) at about v6's cost.
+pub const DEFAULT_SEGMENTER: Segmenter = Segmenter::Student;
 
 /// A detected rally interval over a recording, in milliseconds from its start,
 /// carrying a per-region confidence in `[0, 1]`. Low-confidence rallies surface
@@ -279,8 +326,9 @@ pub struct Params {
     pub bridge_gap_ms: i64,
     /// Discard a motion run shorter than this (ms) — too brief to be a rally.
     pub min_rally_ms: i64,
-    /// Extend every rally edge by this much (ms) so the serve and the final shot
-    /// are not clipped (inclusion bias). Overlaps created by padding are merged.
+    /// Extend every rally edge by this much (ms). 0 since v7 (issue #104): stored
+    /// rallies are strict and padding is applied at playback/export
+    /// (`db::Padding`). Kept for tuning experiments; overlaps it creates are merged.
     pub pad_ms: i64,
 }
 
@@ -302,7 +350,7 @@ impl Default for Params {
             block_ms: 500,
             bridge_gap_ms: 2900,
             min_rally_ms: 1500,
-            pad_ms: 1200,
+            pad_ms: 0,
         }
     }
 }
@@ -1164,6 +1212,11 @@ fn merge_overlaps(rallies: Vec<Rally>) -> Vec<Rally> {
 mod tests {
     use super::*;
 
+    /// Since v7 rallies are strict (#104); a viewer sees them widened by the default
+    /// presentation padding, which is what inclusion bias is now measured against.
+    const LEAD: i64 = crate::db::DEFAULT_PADDING.lead_ms;
+    const TAIL: i64 = crate::db::DEFAULT_PADDING.tail_ms;
+
     const SR: u32 = 16_000;
     const FPS: f64 = 5.0;
 
@@ -1213,14 +1266,20 @@ mod tests {
         let rallies = segment(&audio, SR, &motion, None).rallies;
         assert_eq!(rallies.len(), 2, "expected two rallies, got {rallies:?}");
 
-        // Motion edges + padding place the boundaries; inclusion bias means we
-        // never start late or end early.
-        assert!(rallies[0].start_ms <= 5000, "rally 0 start {rallies:?}");
+        // Motion edges place the (strict, since v7) boundaries; inclusion bias now
+        // lives in presentation padding — the default lead-in covers any late start.
+        assert!(
+            rallies[0].start_ms <= 5000 + LEAD,
+            "rally 0 start {rallies:?}"
+        );
         assert!(
             (13_000..=16_500).contains(&rallies[0].end_ms),
             "rally 0 end {rallies:?}"
         );
-        assert!(rallies[1].start_ms <= 22_000, "rally 1 start {rallies:?}");
+        assert!(
+            rallies[1].start_ms <= 22_000 + LEAD,
+            "rally 1 start {rallies:?}"
+        );
         assert!(
             (30_000..=33_500).contains(&rallies[1].end_ms),
             "rally 1 end {rallies:?}"
@@ -1490,10 +1549,10 @@ mod tests {
             1,
             "occupancy should propose a rally: {rallies:?}"
         );
-        // Occupancy places the (unedged-by-motion) span roughly over [4,16); padding
-        // widens it. Never starts late / ends early (inclusion bias).
-        assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
-        assert!(rallies[0].end_ms >= 16_000, "end {rallies:?}");
+        // Occupancy places the (unedged-by-motion) span roughly over [4,16). Any late
+        // start / early end stays within the default presentation padding (#104).
+        assert!(rallies[0].start_ms <= 4_000 + LEAD, "start {rallies:?}");
+        assert!(rallies[0].end_ms >= 16_000 - TAIL, "end {rallies:?}");
     }
 
     #[test]
@@ -1636,8 +1695,8 @@ mod tests {
             1,
             "detector flicker must not shatter the rally: {rallies:?}"
         );
-        assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
-        assert!(rallies[0].end_ms >= 20_000, "end {rallies:?}");
+        assert!(rallies[0].start_ms <= 4_000 + LEAD, "start {rallies:?}");
+        assert!(rallies[0].end_ms >= 20_000 - TAIL, "end {rallies:?}");
     }
 
     #[test]
@@ -1688,8 +1747,8 @@ mod tests {
             1,
             "a deep retreat must not shatter or end the rally: {rallies:?}"
         );
-        assert!(rallies[0].start_ms <= 4_000, "start {rallies:?}");
-        assert!(rallies[0].end_ms >= 20_000, "end {rallies:?}");
+        assert!(rallies[0].start_ms <= 4_000 + LEAD, "start {rallies:?}");
+        assert!(rallies[0].end_ms >= 20_000 - TAIL, "end {rallies:?}");
     }
 
     // --- Occupancy kinematics (issue #93) -------------------------------------

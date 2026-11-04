@@ -22,6 +22,7 @@ import {
   type Verdict,
 } from "@/components/recording-player-transport"
 import { LONG_RALLY_MS, VERDICT_DOT } from "@/components/recording-player"
+import { usePlaybackPadding } from "@/components/recording-player/use-playback-padding"
 
 /** One recording in a session, enough to build a jump playlist. */
 interface Recording {
@@ -73,6 +74,7 @@ export function MomentBrowser({
   onBack: () => void
   onJump: (target: JumpTarget) => void
 }) {
+  const padding = usePlaybackPadding()
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
   const [results, setResults] = useState<FilteredRally[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
@@ -127,11 +129,12 @@ export function MomentBrowser({
       onJump({
         recordings: session.recordings,
         startIndex,
-        startMs: r.start_ms,
+        // Open on the rally's lead-in, as playback pads it (#104).
+        startMs: Math.max(0, r.start_ms - padding.lead_ms),
         day: r.capture_day,
       })
     },
-    [sessions, onJump]
+    [sessions, onJump, padding]
   )
 
   // Export a reel of the current filter (issue #14): every rally the filter

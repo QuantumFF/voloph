@@ -16,8 +16,17 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+
+import type { Padding } from "@/components/recording-player-transport"
+import {
+  describePadding,
+  PADDING_PRESETS,
+  paddingPresetId,
+} from "@/components/recording-player/use-playback-padding"
 
 import { kindLabel } from "./recording-state"
 import type { Library } from "./types"
@@ -25,7 +34,8 @@ import type { Library } from "./types"
 /**
  * The thin top bar (issue #48): app identity, the library switcher, and the
  * library actions — browse moments, refresh, designate libraries, receive a
- * bundle, and re-analyze all.
+ * bundle, choose rally detection (ADR 0019) and the clip padding (ADR 0020),
+ * and re-analyze all.
  */
 export function LibraryHeader({
   libraries,
@@ -35,6 +45,10 @@ export function LibraryHeader({
   scanning,
   refreshing,
   reanalyzingAll,
+  segmenter,
+  onSegmenter,
+  padding,
+  onPadding,
   onBrowse,
   onSwitch,
   onRefresh,
@@ -49,6 +63,10 @@ export function LibraryHeader({
   scanning: boolean
   refreshing: boolean
   reanalyzingAll: boolean
+  segmenter: string
+  onSegmenter: (id: string) => void
+  padding: Padding
+  onPadding: (padding: Padding) => void
   onBrowse: () => void
   onSwitch: (kind: string) => void
   onRefresh: () => void
@@ -162,7 +180,7 @@ export function LibraryHeader({
               <span className="sr-only">More library actions</span>
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-44">
+          <DropdownMenuContent align="end" className="w-60">
             <DropdownMenuLabel>Session bundle</DropdownMenuLabel>
             {/* Receive a shared review (ADR 0012): only meaningful against the
                 shared library, where bundles live and resolve. */}
@@ -174,6 +192,84 @@ export function LibraryHeader({
               <DownloadIcon className="size-4" />
               Receive bundle…
             </DropdownMenuItem>
+            {/* Rally detection (ADR 0019): per library. Switching re-analyzes the
+                untouched recordings in the background; hand-edited ones keep
+                their timelines. */}
+            <DropdownMenuLabel>Rally detection</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              value={segmenter}
+              onValueChange={onSegmenter}
+            >
+              <DropdownMenuRadioItem
+                value="student"
+                className="flex-col items-start gap-0"
+              >
+                <span>Standard</span>
+                <span className="text-xs text-muted-foreground">
+                  Fast on any computer
+                </span>
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem
+                value="teacher"
+                className="flex-col items-start gap-0"
+              >
+                <span>Precise</span>
+                <span className="text-xs text-muted-foreground">
+                  Tracks the shuttle; best with a GPU
+                </span>
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem
+                value="v6"
+                className="flex-col items-start gap-0"
+              >
+                <span>Classic</span>
+                <span className="text-xs text-muted-foreground">
+                  Catches more very short rallies, but invents more
+                </span>
+              </DropdownMenuRadioItem>
+            </DropdownMenuRadioGroup>
+            {/* Clip padding (ADR 0020): rallies are stored strict, serve to
+                landing; playback and export add this lead-in and tail. One
+                setting for every library; changing it re-analyzes nothing. A
+                value set outside these presets shows as "Custom". */}
+            <DropdownMenuLabel>Clip padding</DropdownMenuLabel>
+            <DropdownMenuRadioGroup
+              value={paddingPresetId(padding)}
+              onValueChange={(id) => {
+                const preset = PADDING_PRESETS.find((p) => p.id === id)
+                if (preset) {
+                  onPadding({
+                    lead_ms: preset.lead_ms,
+                    tail_ms: preset.tail_ms,
+                  })
+                }
+              }}
+            >
+              {PADDING_PRESETS.map((p) => (
+                <DropdownMenuRadioItem
+                  key={p.id}
+                  value={p.id}
+                  className="flex-col items-start gap-0"
+                >
+                  <span>{p.label}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {describePadding(p)}
+                  </span>
+                </DropdownMenuRadioItem>
+              ))}
+              {paddingPresetId(padding) === "custom" ? (
+                <DropdownMenuRadioItem
+                  value="custom"
+                  disabled
+                  className="flex-col items-start gap-0"
+                >
+                  <span>Custom</span>
+                  <span className="text-xs text-muted-foreground">
+                    {describePadding(padding)}
+                  </span>
+                </DropdownMenuRadioItem>
+              ) : null}
+            </DropdownMenuRadioGroup>
             <DropdownMenuLabel>All recordings</DropdownMenuLabel>
             <DropdownMenuItem
               onClick={onReanalyzeAll}

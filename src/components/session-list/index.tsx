@@ -55,6 +55,10 @@ export function SessionList({
     scanning,
     refreshing,
     reanalyzingAll,
+    segmenter,
+    handleSegmenter,
+    padding,
+    handlePadding,
     confirmAction,
     setConfirmAction,
     error,
@@ -142,6 +146,10 @@ export function SessionList({
         scanning={scanning}
         refreshing={refreshing}
         reanalyzingAll={reanalyzingAll}
+        segmenter={segmenter}
+        onSegmenter={(id) => void handleSegmenter(id)}
+        padding={padding}
+        onPadding={(p) => void handlePadding(p)}
         onBrowse={onBrowse}
         onSwitch={(kind) => void handleSwitch(kind)}
         onRefresh={() => void handleRefresh()}

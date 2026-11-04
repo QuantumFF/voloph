@@ -185,7 +185,7 @@ pub fn reset_segmentation(conn: &Connection, path: &str) -> rusqlite::Result<()>
     conn.execute(
         "UPDATE recordings
          SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
-             segmenter_version = NULL
+             segmenter_version = NULL, segmenter_id = NULL
          WHERE library = ?1 AND path = ?2",
         rusqlite::params![&kind, &key],
     )?;
@@ -207,7 +207,7 @@ pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE recordings
          SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
-             segmenter_version = NULL
+             segmenter_version = NULL, segmenter_id = NULL
          WHERE library = ?1",
         [&kind],
     )?;
@@ -232,20 +232,39 @@ pub fn reset_all_segmentation(conn: &Connection) -> rusqlite::Result<()> {
 /// published Analysis adopts it instead of re-computing (adoption prefers the
 /// highest version); one without falls to the worker. No column change lands inert:
 /// while `SEGMENTER_VERSION` is 1, nothing outranks anything and this is a no-op.
+///
+/// With selectable segmenters (ADR 0019) "stale" is per library: a draft is stale when
+/// a different segmenter made it than the one its library uses now, or an older
+/// version of the same one. So switching a library's segmenter re-derives its
+/// untouched drafts, and a hand-touched one keeps the segmenter that drew it.
 pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
-    let active = crate::segment::SEGMENTER_VERSION as i64;
-    let stale: Vec<i64> = {
+    let rows: Vec<(i64, String, Option<String>, i64)> = {
         let mut stmt = tx.prepare(
-            "SELECT id FROM recordings
+            "SELECT id, library, segmenter_id, segmenter_version FROM recordings
              WHERE segment_state = 'ready'
-               AND segmenter_version IS NOT NULL
-               AND segmenter_version < ?1",
+               AND segmenter_version IS NOT NULL",
         )?;
-        let ids = stmt
-            .query_map([active], |r| r.get(0))?
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        ids
+        rows
     };
+    let mut chosen = std::collections::HashMap::new();
+    let mut stale = Vec::new();
+    for (id, library, seg_id, version) in rows {
+        let active = match chosen.get(&library) {
+            Some(&s) => s,
+            None => {
+                let s = super::library_segmenter(tx, &library)?;
+                chosen.insert(library.clone(), s);
+                s
+            }
+        };
+        let made_by = seg_id.as_deref().unwrap_or("v6");
+        if made_by != active.id() || version < i64::from(active.version()) {
+            stale.push(id);
+        }
+    }
     for id in stale {
         // Hand-touched drafts carry corrections that no version bump may clobber.
         if is_hand_touched(tx, id)? {
@@ -255,12 +274,40 @@ pub(crate) fn resegment_stale_untouched(tx: &rusqlite::Transaction) -> rusqlite:
         tx.execute(
             "UPDATE recordings
              SET segment_state = 'unknown', duration_ms = NULL, waveform = NULL,
-                 segmenter_version = NULL
+                 segmenter_version = NULL, segmenter_id = NULL
              WHERE id = ?1",
             [id],
         )?;
     }
     Ok(())
+}
+
+/// Switch the segmenter `kind`'s library draws with (ADR 0019): store the choice,
+/// then — in one transaction — send its untouched drafts that another segmenter made
+/// back to the worker and adopt any shared Analyses the new segmenter already
+/// published. Hand-touched recordings keep their drafts. Returns how many recordings
+/// were queued for re-analysis.
+pub fn switch_segmenter(
+    conn: &mut Connection,
+    kind: &str,
+    segmenter: crate::segment::Segmenter,
+) -> rusqlite::Result<usize> {
+    let tx = conn.transaction()?;
+    super::set_library_segmenter(&tx, kind, segmenter)?;
+    let before: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM recordings WHERE library = ?1 AND segment_state = 'unknown'",
+        [kind],
+        |r| r.get(0),
+    )?;
+    resegment_stale_untouched(&tx)?;
+    super::adopt_analyses(&tx)?;
+    let after: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM recordings WHERE library = ?1 AND segment_state = 'unknown'",
+        [kind],
+        |r| r.get(0),
+    )?;
+    tx.commit()?;
+    Ok((after - before).max(0) as usize)
 }
 
 /// Advance a recording's segmentation lifecycle state (ADR 0002).
@@ -282,6 +329,7 @@ pub fn save_rallies(
     duration_ms: i64,
     rallies: &[crate::segment::Rally],
     waveform: &[f32],
+    segmenter: crate::segment::Segmenter,
 ) -> rusqlite::Result<()> {
     let waveform_json = super::waveform_to_json(waveform);
     let tx = conn.transaction()?;
@@ -303,17 +351,19 @@ pub fn save_rallies(
             ])?;
         }
     }
-    // Stamp the producing segmenter's version onto the draft (ADR 0013/0015) so a
-    // later bump can tell this draft is stale. A fresh machine analysis is always
-    // the active version — re-analyze and silent re-analysis both flow through here.
+    // Stamp the producing segmenter and its version onto the draft (ADR 0013/0015/
+    // 0019) so a later bump — or a switch of the library's segmenter — can tell this
+    // draft is stale. Re-analyze and silent re-analysis both flow through here.
     tx.execute(
         "UPDATE recordings
-         SET segment_state = 'ready', duration_ms = ?1, waveform = ?2, segmenter_version = ?3
-         WHERE id = ?4",
+         SET segment_state = 'ready', duration_ms = ?1, waveform = ?2, segmenter_version = ?3,
+             segmenter_id = ?4
+         WHERE id = ?5",
         rusqlite::params![
             duration_ms,
             waveform_json,
-            crate::segment::SEGMENTER_VERSION,
+            segmenter.version(),
+            segmenter.id(),
             recording_id
         ],
     )?;

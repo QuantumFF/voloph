@@ -12,6 +12,7 @@ import {
   buildSessionAnnotations,
   buildSessionModel,
   clamp,
+  rallyLeadInMs,
   type PlaylistRecording,
   type SessionModel,
   type SessionRally,
@@ -30,6 +31,7 @@ import { buildKeymap, useGlobalKeymap, type Keybinding } from "./keymap"
 import { useMpvTransport } from "./use-mpv-transport"
 import { useSessionExport } from "./use-session-export"
 import { useSessionPlayback } from "./use-session-playback"
+import { usePlaybackPadding } from "./use-playback-padding"
 import { useSessionTimelines } from "./use-session-timelines"
 import { useTimelineEdits } from "./use-timeline-edits"
 import { CheatSheet } from "./cheat-sheet"
@@ -123,6 +125,8 @@ export function RecordingPlayer({
   // (ADR 0008) — lives behind this hook; the returned ref marks the empty pane
   // the surface is slaved to.
   const paneRef = useMpvSurface(showCheatSheet)
+  // Lead-in/tail around each strict rally for playback (#104).
+  const padding = usePlaybackPadding()
 
   // Draft timelines for the whole session, polled until segmented (ADR 0002).
   const { timelines, refreshTimeline, reanalyzing, reanalyze } =
@@ -167,6 +171,7 @@ export function RecordingPlayer({
     timelines,
     session,
     segmentOffset,
+    padding,
   })
 
   // mpv's transport state (reconciled from its events) and commands.
@@ -444,7 +449,7 @@ export function RecordingPlayer({
           recordings={recordings}
           annotations={sessionAnnotations}
           currentRallyIndex={currentRallyIndex}
-          onSelectRally={(rally) => seekSession(rally.globalStart)}
+          onSelectRally={(rally) => seekSession(rallyLeadInMs(rally, padding))}
         />
 
         <main className="flex min-w-0 flex-1 flex-col">

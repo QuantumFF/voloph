@@ -9,5 +9,12 @@ fn main() {
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=dylib=mpv");
 
+    // ONNX Runtime's WebGPU provider links libwebgpu_dawn.so (ADR 0021). ort-sys copies
+    // it beside the build output (target/<profile>/ and deps/), and the Linux bundles
+    // install it under /usr/lib/Voloph (deb, rpm) or usr/lib (AppImage), so look in
+    // all three, relative to the executable.
+    #[cfg(target_os = "linux")]
+    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN:$ORIGIN/../lib/Voloph:$ORIGIN/../lib");
+
     tauri_build::build()
 }
