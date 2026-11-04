@@ -21,6 +21,9 @@ import {
   rallyIndexAt,
   rallyKey,
   rallyLeadInMs,
+  NO_PADDING,
+  paddedSpanMs,
+  paddedPlayIntervals,
   resumeStartMs,
   resumeTickLanded,
   seekTarget,
@@ -264,6 +267,93 @@ describe("rallyLeadInMs", () => {
     // b.mp4 starts at 10 s on the session axis; its rally starts 0.3 s in.
     expect(second.globalStart).toBe(10300)
     expect(rallyLeadInMs(second, pad)).toBe(10000)
+  })
+})
+
+describe("paddedSpanMs", () => {
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+
+  it("widens a rally by its lead-in and tail", () => {
+    expect(paddedSpanMs(5000, 6000, pad, 0, 10000)).toEqual({
+      start: 4000,
+      end: 7500,
+    })
+  })
+
+  it("never reaches past its own recording", () => {
+    // A recording spanning 10–20 s on the session axis.
+    expect(paddedSpanMs(10300, 19000, pad, 10000, 20000)).toEqual({
+      start: 10000,
+      end: 20000,
+    })
+  })
+
+  it("is the strict rally with no padding", () => {
+    expect(paddedSpanMs(5000, 6000, NO_PADDING, 0, 10000)).toEqual({
+      start: 5000,
+      end: 6000,
+    })
+  })
+})
+
+describe("paddedPlayIntervals", () => {
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+  const span = (
+    recordingIndex: number,
+    globalStart: number,
+    globalEnd: number,
+    recordingStart = 0,
+    recordingEnd = 100_000
+  ) => ({
+    recordingIndex,
+    globalStart,
+    globalEnd,
+    recordingStart,
+    recordingEnd,
+  })
+
+  it("merges rallies whose padding touches into one box", () => {
+    expect(
+      paddedPlayIntervals(
+        [span(0, 5000, 6000), span(0, 8000, 9000), span(0, 20000, 21000)],
+        pad
+      )
+    ).toEqual([
+      { recordingIndex: 0, globalStart: 4000, globalEnd: 10500 },
+      { recordingIndex: 0, globalStart: 19000, globalEnd: 22500 },
+    ])
+  })
+
+  it("never merges across a recording boundary", () => {
+    expect(
+      paddedPlayIntervals(
+        [span(0, 8000, 9500, 0, 10000), span(1, 10300, 12000, 10000, 20000)],
+        pad
+      )
+    ).toEqual([
+      { recordingIndex: 0, globalStart: 7000, globalEnd: 10000 },
+      { recordingIndex: 1, globalStart: 10000, globalEnd: 13500 },
+    ])
+  })
+
+  it("draws exactly the session's play intervals", () => {
+    const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+      "a.mp4": timeline(10000, [rally(1, 2000, 3000), rally(2, 4000, 9500)]),
+      "b.mp4": timeline(10000, [rally(3, 300, 2000), rally(4, 7000, 8000)]),
+    })
+    const spans = model.rallies.map((r) => {
+      const seg = model.segments[r.recordingIndex]
+      return {
+        recordingIndex: r.recordingIndex,
+        globalStart: r.globalStart,
+        globalEnd: r.globalEnd,
+        recordingStart: seg.offsetMs,
+        recordingEnd: seg.offsetMs + (seg.durationMs ?? 0),
+      }
+    })
+    expect(paddedPlayIntervals(spans, pad)).toEqual(
+      sessionPlayIntervals(model, pad)
+    )
   })
 })
 

@@ -166,11 +166,83 @@ export function rallyLeadInMs(r: SessionRally, pad: Padding): number {
   return recordingStart + leadInMs(r.localStart, pad)
 }
 
+/**
+ * How far a rally's padding reaches on the session axis (#104) — the span the
+ * strip draws behind its strict block: `pad.lead_ms` before and `pad.tail_ms`
+ * after, clamped into its own recording `[recordingStart, recordingEnd]`, as
+ * `playIntervals` clamps them. Takes bare bounds so a live edge-drag can be
+ * padded too.
+ */
+export function paddedSpanMs(
+  globalStart: number,
+  globalEnd: number,
+  pad: Padding,
+  recordingStart: number,
+  recordingEnd: number
+): { start: number; end: number } {
+  return {
+    start: Math.max(recordingStart, globalStart - pad.lead_ms),
+    end: Math.min(recordingEnd, globalEnd + pad.tail_ms),
+  }
+}
+
 /** A play interval (see `playIntervals`) lifted onto the session-global axis. */
 export interface SessionPlayInterval {
   recordingIndex: number
   globalStart: number
   globalEnd: number
+}
+
+/** A strict rally span on the session axis, with its recording's bounds. */
+export interface RallySpan {
+  recordingIndex: number
+  globalStart: number
+  globalEnd: number
+  recordingStart: number
+  recordingEnd: number
+}
+
+/**
+ * The play intervals of arbitrary strict spans — what the strip draws as each
+ * segment's box. Each span is padded (`paddedSpanMs`, clamped into its
+ * recording) and merged with its neighbour where the padding makes them touch,
+ * never across a recording boundary: the same rule as `playIntervals`, so the
+ * boxes are exactly what playback and `[`/`]` step through. Takes bare spans so
+ * a live edge-drag reshapes its box as it moves. Ascending.
+ */
+export function paddedPlayIntervals(
+  spans: RallySpan[],
+  pad: Padding
+): SessionPlayInterval[] {
+  const sorted = [...spans].sort(
+    (a, b) =>
+      a.recordingIndex - b.recordingIndex || a.globalStart - b.globalStart
+  )
+  const out: SessionPlayInterval[] = []
+  for (const s of sorted) {
+    const { start, end } = paddedSpanMs(
+      s.globalStart,
+      s.globalEnd,
+      pad,
+      s.recordingStart,
+      s.recordingEnd
+    )
+    const last = out[out.length - 1]
+    if (
+      last &&
+      last.recordingIndex === s.recordingIndex &&
+      start <= last.globalEnd
+    ) {
+      last.globalEnd = Math.max(last.globalEnd, end)
+    } else {
+      out.push({
+        recordingIndex: s.recordingIndex,
+        globalStart: start,
+        globalEnd: end,
+      })
+    }
+  }
+  return out
 }
 
 /**

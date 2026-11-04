@@ -487,6 +487,7 @@ export function RecordingPlayer({
               session={session}
               annotations={sessionAnnotations}
               globalPlayheadMs={globalPlayheadMs}
+              padding={padding}
               pxPerSec={pxPerSec}
               setPxPerSec={setPxPerSec}
               following={following}
