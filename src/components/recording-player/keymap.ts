@@ -19,11 +19,32 @@ const VOLUME_STEP = 10
  * cheat-sheet, so they cannot drift.
  */
 export interface Keybinding {
+  /**
+   * Alternative chords that trigger it, each written `Mod+Key` (`Ctrl+←`); the
+   * cheat-sheet renders every part as its own key cap.
+   */
   keys: string[]
   label: string
+  /** Which cheat-sheet section it's listed under. */
+  group: KeyGroup
   match: (e: KeyboardEvent) => boolean
   run: (e: KeyboardEvent) => void
 }
+
+/**
+ * The cheat-sheet sections, in display order. `edit` bindings only act in
+ * timeline edit mode (`E`); `help` is the cheat-sheet's own toggle, shown as a
+ * footnote rather than a section.
+ */
+export const KEY_GROUPS = [
+  "playback",
+  "navigate",
+  "review",
+  "edit",
+  "timeline",
+  "help",
+] as const
+export type KeyGroup = (typeof KEY_GROUPS)[number]
 
 /** The player actions the keymap drives, provided by `RecordingPlayer`. */
 export interface KeymapActions {
@@ -33,9 +54,12 @@ export interface KeymapActions {
   frameStep: (forward: boolean) => void
   goToRally: (direction: "next" | "prev") => void
   goToUncertain: () => void
+  goToNextUnmarked: () => void
   toggleLoop: () => void
   toggleGapSkip: () => void
   jumpToPlayhead: () => void
+  zoomTimeline: (dir: 1 | -1) => void
+  fitTimeline: () => void
   toggleMute: () => void
   stepSpeed: (dir: 1 | -1) => void
   resetSpeed: () => void
@@ -62,9 +86,12 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     frameStep,
     goToRally,
     goToUncertain,
+    goToNextUnmarked,
     toggleLoop,
     toggleGapSkip,
     jumpToPlayhead,
+    zoomTimeline,
+    fitTimeline,
     toggleMute,
     stepSpeed,
     resetSpeed,
@@ -84,13 +111,15 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     {
       keys: ["Space", "K"],
       label: "Play / pause",
+      group: "playback",
       match: (e) =>
         plain(e) && (e.code === "Space" || e.key.toLowerCase() === "k"),
       run: togglePlay,
     },
     {
       keys: ["Ctrl+←", "Ctrl+→"],
-      label: "Seek ∓ 2.5s",
+      label: "Seek back / forward 2.5s",
+      group: "navigate",
       match: (e) =>
         (e.ctrlKey || e.metaKey) &&
         !e.shiftKey &&
@@ -101,7 +130,8 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     },
     {
       keys: ["←", "→"],
-      label: "Seek ∓ 5s",
+      label: "Seek back / forward 5s",
+      group: "navigate",
       match: (e) =>
         plain(e) && (e.key === "ArrowLeft" || e.key === "ArrowRight"),
       run: (e) =>
@@ -111,7 +141,8 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     },
     {
       keys: ["Shift+←", "Shift+→"],
-      label: "Seek ∓ 10s",
+      label: "Seek back / forward 10s",
+      group: "navigate",
       match: (e) =>
         e.shiftKey &&
         !e.ctrlKey &&
@@ -124,109 +155,157 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     {
       keys: ["↑", "↓"],
       label: "Volume up / down",
+      group: "playback",
       match: (e) => plain(e) && (e.key === "ArrowUp" || e.key === "ArrowDown"),
       run: (e) =>
         changeVolume(e.key === "ArrowUp" ? VOLUME_STEP : -VOLUME_STEP),
     },
     {
       keys: [",", "."],
-      label: "Frame step back / forward",
+      label: "Step one frame back / forward",
+      group: "navigate",
       match: (e) => plain(e) && (e.key === "," || e.key === "."),
       run: (e) => frameStep(e.key === "."),
     },
     {
       keys: ["[", "]"],
-      label: "Prev / Next rally",
+      label: "Previous / next rally",
+      group: "navigate",
       match: (e) => plain(e) && (e.key === "[" || e.key === "]"),
       run: (e) => goToRally(e.key === "[" ? "prev" : "next"),
     },
     {
       keys: ["U"],
       label: "Next uncertain region",
+      group: "navigate",
       match: (e) => plain(e) && e.key.toLowerCase() === "u",
       run: goToUncertain,
     },
     {
+      keys: ["N"],
+      label: "Next unmarked rally",
+      group: "navigate",
+      match: (e) => plain(e) && e.key.toLowerCase() === "n",
+      run: goToNextUnmarked,
+    },
+    {
       keys: ["L"],
       label: "Loop current rally",
+      group: "playback",
       match: (e) => plain(e) && e.key.toLowerCase() === "l",
       run: toggleLoop,
     },
     {
       keys: ["G"],
-      label: "Toggle skipping gaps",
+      label: "Skip gaps on / off",
+      group: "playback",
       match: (e) => plain(e) && e.key.toLowerCase() === "g",
       run: toggleGapSkip,
     },
     {
       keys: ["F"],
-      label: "Jump to playhead",
+      label: "Scroll the timeline to the playhead",
+      group: "timeline",
       match: (e) => plain(e) && e.key.toLowerCase() === "f",
       run: jumpToPlayhead,
     },
     {
+      // Unmodified, so they never meet the speed keys (Ctrl+- / Ctrl+= /
+      // Ctrl+0). Shift is allowed so `+` and `_` (Shift+= / Shift+-) count.
+      keys: ["-", "="],
+      label: "Zoom the timeline out / in",
+      group: "timeline",
+      match: (e) =>
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        (e.key === "-" || e.key === "_" || e.key === "=" || e.key === "+"),
+      run: (e) => zoomTimeline(e.key === "-" || e.key === "_" ? -1 : 1),
+    },
+    {
+      keys: ["0", "Z"],
+      label: "Fit the whole session",
+      group: "timeline",
+      match: (e) => plain(e) && (e.key === "0" || e.key.toLowerCase() === "z"),
+      run: fitTimeline,
+    },
+    {
       keys: ["E"],
-      label: "Toggle timeline editing",
+      label: "Enter / leave edit mode",
+      group: "edit",
       match: (e) => plain(e) && e.key.toLowerCase() === "e",
       run: toggleEditing,
     },
     {
       keys: ["A"],
-      label: "Add rally at playhead (edit mode)",
+      label: "Add a rally at the playhead",
+      group: "edit",
       match: (e) => editing && plain(e) && e.key.toLowerCase() === "a",
       run: addAtPlayhead,
     },
     {
       keys: ["S"],
-      label: "Split selected/current rally (edit mode)",
+      label: "Split the selected rally at the playhead",
+      group: "edit",
       match: (e) => editing && plain(e) && e.key.toLowerCase() === "s",
       run: splitEditTarget,
     },
     {
       keys: ["C"],
-      label: "Combine selected/current rally with next (edit mode)",
+      label: "Merge the selected rally with the next",
+      group: "edit",
       match: (e) => editing && plain(e) && e.key.toLowerCase() === "c",
       run: mergeEditTarget,
     },
     {
-      keys: ["X"],
-      label: "Delete selected/current rally (edit mode)",
-      match: (e) => editing && plain(e) && e.key.toLowerCase() === "x",
+      // Not X: X flags in both modes, so muscle-memory flagging in edit mode
+      // can never delete a rally.
+      keys: ["Delete", "Backspace"],
+      label: "Delete the selected rally",
+      group: "edit",
+      match: (e) =>
+        editing && plain(e) && (e.key === "Delete" || e.key === "Backspace"),
       run: deleteEditTarget,
     },
     {
       keys: ["M"],
-      label: "Mute",
+      label: "Mute / unmute",
+      group: "playback",
       match: (e) => plain(e) && e.key.toLowerCase() === "m",
       run: toggleMute,
     },
     {
       keys: ["1"],
-      label: "Annotate: good at playhead",
+      label: "Mark good at the playhead",
+      group: "review",
       match: (e) => plain(e) && e.key === "1",
       run: () => annotate("good"),
     },
     {
       keys: ["2"],
-      label: "Annotate: bad at playhead",
+      label: "Mark bad at the playhead",
+      group: "review",
       match: (e) => plain(e) && e.key === "2",
       run: () => annotate("bad"),
     },
     {
       keys: ["3"],
-      label: "Annotate: mistake at playhead",
+      label: "Mark mistake at the playhead",
+      group: "review",
       match: (e) => plain(e) && e.key === "3",
       run: () => annotate("mistake"),
     },
     {
       keys: ["X"],
       label: "Flag / unflag the current rally",
-      match: (e) => !editing && plain(e) && e.key.toLowerCase() === "x",
+      group: "review",
+      match: (e) => plain(e) && e.key.toLowerCase() === "x",
       run: flagCurrentRally,
     },
     {
       keys: ["Ctrl+-", "Ctrl+="],
       label: "Playback speed down / up",
+      group: "playback",
       match: (e) =>
         (e.ctrlKey || e.metaKey) &&
         !e.altKey &&
@@ -236,24 +315,28 @@ export function buildKeymap(actions: KeymapActions): Keybinding[] {
     {
       keys: ["Ctrl+0"],
       label: "Reset speed to 1×",
+      group: "playback",
       match: (e) => (e.ctrlKey || e.metaKey) && !e.altKey && e.key === "0",
       run: resetSpeed,
     },
     {
       keys: ["?"],
-      label: "Toggle this cheat-sheet",
+      label: "Show / hide these shortcuts",
+      group: "help",
       match: (e) => e.key === "?",
       run: toggleCheatSheet,
     },
     {
-      keys: ["Scroll over timeline"],
-      label: "Scroll the timeline",
+      keys: ["Scroll"],
+      label: "Pan the timeline (over the strip)",
+      group: "timeline",
       match: () => false,
       run: () => {},
     },
     {
-      keys: ["Alt + scroll over timeline"],
-      label: "Zoom timeline at the cursor",
+      keys: ["Alt+Scroll"],
+      label: "Zoom the timeline at the cursor",
+      group: "timeline",
       match: () => false,
       run: () => {},
     },
@@ -279,6 +362,17 @@ export function useGlobalKeymap(keymap: Keybinding[]) {
       }
       const binding = keymap.find((b) => b.match(e))
       if (!binding) return
+      // A modal (the cheat-sheet, a confirmation) owns the keyboard: playback
+      // keys must not act on the player hidden behind it. `?` still toggles the
+      // cheat-sheet so it closes the way it opened.
+      if (
+        !binding.keys.includes("?") &&
+        document.querySelector(
+          '[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]'
+        )
+      ) {
+        return
+      }
       e.preventDefault()
       e.stopPropagation()
       binding.run(e)

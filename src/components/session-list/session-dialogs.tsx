@@ -22,7 +22,7 @@ const confirmCopy = {
   reanalyze: {
     title: "Re-analyze all recordings?",
     description:
-      "This re-detects rallies in every recording and discards every draft timeline — including any manual corrections you have made.",
+      "This re-detects rallies in every recording and discards every current timeline — including any corrections you made and any flags. Your verdicts are kept.",
     action: "Re-analyze all",
     destructive: true,
   },
@@ -110,6 +110,62 @@ export function ForgetReviewDialog({
             className={buttonVariants({ variant: "destructive" })}
           >
             Delete review
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+/**
+ * Per-recording re-analyze confirm: re-detecting a recording's rallies throws
+ * away its timeline — hand corrections and the flags that live on its rallies —
+ * so, like Re-analyze all, it is confirmed first. Its verdicts are kept: they
+ * are pinned to timestamps in the recording, not to rallies.
+ */
+export function ReanalyzeRecordingDialog({
+  target,
+  onCancel,
+  onConfirm,
+}: {
+  /** The recording to re-analyze and how many of its rallies are flagged. */
+  target: { path: string; flagged: number } | null
+  onCancel: () => void
+  onConfirm: (path: string) => void
+}) {
+  return (
+    <AlertDialog
+      open={target !== null}
+      onOpenChange={(o) => {
+        if (!o) onCancel()
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>
+            Re-analyze {target ? fileName(target.path) : "this recording"}?
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            Rallies are detected again from scratch. This discards the current
+            timeline, including any corrections you made
+            {target && target.flagged > 0
+              ? target.flagged === 1
+                ? " and the flag on 1 rally"
+                : ` and the flags on ${target.flagged} rallies`
+              : " and any flags"}
+            . Your verdicts are kept.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            onClick={() => {
+              if (target) onConfirm(target.path)
+              onCancel()
+            }}
+            className={buttonVariants({ variant: "destructive" })}
+          >
+            Re-analyze
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

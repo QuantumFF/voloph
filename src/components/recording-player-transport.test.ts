@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  CORRECTED_CONFIDENCE,
+  FOCUS_SEEK_SLACK_MS,
+  RALLY_START_INSET_MS,
   SPEED_LADDER,
   addAtPlayheadEdit,
   adjustRallyEdit,
@@ -8,24 +11,43 @@ import {
   buildSessionAnnotations,
   buildSessionModel,
   clampVolume,
+  describeHandCorrections,
+  countVerdicts,
+  describeLanding,
+  describeMarkBurst,
+  describeMomentPlace,
+  editBlockedReasons,
+  extendMarkBurst,
+  pruneMarkBurst,
   editAffordances,
   gapSkipAction,
+  handCorrections,
   inPlayInterval,
   leadInMs,
   mergeRallyEdit,
+  groupAnnotations,
+  momentLanding,
+  momentPlace,
+  markedRallyCount,
   nextRallyMs,
+  nextUnmarkedIndex,
+  rallyOpenMs,
+  rallyStepIndex,
   nextUncertainMs,
   prevRallyAction,
   rallyAt,
   rallyContains,
+  rallyFocusAt,
   rallyIndexAt,
   rallyKey,
+  rallyEditSeekMs,
   rallyLeadInMs,
   NO_PADDING,
   paddedSpanMs,
   paddedPlayIntervals,
   resumeStartMs,
   resumeTickLanded,
+  secondsUntil,
   seekTarget,
   sessionPlayIntervals,
   speedIndexForValue,
@@ -36,6 +58,7 @@ import {
   type SessionAnnotation,
   type SessionRally,
   type Timeline,
+  type Verdict,
 } from "./recording-player-transport"
 
 /** A rally with a default-certain confidence unless overridden. */
@@ -920,6 +943,355 @@ describe("rally containing a moment", () => {
   })
 })
 
+describe("rallyFocusAt", () => {
+  // a.mp4: rallies at 2–3 s and 3.5–4 s (tail and lead-in meet), then 8–9 s.
+  // b.mp4 starts at 10 s; its rally sits at 10.5–11 s on the session axis.
+  const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
+    "a.mp4": timeline(10000, [
+      rally(1, 2000, 3000),
+      rally(2, 3500, 4000),
+      rally(3, 8000, 9000),
+    ]),
+    "b.mp4": timeline(10000, [rally(1, 500, 1000)]),
+  })
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+
+  it.each([
+    // [session ms, kind, index, nextIndex]
+    [0, "none", -1, 0], // before anything: the first rally is next
+    [1500, "live", 0, -1], // in rally 1's lead-in
+    [2500, "live", 0, -1], // inside rally 1
+    [3100, "live", 0, -1], // tail of 1 and lead-in of 2: 1 is nearer
+    [3400, "live", 1, -1], // …now 2 is nearer
+    [5000, "live", 1, -1], // rally 2's tail (ends 5.5 s)
+    [6000, "after", 1, 2], // the gap: rally 2 stays in focus, 3 is up next
+    [9900, "live", 2, -1], // rally 3's tail, clamped to a.mp4
+    [10000, "live", 3, -1], // b.mp4's lead-in, clamped to its start
+    [13000, "after", 3, -1], // past the last rally: nothing follows
+  ] as const)("at %i ms focus is %s %i", (ms, kind, index, next) => {
+    expect(rallyFocusAt(model, pad, ms)).toEqual({
+      kind,
+      index,
+      nextIndex: next,
+    })
+  })
+
+  it("never pads a rally across its recording's end", () => {
+    // 9.5 s: a.mp4's tail would reach 10.5 s, but the recording ends at 10 s;
+    // b's lead-in opens exactly at 10 s.
+    expect(rallyFocusAt(model, pad, 9999).index).toBe(2)
+    expect(rallyFocusAt(model, NO_PADDING, 9500)).toEqual({
+      kind: "after",
+      index: 2,
+      nextIndex: 3,
+    })
+  })
+
+  it("with no rallies there is no focus", () => {
+    const empty = buildSessionModel([{ path: "a.mp4" }], {
+      "a.mp4": timeline(10000, []),
+    })
+    expect(rallyFocusAt(empty, pad, 5000)).toEqual({
+      kind: "none",
+      index: -1,
+      nextIndex: -1,
+    })
+  })
+})
+
+describe("rallyFocusAt after a jump to a lead-in", () => {
+  // a.mp4: rally 1 at 2–3 s, rally 2 at 8–9 s; lead-in 1 s, tail 1.5 s, so
+  // rally 2's lead-in opens at 7 s and the gap runs 4.5–7 s.
+  const model = buildSessionModel([{ path: "a.mp4" }], {
+    "a.mp4": timeline(10000, [rally(1, 2000, 3000), rally(2, 8000, 9000)]),
+  })
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+
+  it("keeps the rally whose lead-in a seek landed a frame short of", () => {
+    // A 30 fps frame before 7 s is still rally 2's — it doesn't flip back to
+    // "after rally 1" when that tick arrives (or when Skip gaps is toggled).
+    expect(rallyFocusAt(model, pad, 7000 - 1000 / 30)).toEqual({
+      kind: "live",
+      index: 1,
+      nextIndex: -1,
+    })
+    expect(rallyFocusAt(model, pad, 7000 - FOCUS_SEEK_SLACK_MS)).toMatchObject({
+      kind: "live",
+      index: 1,
+    })
+  })
+
+  it("is still the gap after the previous rally beyond that frame", () => {
+    expect(rallyFocusAt(model, pad, 7000 - FOCUS_SEEK_SLACK_MS - 1)).toEqual({
+      kind: "after",
+      index: 0,
+      nextIndex: 1,
+    })
+  })
+
+  it("leaves ownership alone: the lead-in still belongs to no rally", () => {
+    expect(momentPlace(model, pad, 7000 - 20)).toEqual({
+      kind: "before",
+      index: 1,
+      padded: true,
+    })
+  })
+})
+
+describe("rallyOpenMs", () => {
+  const r = sessionRally(1, 5000, 9000) // global 15–19 s
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+
+  it("opens on the lead-in while playing", () => {
+    expect(rallyOpenMs(r, pad, { atStrictStart: false })).toBe(14000)
+  })
+
+  it("opens just inside the true start while paused (or correcting)", () => {
+    const ms = rallyOpenMs(r, pad, { atStrictStart: true })
+    expect(ms).toBe(15000 + RALLY_START_INSET_MS)
+    expect(rallyContains(r, ms)).toBe(true)
+  })
+})
+
+describe("rallyStepIndex", () => {
+  // Rallies at 2–3 s, 8–9 s and 15–20 s of one recording.
+  const model = buildSessionModel([{ path: "a.mp4" }], {
+    "a.mp4": timeline(30000, [
+      rally(1, 2000, 3000),
+      rally(2, 8000, 9000),
+      rally(3, 15000, 20000),
+    ]),
+  })
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+
+  it.each([
+    // [session ms, next, prev]
+    [0, 0, 0], // before the first: next is it, prev snaps to it
+    [2050, 1, 0], // just inside rally 1 (where a paused jump lands)
+    [7500, 2, 0], // rally 2's lead-in: next is 3, prev steps back to 1
+    [8050, 2, 0], // just inside rally 2
+    [17000, -1, 2], // well into rally 3: prev restarts it, nothing next
+    [6000, 1, 0], // the gap after rally 1: next is 2, prev restarts 1
+  ] as const)("at %i ms next is %i, prev is %i", (ms, next, prev) => {
+    expect(rallyStepIndex(model, pad, ms, "next")).toBe(next)
+    expect(rallyStepIndex(model, pad, ms, "prev")).toBe(prev)
+  })
+
+  it("has nowhere to go without rallies", () => {
+    const empty = buildSessionModel([{ path: "a.mp4" }], {
+      "a.mp4": timeline(30000, []),
+    })
+    expect(rallyStepIndex(empty, pad, 0, "next")).toBe(-1)
+    expect(rallyStepIndex(empty, pad, 0, "prev")).toBe(-1)
+  })
+})
+
+describe("review progress", () => {
+  // Rallies at 1–2 s, 4–5 s and 7–8 s (global, one recording).
+  const model = buildSessionModel([{ path: "a.mp4" }], {
+    "a.mp4": timeline(10000, [
+      rally(1, 1000, 2000),
+      rally(2, 4000, 5000),
+      rally(3, 7000, 8000),
+    ]),
+  })
+  const mark = (id: number, ms: number): SessionAnnotation => ({
+    recordingIndex: 0,
+    path: "a.mp4",
+    id,
+    globalMs: ms,
+    verdict: "good",
+    aspect: null,
+    note: null,
+  })
+
+  it("counts rallies owning a mark; a mark in a gap counts for none", () => {
+    const marks = [mark(1, 1500), mark(2, 1600), mark(3, 3000)]
+    expect(markedRallyCount(model.rallies, marks)).toBe(1)
+  })
+
+  it("finds the next unmarked rally after the one shown, wrapping", () => {
+    const marks = [mark(1, 4500)] // rally 2 marked
+    expect(nextUnmarkedIndex(model.rallies, marks, 0)).toBe(2)
+    expect(nextUnmarkedIndex(model.rallies, marks, 2)).toBe(0)
+    expect(nextUnmarkedIndex(model.rallies, marks, -1)).toBe(0)
+  })
+
+  it("is -1 once every rally is marked", () => {
+    const marks = [mark(1, 1500), mark(2, 4500), mark(3, 7500)]
+    expect(nextUnmarkedIndex(model.rallies, marks, 0)).toBe(-1)
+  })
+})
+
+describe("momentPlace", () => {
+  // a.mp4: rallies at 2–3 s and 8–9 s; lead-in 1 s, tail 1.5 s.
+  const model = buildSessionModel([{ path: "a.mp4" }], {
+    "a.mp4": timeline(10000, [rally(1, 2000, 3000), rally(2, 8000, 9000)]),
+  })
+  const pad = { lead_ms: 1000, tail_ms: 1500 }
+
+  it.each([
+    // [session ms, place words, landing words]
+    // Before anything: the first rally is next, but doesn't own it.
+    [500, "Gap (before Rally 1)", "→ Gap · 0:00 (before Rally 1)"],
+    // Its lead-in: shown as rally 1, owned by none.
+    [1500, "Gap (Rally 1 lead-in)", "→ Gap · 0:01 (Rally 1 lead-in)"],
+    // Its strict start is inside it (half-open span).
+    [2000, "Rally 1", "→ Rally 1 · 0:02"],
+    [2500, "Rally 1", "→ Rally 1 · 0:02"],
+    // Its strict end belongs to the gap after it.
+    [3000, "Gap (Rally 1 tail)", "→ Gap · 0:03 (Rally 1 tail)"],
+    [3200, "Gap (Rally 1 tail)", "→ Gap · 0:03 (Rally 1 tail)"],
+    // The open gap after it.
+    [6000, "Gap (after Rally 1)", "→ Gap · 0:06 (after Rally 1)"],
+    [7500, "Gap (Rally 2 lead-in)", "→ Gap · 0:07 (Rally 2 lead-in)"],
+    [9800, "Gap (Rally 2 tail)", "→ Gap · 0:09 (Rally 2 tail)"],
+  ] as const)("at %i ms a verdict lands in %s", (ms, place, landing) => {
+    const where = momentPlace(model, pad, ms)
+    expect(describeMomentPlace(where)).toBe(place)
+    const clock = `0:0${Math.floor(ms / 1000)}`
+    expect(describeLanding(where, clock)).toBe(landing)
+  })
+
+  it("names a rally as receiver only when its strict span owns the moment", () => {
+    // Agrees with `rallyAt` — the ownership rule — at every probe.
+    for (let ms = 0; ms < 10000; ms += 250) {
+      const landing = momentLanding(momentPlace(model, pad, ms))
+      const owner = rallyIndexAt(model.rallies, ms)
+      expect(landing.owned).toBe(owner >= 0)
+      expect(landing.receiver).toBe(owner >= 0 ? `Rally ${owner + 1}` : "Gap")
+    }
+  })
+
+  it("with no rallies a moment is next to none", () => {
+    const empty = buildSessionModel([{ path: "a.mp4" }], {
+      "a.mp4": timeline(10000, []),
+    })
+    const where = momentPlace(empty, pad, 5000)
+    expect(where).toEqual({ kind: "none" })
+    expect(describeMomentPlace(where)).toBe("Gap")
+    expect(describeLanding(where, "0:05")).toBe("→ Gap · 0:05")
+  })
+})
+
+describe("rallyEditSeekMs", () => {
+  it("opens a rally just inside its strict start, so the playhead is in it", () => {
+    const r = { globalStart: 215000, globalEnd: 222000 }
+    const ms = rallyEditSeekMs(r)
+    expect(ms).toBe(215000 + RALLY_START_INSET_MS)
+    // A frame at 30 fps shown at that time is still inside the rally.
+    expect(ms - 1000 / 30).toBeGreaterThan(r.globalStart)
+  })
+
+  it("never passes the midpoint of a very short rally", () => {
+    expect(rallyEditSeekMs({ globalStart: 1000, globalEnd: 1040 })).toBe(1020)
+  })
+})
+
+describe("groupAnnotations", () => {
+  const mark = (id: number, verdict: Verdict, globalMs: number) => ({
+    id,
+    recordingIndex: 0,
+    path: "a.mp4",
+    verdict,
+    aspect: null,
+    note: null,
+    globalMs,
+  })
+
+  it("folds one verdict's marks within one displayed second into a row", () => {
+    const groups = groupAnnotations([
+      mark(1, "good", 19500),
+      mark(2, "good", 20100),
+      mark(3, "good", 20900),
+      mark(4, "bad", 20200),
+      mark(5, "good", 21000),
+    ])
+    expect(
+      groups.map((g) => [g.verdict, g.globalMs, g.marks.map((m) => m.id)])
+    ).toEqual([
+      ["good", 19500, [1]],
+      ["good", 20100, [2, 3]],
+      ["bad", 20200, [4]],
+      ["good", 21000, [5]],
+    ])
+  })
+
+  it("keys groups by verdict and second, so keys are unique", () => {
+    const keys = groupAnnotations([
+      mark(1, "good", 20000),
+      mark(2, "bad", 20000),
+      mark(3, "good", 20500),
+    ]).map((g) => g.key)
+    expect(new Set(keys).size).toBe(keys.length)
+    expect(keys).toHaveLength(2)
+  })
+
+  it("is empty for no annotations", () => {
+    expect(groupAnnotations([])).toEqual([])
+  })
+})
+
+describe("countVerdicts", () => {
+  it("tallies each verdict, zero for an absent one", () => {
+    expect(
+      countVerdicts([
+        { verdict: "good" },
+        { verdict: "good" },
+        { verdict: "mistake" },
+      ])
+    ).toEqual({ good: 2, bad: 0, mistake: 1 })
+  })
+})
+
+describe("secondsUntil", () => {
+  it.each([
+    // [from, target, seconds]
+    [214_600, 216_200, 2], // 1.6 s to wait reads "2s", not "1s" or "0s"
+    [215_900, 216_200, 1], // 0.3 s left is still "1s", never "0s"
+    [216_200, 216_200, 0], // at the moment itself
+    [217_000, 216_200, 0], // already past: never negative
+    [210_000, 213_000, 3], // whole seconds stay whole
+  ])("from %i to %i is %i s", (from, target, seconds) => {
+    expect(secondsUntil(from, target)).toBe(seconds)
+  })
+})
+
+describe("handCorrections", () => {
+  it("counts hand-corrected rallies and flags a re-analysis would discard", () => {
+    const flagged = { ...rally(3, 9000, 9500, 0.7), flagged: true }
+    expect(
+      handCorrections(
+        timeline(10000, [
+          rally(1, 1000, 2000, 0.8), // a machine draft
+          rally(2, 3000, 4000, CORRECTED_CONFIDENCE), // adjusted by hand
+          flagged,
+        ])
+      )
+    ).toEqual({ corrected: 1, flagged: 1 })
+  })
+
+  it("says what would be lost in words", () => {
+    expect(describeHandCorrections({ corrected: 2, flagged: 1 })).toBe(
+      "2 corrected rallies and 1 flag"
+    )
+    expect(describeHandCorrections({ corrected: 1, flagged: 0 })).toBe(
+      "1 corrected rally"
+    )
+    expect(describeHandCorrections({ corrected: 0, flagged: 3 })).toBe(
+      "3 flags"
+    )
+    expect(describeHandCorrections({ corrected: 0, flagged: 0 })).toBeNull()
+  })
+
+  it("finds nothing in an untouched draft or a missing timeline", () => {
+    expect(
+      handCorrections(timeline(10000, [rally(1, 1000, 2000, 0.99)]))
+    ).toEqual({ corrected: 0, flagged: 0 })
+    expect(handCorrections(undefined)).toEqual({ corrected: 0, flagged: 0 })
+  })
+})
+
 describe("editAffordances", () => {
   // Two rallies in a.mp4, one in b.mp4 (b starts at 10 s on the session axis).
   const model = buildSessionModel([{ path: "a.mp4" }, { path: "b.mp4" }], {
@@ -968,5 +1340,69 @@ describe("editAffordances", () => {
     const last = editAffordances(model.rallies, 2, null)
     expect(last.target).toBe(third)
     expect(last.canMerge).toBe(false)
+  })
+})
+
+describe("mark bursts", () => {
+  const mark = (id: number, verdict: "good" | "bad" | "mistake") => ({
+    path: "a.mp4",
+    id,
+    verdict,
+    globalMs: 24_000 + id,
+  })
+
+  it("marks on the same place collect into one burst, in press order", () => {
+    let burst = extendMarkBurst(null, "Rally 1", mark(1, "good"))
+    burst = extendMarkBurst(burst, "Rally 1", mark(2, "bad"))
+    burst = extendMarkBurst(burst, "Rally 1", mark(3, "mistake"))
+    expect(burst.marks.map((m) => m.id)).toEqual([1, 2, 3])
+    expect(describeMarkBurst(burst)).toBe("Good · Bad · Mistake")
+  })
+
+  it("a mark on another place starts a new burst", () => {
+    const first = extendMarkBurst(null, "Rally 1", mark(1, "good"))
+    const next = extendMarkBurst(first, "Rally 2", mark(2, "bad"))
+    expect(next).toEqual({ place: "Rally 2", marks: [mark(2, "bad")] })
+  })
+
+  it("repeats are counted, in verdict order", () => {
+    let burst = extendMarkBurst(null, "Rally 1", mark(1, "mistake"))
+    burst = extendMarkBurst(burst, "Rally 1", mark(2, "good"))
+    burst = extendMarkBurst(burst, "Rally 1", mark(3, "good"))
+    expect(describeMarkBurst(burst)).toBe("Good ×2 · Mistake")
+  })
+
+  it("pruning drops deleted marks, and the burst once it is empty", () => {
+    let burst = extendMarkBurst(null, "Rally 1", mark(1, "good"))
+    burst = extendMarkBurst(burst, "Rally 1", mark(2, "bad"))
+    expect(pruneMarkBurst(burst, () => true)).toBe(burst)
+    expect(pruneMarkBurst(burst, (m) => m.id !== 2)?.marks).toEqual([
+      mark(1, "good"),
+    ])
+    expect(pruneMarkBurst(burst, () => false)).toBeNull()
+    expect(pruneMarkBurst(null, () => true)).toBeNull()
+  })
+})
+
+describe("editBlockedReasons", () => {
+  it("with nothing selected every action asks for a selection", () => {
+    const r = editBlockedReasons(null, false, false)
+    expect(r.split).toMatch(/^Select a rally first/)
+    expect(r.merge).toMatch(/^Select a rally first/)
+    expect(r.delete).toMatch(/^Select a rally first/)
+  })
+
+  it("a split outside the selected rally says where the playhead must go", () => {
+    expect(editBlockedReasons(13, false, true)).toEqual({
+      split: "Move the playhead inside Rally 13 to split it there.",
+      merge: null,
+      delete: null,
+    })
+  })
+
+  it("an unmergeable rally says why", () => {
+    expect(editBlockedReasons(18, true, false).merge).toBe(
+      "Rally 18 has no next rally in the same recording to merge with."
+    )
   })
 })

@@ -1,6 +1,7 @@
 "use client"
 
 import {
+  ChevronDownIcon,
   ClapperboardIcon,
   DownloadIcon,
   FilterIcon,
@@ -8,38 +9,35 @@ import {
   MoreVerticalIcon,
   RefreshCwIcon,
   RotateCwIcon,
+  SettingsIcon,
 } from "lucide-react"
+
+import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuItemText,
   DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
 import type { Padding } from "@/components/recording-player-transport"
 
-import {
-  describePadding,
-  PADDING_PRESETS,
-  paddingForPreset,
-  paddingPresetId,
-  SEGMENTERS,
-  segmenterId,
-  type SegmenterId,
-} from "./library-settings"
-import { kindLabel } from "./recording-state"
+import type { SegmenterId } from "./library-settings"
+import { kindLabel, shortPath } from "./recording-state"
+import { SettingsDialog } from "./settings-dialog"
 import type { Library } from "./types"
 
 /**
  * The thin top bar (issue #48): app identity, the library switcher, and the
  * library actions — browse moments, refresh, designate libraries, receive a
- * bundle, choose rally detection (ADR 0019) and the clip padding (ADR 0020),
- * and re-analyze all.
+ * bundle, and re-analyze all. The persistent preferences — rally detection
+ * (ADR 0019) and clip padding (ADR 0020) — live in the Settings dialog behind
+ * the gear, apart from the one-off and destructive actions in the ⋮ menu.
  */
 export function LibraryHeader({
   libraries,
@@ -79,11 +77,14 @@ export function LibraryHeader({
   onReceive: () => void
   onReanalyzeAll: () => void
 }) {
+  const localLib = libraries.find((l) => l.kind === "local")
+  const sharedLib = libraries.find((l) => l.kind === "shared")
+  const [settingsOpen, setSettingsOpen] = useState(false)
   return (
     <header className="flex h-11 shrink-0 items-center gap-2.5 border-b px-4">
       <ClapperboardIcon className="size-5" />
       <span className="text-sm font-semibold">Voloph</span>
-      <span className="text-xs text-muted-foreground">
+      <span className="hidden text-xs text-muted-foreground lg:inline">
         Every rally, no downtime
       </span>
       <div className="ml-auto flex items-center gap-2">
@@ -123,40 +124,67 @@ export function LibraryHeader({
           size="sm"
           onClick={onRefresh}
           disabled={refreshing || library === null}
-          title="Re-scan the active library for newly added recordings."
+          title={
+            refreshing
+              ? "Re-scanning the library…"
+              : "Re-scan the active library for newly added recordings."
+          }
         >
           <RefreshCwIcon
             className={`size-4 ${refreshing ? "animate-spin" : ""}`}
           />
-          {/* Reserve the wider label's width so swapping the text on click
-              doesn't resize the button and reflow the row. */}
-          <span className="grid text-center">
-            <span className="invisible col-start-1 row-start-1">
-              Refreshing…
-            </span>
-            <span className="col-start-1 row-start-1">
-              {refreshing ? "Refreshing…" : "Refresh"}
-            </span>
-          </span>
+          {/* The spinning icon carries the busy state, so the label (and the
+              button's width) never changes mid-click. */}
+          <span aria-live="polite">Refresh</span>
         </Button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button size="sm" disabled={scanning}>
+            <Button variant="outline" size="sm" disabled={scanning}>
               <FolderOpenIcon className="size-4" />
               {scanning ? "Scanning…" : "Libraries"}
+              <ChevronDownIcon className="size-3.5 text-muted-foreground" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-64">
+          <DropdownMenuContent align="end" className="w-72">
             <DropdownMenuLabel>Local library</DropdownMenuLabel>
+            {/* A designated library's path is one truncated line (home as ~,
+                deep paths elided to their last folders); hovering the item
+                shows it whole. */}
             <DropdownMenuItem
               onClick={() => onDesignateLibrary("local", "local")}
+              title={localLib?.path}
             >
               <FolderOpenIcon className="size-4" />
-              {libraries.some((l) => l.kind === "local")
-                ? "Change local library"
-                : "Designate local library"}
+              <DropdownMenuItemText
+                description={
+                  localLib
+                    ? shortPath(localLib.path)
+                    : "Private to this computer. Pick the folder that holds your recordings."
+                }
+                className={
+                  localLib
+                    ? "[&_[data-slot=dropdown-menu-item-description]]:truncate"
+                    : undefined
+                }
+              >
+                {localLib ? "Change local library…" : "Choose local library…"}
+              </DropdownMenuItemText>
             </DropdownMenuItem>
-            <DropdownMenuLabel>Shared library</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>
+              Shared library
+              {sharedLib ? (
+                <span
+                  className="mt-0.5 block truncate text-[11px] text-muted-foreground/80"
+                  title={sharedLib.path}
+                >
+                  {shortPath(sharedLib.path)} ·{" "}
+                  {sharedLib.mount === "network"
+                    ? "network mount"
+                    : "local mount"}
+                </span>
+              ) : null}
+            </DropdownMenuLabel>
             {/* The user declares whether this device reaches the shared mount as
                 a local disk or over the network — an explicit choice, never
                 filesystem detection (ADR 0011). */}
@@ -164,16 +192,40 @@ export function LibraryHeader({
               onClick={() => onDesignateLibrary("shared", "local")}
             >
               <FolderOpenIcon className="size-4" />
-              Designate shared (local mount)
+              <DropdownMenuItemText description="A disk or synced folder on this computer">
+                {sharedLib ? "Change shared" : "Designate shared"} (local
+                mount)…
+              </DropdownMenuItemText>
             </DropdownMenuItem>
             <DropdownMenuItem
               onClick={() => onDesignateLibrary("shared", "network")}
             >
               <FolderOpenIcon className="size-4" />
-              Designate shared (network mount)
+              <DropdownMenuItemText description="A NAS or network share">
+                {sharedLib ? "Change shared" : "Designate shared"} (network
+                mount)…
+              </DropdownMenuItemText>
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+        <Button
+          variant="outline"
+          size="icon-sm"
+          onClick={() => setSettingsOpen(true)}
+          title="Settings — rally detection and clip padding"
+        >
+          <SettingsIcon className="size-4" />
+          <span className="sr-only">Settings</span>
+        </Button>
+        <SettingsDialog
+          open={settingsOpen}
+          onOpenChange={setSettingsOpen}
+          active={active}
+          segmenter={segmenter}
+          onSegmenter={onSegmenter}
+          padding={padding}
+          onPadding={onPadding}
+        />
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
@@ -185,87 +237,49 @@ export function LibraryHeader({
               <span className="sr-only">More library actions</span>
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-60">
+          <DropdownMenuContent align="end" className="w-72">
             <DropdownMenuLabel>Session bundle</DropdownMenuLabel>
             {/* Receive a shared review (ADR 0012): only meaningful against the
                 shared library, where bundles live and resolve. */}
             <DropdownMenuItem
               onClick={onReceive}
               disabled={active !== "shared"}
-              className="whitespace-nowrap"
             >
               <DownloadIcon className="size-4" />
-              Receive bundle…
+              <DropdownMenuItemText
+                description={
+                  active === "shared"
+                    ? "Apply a review someone shared with you"
+                    : sharedLib
+                      ? "Switch to the shared library to receive bundles"
+                      : "Needs a shared library — designate one under Libraries"
+                }
+              >
+                Receive bundle…
+              </DropdownMenuItemText>
             </DropdownMenuItem>
-            {/* Rally detection (ADR 0019): per library. Switching re-analyzes the
-                untouched recordings in the background; hand-edited ones keep
-                their timelines. */}
-            <DropdownMenuLabel>Rally detection</DropdownMenuLabel>
-            <DropdownMenuRadioGroup
-              value={segmenter ?? ""}
-              onValueChange={(value) => {
-                const id = segmenterId(value)
-                if (id) onSegmenter(id)
-              }}
-            >
-              {SEGMENTERS.map((s) => (
-                <DropdownMenuRadioItem
-                  key={s.id}
-                  value={s.id}
-                  className="flex-col items-start gap-0"
-                >
-                  <span>{s.label}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {s.hint}
-                  </span>
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
-            {/* Clip padding (ADR 0020): rallies are stored strict, serve to
-                landing; playback and export add this lead-in and tail. One
-                setting for every library; changing it re-analyzes nothing. A
-                value set outside these presets shows as "Custom". */}
-            <DropdownMenuLabel>Clip padding</DropdownMenuLabel>
-            <DropdownMenuRadioGroup
-              value={paddingPresetId(padding)}
-              onValueChange={(id) => {
-                const next = paddingForPreset(id)
-                if (next) onPadding(next)
-              }}
-            >
-              {PADDING_PRESETS.map((p) => (
-                <DropdownMenuRadioItem
-                  key={p.id}
-                  value={p.id}
-                  className="flex-col items-start gap-0"
-                >
-                  <span>{p.label}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {describePadding(p)}
-                  </span>
-                </DropdownMenuRadioItem>
-              ))}
-              {paddingPresetId(padding) === "custom" ? (
-                <DropdownMenuRadioItem
-                  value="custom"
-                  disabled
-                  className="flex-col items-start gap-0"
-                >
-                  <span>Custom</span>
-                  <span className="text-xs text-muted-foreground">
-                    {describePadding(padding)}
-                  </span>
-                </DropdownMenuRadioItem>
-              ) : null}
-            </DropdownMenuRadioGroup>
+            <DropdownMenuSeparator />
             <DropdownMenuLabel>All recordings</DropdownMenuLabel>
+            {/* Destructive (it discards hand corrections and flags), so it
+                reads as such here and still goes through the confirm dialog.
+                Same wording as the per-recording Re-analyze. */}
             <DropdownMenuItem
+              variant="destructive"
               onClick={onReanalyzeAll}
               disabled={reanalyzingAll}
-              className="whitespace-nowrap"
             >
-              <RotateCwIcon className="size-4" />
-              Re-analyze all
+              <RotateCwIcon
+                className={`size-4 ${reanalyzingAll ? "animate-spin" : ""}`}
+              />
+              <DropdownMenuItemText
+                description={
+                  reanalyzingAll
+                    ? "Already re-analyzing — wait for it to finish"
+                    : "Re-detects every recording's rallies. Keeps verdicts; discards your timeline corrections and flags."
+                }
+              >
+                {reanalyzingAll ? "Re-analyzing…" : "Re-analyze all…"}
+              </DropdownMenuItemText>
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

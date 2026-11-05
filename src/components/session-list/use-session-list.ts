@@ -19,6 +19,7 @@ import {
   type SegmenterId,
 } from "./library-settings"
 import { isProcessing } from "./recording-state"
+import { useReviewProgress } from "./use-review-progress"
 import type {
   Browsing,
   BundleOffer,
@@ -68,6 +69,12 @@ export function useSessionList(rescanOnMount: boolean) {
   // Discarding a retained review is destructive (the file may yet come back), so
   // it goes through the same confirm gate as the bulk re-analyze.
   const [forgetPath, setForgetPath] = useState<string | null>(null)
+  // A recording whose re-analyze awaits confirmation: it discards the timeline's
+  // corrections and flags, so it goes through a confirm like Re-analyze all.
+  const [reanalyzeTarget, setReanalyzeTarget] = useState<{
+    path: string
+    flagged: number
+  } | null>(null)
   // Cross-library carry-over offers (ADR 0011): the same content sits in both
   // libraries and only one side has hand-touched review. The app offers — never
   // silently — to carry that review to the other copy; the user accepts or declines
@@ -117,7 +124,12 @@ export function useSessionList(rescanOnMount: boolean) {
     }
   }, [])
 
-  const refresh = useCallback(async () => {
+  // Bumped by every refresh except the analysis poll, so review progress
+  // re-reads after anything that can change it (mount, returning from the
+  // player, a receive or carry) without re-querying on every 3 s poll tick.
+  const [reviewEpoch, setReviewEpoch] = useState(0)
+
+  const refresh = useCallback(async (poll = false) => {
     try {
       const [next, state, offers, label, bundles, seg] = await Promise.all([
         trackedInvoke<Session[]>("list_sessions"),
@@ -128,6 +140,7 @@ export function useSessionList(rescanOnMount: boolean) {
         trackedInvoke<string>("active_segmenter"),
       ])
       setSessions(next)
+      if (!poll) setReviewEpoch((e) => e + 1)
       setLibraries(state[0])
       setActive(state[1])
       setCarryOffers(offers)
@@ -324,7 +337,7 @@ export function useSessionList(rescanOnMount: boolean) {
   )
   useEffect(() => {
     if (!stillWorking) return
-    const interval = setInterval(() => void refresh(), 3000)
+    const interval = setInterval(() => void refresh(true), 3000)
     return () => clearInterval(interval)
   }, [stillWorking, refresh])
 
@@ -355,6 +368,10 @@ export function useSessionList(rescanOnMount: boolean) {
     )
   )
   const remainingByRecording = deriveRemaining(analyzing, progress)
+
+  // Per-recording review state (marked rallies, marks, flags) for the session
+  // blocks; null until the first load lands.
+  const review = useReviewProgress(sessions, reviewEpoch)
 
   // Designate (or re-designate) a library of `kind` ("local" | "shared") with the
   // folder where it is mounted here and its declared `mount` locality ("local" |
@@ -457,14 +474,31 @@ export function useSessionList(rescanOnMount: boolean) {
     return guard(() => setPlaybackPadding(next))
   }
 
+  // Reveal a recording in the system file manager (opener plugin, ADR 0003's
+  // reference-in-place: the file is wherever the user put it). Read-only.
+  function handleReveal(path: string) {
+    return guard(async () => {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener")
+      await revealItemInDir(path)
+    })
+  }
+
+  // Copy a recording's absolute path to the clipboard, confirmed by a toast.
+  function handleCopyPath(path: string) {
+    return guard(async () => {
+      await navigator.clipboard.writeText(path)
+      showToast("File path copied.")
+    })
+  }
+
   // Run whichever bulk action the confirmation dialog is open for, then close it.
   function handleConfirm() {
     if (confirmAction === "reanalyze") void runReanalyzeAll()
     setConfirmAction(null)
   }
 
-  // Per-recording re-analyze: re-run rally detection for one recording in place
-  // (discards its draft timeline). Mirrors the player's Re-analyze action.
+  // Per-recording re-analyze, once confirmed: re-run rally detection for one
+  // recording in place (discards its timeline, corrections and flags included).
   function handleReanalyze(path: string) {
     return guard(async () => {
       await trackedInvoke("reanalyze_recording", { path })
@@ -594,6 +628,8 @@ export function useSessionList(rescanOnMount: boolean) {
     unresolved,
     forgetPath,
     setForgetPath,
+    reanalyzeTarget,
+    setReanalyzeTarget,
     bundleOffers,
     shareTarget,
     setShareTarget,
@@ -607,6 +643,7 @@ export function useSessionList(rescanOnMount: boolean) {
     library,
     carryByPath,
     remainingByRecording,
+    review,
     handleCarry,
     handleDismiss,
     handleReceiveOffer,
@@ -622,6 +659,8 @@ export function useSessionList(rescanOnMount: boolean) {
     handleForget,
     handleConfirm,
     handleReanalyze,
+    handleReveal,
+    handleCopyPath,
     openShare,
     confirmShare,
     handleReceive,

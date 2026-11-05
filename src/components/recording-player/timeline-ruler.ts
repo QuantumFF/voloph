@@ -73,3 +73,113 @@ export function rulerTicks(
   }
   return ticks
 }
+
+/**
+ * Rough rendered width (px) of an 11px tabular timecode: digits ~6.2px, the
+ * colon narrower — rounded up so a label is hidden a touch early, never late.
+ */
+const TIMECODE_PX_PER_CHAR = 6.8
+
+/** The ruler label's inset from its tick (`left-1`). */
+const LABEL_INSET_PX = 4
+
+/** The playhead chip's horizontal padding (`px-1.5`), per side. */
+const CHIP_PAD_PX = 6
+
+/** Clear space kept between the chip and a neighbouring label. */
+const CHIP_GAP_PX = 4
+
+/** The off-screen playhead chip's inset from the strip's edge (`left-1`/`right-1`). */
+const EDGE_CHIP_INSET_PX = 4
+
+/** The off-screen playhead chip's chevron plus its uneven padding (`pl-1 pr-2`). */
+const EDGE_CHIP_EXTRA_PX = 26
+
+/** A horizontal extent on the strip, in content px. */
+export interface PxSpan {
+  lo: number
+  hi: number
+}
+
+/** Where a major tick's label sits: just right of its tick, as wide as its text. */
+export function labelSpan(tickPx: number, label: string): PxSpan {
+  const lo = tickPx + LABEL_INSET_PX
+  return { lo, hi: lo + label.length * TIMECODE_PX_PER_CHAR }
+}
+
+/**
+ * The ruler the playhead chip covers — a timecode badge centred on the
+ * playhead — widened by the clear gap kept around it.
+ */
+export function chipSpan(playheadPx: number, chipLabel: string): PxSpan {
+  const half =
+    (chipLabel.length * TIMECODE_PX_PER_CHAR) / 2 + CHIP_PAD_PX + CHIP_GAP_PX
+  return { lo: playheadPx - half, hi: playheadPx + half }
+}
+
+/**
+ * The ruler the off-screen playhead chip covers: pinned to the left or right
+ * edge of the visible window (`view`, content px), pointing the way back.
+ */
+export function edgeChipSpan(
+  side: "left" | "right",
+  view: { left: number; width: number },
+  chipLabel: string
+): PxSpan {
+  const width =
+    EDGE_CHIP_INSET_PX +
+    chipLabel.length * TIMECODE_PX_PER_CHAR +
+    EDGE_CHIP_EXTRA_PX +
+    CHIP_GAP_PX
+  return side === "left"
+    ? { lo: view.left, hi: view.left + width }
+    : { lo: view.left + view.width - width, hi: view.left + view.width }
+}
+
+/**
+ * Whether a major tick's label is drawn: only when the whole label fits inside
+ * the visible window — a label straddling the strip's edge would be sliced
+ * (":40") — and clears every chip over the ruler (`covered`), so none peeks out
+ * from under one ("0:0", "3:3"). Recomputed every render, so a label the
+ * playhead chip hid comes back as soon as the chip moves off it. A zero-width
+ * window (not measured yet) clips nothing.
+ */
+export function rulerLabelVisible(
+  tickPx: number,
+  label: string,
+  view: { left: number; width: number },
+  covered: PxSpan[]
+): boolean {
+  const { lo, hi } = labelSpan(tickPx, label)
+  if (view.width > 0 && (lo < view.left || hi > view.left + view.width)) {
+    return false
+  }
+  return covered.every((c) => hi <= c.lo || lo >= c.hi)
+}
+
+/**
+ * Whether a major tick's label (drawn starting just right of its tick) would
+ * sit under the playhead chip — a timecode badge centred on the playhead over
+ * the ruler — so the strip can drop it rather than leave a sliced "0:0" peeking
+ * out. Widths are estimated from the text length, padded so near-misses hide.
+ */
+export function labelUnderChip(
+  tickPx: number,
+  label: string,
+  playheadPx: number,
+  chipLabel: string
+): boolean {
+  return !rulerLabelVisible(tickPx, label, { left: 0, width: 0 }, [
+    chipSpan(playheadPx, chipLabel),
+  ])
+}
+
+/**
+ * Whether a rally's number fits inside its block, top-left: a plain 10px
+ * tabular label (~6px a digit, plus its inset and the block's border either
+ * side) needs this much block. Narrower blocks show the number only on hover /
+ * focus.
+ */
+export function rallyNumberFits(widthPx: number, label: string): boolean {
+  return widthPx >= Math.max(14, label.length * 6 + 8)
+}

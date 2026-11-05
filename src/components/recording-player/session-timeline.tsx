@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
   type Dispatch,
+  type MouseEvent as ReactMouseEvent,
   type SetStateAction,
 } from "react"
 import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react"
@@ -21,6 +22,7 @@ import {
   editAffordances,
   rallyKey,
   paddedPlayIntervals,
+  rallyFocusAt,
   rallyLeadInMs,
   stripScrollTarget,
   type Padding,
@@ -35,7 +37,25 @@ import {
 } from "./constants"
 import { RallyBlock, type DragState } from "./rally-block"
 import { EditToolbar, TimelineNav } from "./timeline-toolbar"
-import { rulerScale, rulerTicks } from "./timeline-ruler"
+import {
+  MARK_HEAD_PX,
+  MARK_HIT_PX,
+  MARK_PILL_PX,
+  VERDICT_ORDER,
+  dodgePlayhead,
+  groupMarks,
+  pillLabel,
+  pillWidth,
+  type MarkGroup,
+} from "./timeline-marks"
+import {
+  chipSpan,
+  edgeChipSpan,
+  rulerLabelVisible,
+  rulerScale,
+  rulerTicks,
+  type PxSpan,
+} from "./timeline-ruler"
 
 /** How much each Alt+scroll notch over the timeline zooms. */
 const ALT_SCROLL_ZOOM_FACTOR = 1.15
@@ -55,6 +75,39 @@ const PLAYHEAD_SNAP_THRESHOLD_MS = 250
  */
 const RULER_OVERSCAN = 0.5
 
+/**
+ * Heights of the strip's rows (px), top to bottom: the recording lane naming
+ * each recording, the time ruler, the marker band (verdict-mark heads and
+ * pills, and flags, just above the rallies they belong to), then the track of rally blocks over the
+ * waveform. The playhead starts below the lane — its badge sits on the ruler —
+ * so it never slices a recording's name. The marker band is sized around a
+ * 16px pile pill (MARK_PILL_PX) with a pixel clear above and below. Fixed, so
+ * the strip's height doesn't depend on the window: ruler + markers + track
+ * come to 120px, with the lane and scrollbar ~146px in all.
+ */
+const LANE_PX = 18
+const RULER_PX = 20
+const MARKER_PX = 18
+const TRACK_PX = 82
+
+/** Height (px) of a lone verdict mark's head, standing in the marker band. */
+const MARK_HEAD_H_PX = 7
+
+/**
+ * The rally the strip draws as current: the one playing (strict span or its
+ * padded lead-in / tail, #104) — the same rule the rail and inspector use
+ * (`rallyFocusAt`), so the three can't disagree. Null in a gap.
+ */
+function currentRallyKey(
+  session: SessionModel,
+  globalMs: number | null,
+  padding: Padding
+): string | null {
+  if (globalMs === null) return null
+  const focus = rallyFocusAt(session, padding, globalMs)
+  return focus.kind === "live" ? rallyKey(session.rallies[focus.index]) : null
+}
+
 /** Imperative surface of the timeline strip the player drives (jump-to-playhead). */
 export interface SessionTimelineHandle {
   scrollToPlayhead: () => void
@@ -66,10 +119,10 @@ export interface SessionTimelineHandle {
  * pixels-per-second scale. Each recording's audio waveform fills its span with
  * detected rallies drawn as blocks over it, gaps the empty space between them
  * (ADR 0001), low-confidence rallies styled as uncertain regions (ADR 0002), and
- * recordings marked off by solid dividers, alternating shading and a numbered
- * label at each one's start. A time ruler across the top labels the
- * session clock, with gridlines down through the strip at each label. The
- * playhead (red, with a timecode badge on the ruler) tracks the session
+ * recordings marked off by solid dividers, alternating shading and a lane
+ * above the ruler naming each one. A time ruler labels the session clock, with
+ * gridlines down through the strip at each label. The playhead (a neutral
+ * foreground line, with a timecode badge on the ruler) tracks the session
  * position and auto-scrolls into view; when you've scrolled it out of view an
  * edge chip points the way back. Each play interval — rallies padded by the
  * lead-in and tail (#104), merged where they touch — is an outlined box with
@@ -98,6 +151,9 @@ export const SessionTimeline = forwardRef<
      * them through the setters.
      */
     pxPerSec: number
+    /** Lowest zoom Alt+scroll may reach: the fitted scale when that's below
+     * SESSION_PX_PER_SEC_MIN, so zooming out never jumps back in. */
+    minPxPerSec?: number
     setPxPerSec: Dispatch<SetStateAction<number>>
     following: boolean
     setFollowing: Dispatch<SetStateAction<boolean>>
@@ -120,6 +176,14 @@ export const SessionTimeline = forwardRef<
     onDeleteRally: (rally: SessionRally) => void
     onSplitRally: (rally: SessionRally, atGlobalMs: number) => void
     onMergeRallies: (first: SessionRally, second: SessionRally) => void
+    /**
+     * Told whether the playhead lies inside the strip's visible scroll window,
+     * fired only when that changes (the strip starts out reporting it visible,
+     * so the first call is always `false`). Unmeasured, rally-less or
+     * playhead-less strips count as visible — only a playhead actually
+     * scrolled out of view is lost. Optional.
+     */
+    onPlayheadVisibleChange?: (visible: boolean) => void
   }
 >(function SessionTimeline(
   {
@@ -128,6 +192,7 @@ export const SessionTimeline = forwardRef<
     globalPlayheadMs,
     padding,
     pxPerSec,
+    minPxPerSec = SESSION_PX_PER_SEC_MIN,
     setPxPerSec,
     following,
     setFollowing,
@@ -146,6 +211,7 @@ export const SessionTimeline = forwardRef<
     onDeleteRally,
     onSplitRally,
     onMergeRallies,
+    onPlayheadVisibleChange,
   },
   ref
 ) {
@@ -272,6 +338,10 @@ export const SessionTimeline = forwardRef<
   // against it), `targetPxRef` the latest zoom asked for (so notches compound).
   const renderedPxRef = useRef(pxPerSec)
   const targetPxRef = useRef(pxPerSec)
+  const minPxPerSecRef = useRef(minPxPerSec)
+  useEffect(() => {
+    minPxPerSecRef.current = minPxPerSec
+  }, [minPxPerSec])
   const zoomAnchorRef = useRef<{ ms: number; viewportX: number } | null>(null)
   const playheadRef = useRef(globalPlayheadMs)
   useLayoutEffect(() => {
@@ -302,7 +372,7 @@ export const SessionTimeline = forwardRef<
           e.deltaY < 0 ? ALT_SCROLL_ZOOM_FACTOR : 1 / ALT_SCROLL_ZOOM_FACTOR
         const nextPx = clamp(
           targetPxRef.current * factor,
-          SESSION_PX_PER_SEC_MIN,
+          minPxPerSecRef.current,
           SESSION_PX_PER_SEC_MAX
         )
         if (nextPx === targetPxRef.current) return
@@ -423,6 +493,8 @@ export const SessionTimeline = forwardRef<
     canMerge,
   } = editAffordances(session.rallies, selectedIndex, globalPlayheadMs)
 
+  const currentKey = currentRallyKey(session, globalPlayheadMs, padding)
+
   const playheadPx =
     globalPlayheadMs !== null ? (globalPlayheadMs / 1000) * pxPerSec : null
   const snappedToPlayhead = drag?.snappedToPlayhead ?? false
@@ -459,6 +531,8 @@ export const SessionTimeline = forwardRef<
     totalMs
   )
   const majorTicks = ticks.filter((t) => t.major)
+  const chipLabel =
+    globalPlayheadMs !== null ? formatTimecode(globalPlayheadMs) : null
 
   // Which side the playhead has gone off to, if you've scrolled it out of view.
   const playheadOffside =
@@ -469,6 +543,35 @@ export const SessionTimeline = forwardRef<
         : playheadPx > viewport.left + viewport.width
           ? "right"
           : null
+
+  // Report the playhead leaving / re-entering the visible window to anyone
+  // listening (the player's jump-to-playhead control), only on a change.
+  const playheadVisible = !hasRallies || playheadOffside === null
+  const reportedVisibleRef = useRef(true)
+  const onPlayheadVisibleChangeRef = useRef(onPlayheadVisibleChange)
+  useLayoutEffect(() => {
+    onPlayheadVisibleChangeRef.current = onPlayheadVisibleChange
+  }, [onPlayheadVisibleChange])
+  useEffect(() => {
+    if (reportedVisibleRef.current === playheadVisible) return
+    reportedVisibleRef.current = playheadVisible
+    onPlayheadVisibleChangeRef.current?.(playheadVisible)
+  }, [playheadVisible])
+
+  // A ruler label is drawn only whole: not straddling the strip's edge
+  // (":40"), and not under the playhead badge or the off-screen chip ("0:0") —
+  // re-checked every render, so a hidden label returns once the badge moves on.
+  const rulerCovered: PxSpan[] =
+    playheadPx === null || chipLabel === null
+      ? []
+      : playheadOffside === null
+        ? [chipSpan(playheadPx, chipLabel)]
+        : [edgeChipSpan(playheadOffside, viewport, chipLabel)]
+  const labelShown = (ms: number, label: string) =>
+    rulerLabelVisible((ms / 1000) * pxPerSec, label, viewport, rulerCovered)
+
+  // Verdict marks, merged where they'd pile up at this zoom.
+  const markGroups = groupMarks(annotations, pxPerSec)
 
   return (
     <div className="shrink-0 space-y-2">
@@ -510,7 +613,7 @@ export const SessionTimeline = forwardRef<
         <div className="relative">
           <div
             ref={scrollRef}
-            className="w-full overflow-x-auto rounded-md bg-muted"
+            className="strip-scrollbar w-full overflow-x-scroll rounded-md bg-strip-track"
           >
             <div
               ref={contentRef}
@@ -527,12 +630,47 @@ export const SessionTimeline = forwardRef<
                 onSeekGlobal(xToMs(e.clientX))
               }}
             >
+              {/* The recording lane: each recording's number and file name,
+                  pinned to the left edge while you scroll through it, above
+                  the ruler so it never covers a rally. */}
+              <div
+                className="relative border-b border-foreground/10"
+                style={{ height: LANE_PX }}
+              >
+                {session.segments.map((seg) => {
+                  if (seg.durationMs == null || !seg.timeline) return null
+                  return (
+                    <div
+                      key={seg.path}
+                      className={`absolute inset-y-0 ${
+                        seg.index % 2 === 1 ? "bg-foreground/[0.07]" : ""
+                      }`}
+                      style={{
+                        left: `${(seg.offsetMs / 1000) * pxPerSec}px`,
+                        width: `${(seg.durationMs / 1000) * pxPerSec}px`,
+                      }}
+                    >
+                      <span
+                        className="sticky left-0 inline-block max-w-full truncate px-2 text-[11px] leading-[18px] text-muted-foreground"
+                        title={seg.path}
+                      >
+                        <span className="font-semibold text-foreground/80 tabular-nums">
+                          {seg.index + 1}
+                        </span>{" "}
+                        · {fileName(seg.path)}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+
               {/* The time ruler: labelled major ticks, short minor ones. The
                   one place a click seeks to an exact point inside a rally — in
                   edit mode too, keeping the selection, so you can place the
                   playhead for a split. */}
               <div
-                className="relative h-5 cursor-col-resize overflow-hidden border-b border-foreground/15 bg-background/40 hover:bg-background/70"
+                className="relative cursor-col-resize overflow-hidden border-b border-foreground/15 bg-background/40 hover:bg-background/70"
+                style={{ height: RULER_PX }}
                 onPointerMove={(e) => showHover(e.clientX)}
                 onPointerLeave={hideHover}
                 onClick={(e) => {
@@ -550,8 +688,8 @@ export const SessionTimeline = forwardRef<
                     }`}
                     style={{ left: `${(t.ms / 1000) * pxPerSec}px` }}
                   >
-                    {t.major ? (
-                      <span className="absolute bottom-0.5 left-1 text-[10px] leading-none whitespace-nowrap text-muted-foreground tabular-nums">
+                    {t.major && labelShown(t.ms, formatTimecode(t.ms)) ? (
+                      <span className="absolute bottom-0.5 left-1 text-[11px] leading-none whitespace-nowrap text-muted-foreground tabular-nums">
                         {formatTimecode(t.ms)}
                       </span>
                     ) : null}
@@ -559,7 +697,14 @@ export const SessionTimeline = forwardRef<
                 ))}
               </div>
 
-              <div className="relative h-20">
+              {/* The marker band over the track: shading, waveform and
+                  gridlines run through both; verdict marks stand in the band
+                  and drop a tick through their rally, flags are planted on
+                  their block's top edge into it. */}
+              <div
+                className="relative"
+                style={{ height: MARKER_PX + TRACK_PX }}
+              >
                 {session.segments.map((seg) => {
                   if (seg.durationMs == null || !seg.timeline) return null
                   const left = (seg.offsetMs / 1000) * pxPerSec
@@ -572,7 +717,12 @@ export const SessionTimeline = forwardRef<
                       }`}
                       style={{ left: `${left}px`, width: `${width}px` }}
                     >
-                      <Waveform peaks={seg.timeline.waveform} />
+                      <div
+                        className="absolute inset-x-0 bottom-0"
+                        style={{ top: MARKER_PX }}
+                      >
+                        <Waveform peaks={seg.timeline.waveform} />
+                      </div>
                     </div>
                   )
                 })}
@@ -588,99 +738,98 @@ export const SessionTimeline = forwardRef<
                     the lead-in and tail and merged where they touch — exactly
                     what playback and [ / ] step through. Clicking a box's
                     padding opens it where playback would. */}
-                {playBoxes.map((box, i) => (
-                  <div
-                    key={i}
-                    aria-hidden
-                    onClick={(e) => {
-                      if (editing) return
-                      e.stopPropagation()
-                      onSeekGlobal(box.globalStart)
-                    }}
-                    className="absolute inset-y-0 cursor-pointer rounded-sm border border-primary/80 bg-primary/40 hover:bg-primary/50"
-                    style={{
-                      left: `${(box.globalStart / 1000) * pxPerSec}px`,
-                      width: `${((box.globalEnd - box.globalStart) / 1000) * pxPerSec}px`,
-                    }}
+                <div
+                  className="absolute inset-x-0 bottom-0"
+                  style={{ height: TRACK_PX }}
+                >
+                  {playBoxes.map((box, i) => (
+                    <div
+                      key={i}
+                      aria-hidden
+                      onClick={(e) => {
+                        if (editing) return
+                        e.stopPropagation()
+                        onSeekGlobal(box.globalStart)
+                      }}
+                      className="absolute inset-y-0 cursor-pointer rounded-sm border border-dashed border-strip-pad-edge bg-strip-pad hover:bg-strip-rally"
+                      style={{
+                        left: `${(box.globalStart / 1000) * pxPerSec}px`,
+                        width: `${((box.globalEnd - box.globalStart) / 1000) * pxPerSec}px`,
+                      }}
+                    />
+                  ))}
+                  {session.rallies.map((rally, i) => {
+                    const key = rallyKey(rally)
+                    const seg = session.segments.find(
+                      (s) => s.index === rally.recordingIndex
+                    )
+                    const minGlobalMs = seg?.offsetMs ?? 0
+                    const maxGlobalMs = minGlobalMs + (seg?.durationMs ?? 0)
+                    return (
+                      <RallyBlock
+                        key={key}
+                        rally={rally}
+                        number={i}
+                        pxPerSec={pxPerSec}
+                        editing={editing}
+                        current={key === currentKey}
+                        selected={editing && key === selectedKey}
+                        drag={drag?.key === key ? drag : null}
+                        minGlobalMs={minGlobalMs}
+                        maxGlobalMs={maxGlobalMs}
+                        onSelect={() => setSelectedKey(key)}
+                        onSeek={() =>
+                          onSeekGlobal(rallyLeadInMs(rally, padding))
+                        }
+                        onStartDrag={(edge, anchorGlobalMs, minMs, maxMs) =>
+                          setDrag({
+                            key,
+                            edge,
+                            anchorGlobalMs,
+                            globalMs:
+                              edge === "start"
+                                ? rally.globalStart
+                                : rally.globalEnd,
+                            snappedToPlayhead: false,
+                            minGlobalMs: minMs,
+                            maxGlobalMs: maxMs,
+                          })
+                        }
+                      />
+                    )
+                  })}
+                </div>
+                {markGroups.map((group) => (
+                  <VerdictMarkGroup
+                    key={group.marks[0].id}
+                    group={group}
+                    pillCentre={
+                      group.marks.length === 1
+                        ? group.centre
+                        : dodgePlayhead(
+                            group.centre,
+                            pillWidth(group.marks.length),
+                            playheadPx
+                          )
+                    }
+                    onSeek={onSeekGlobal}
                   />
                 ))}
-                {session.rallies.map((rally, i) => {
-                  const key = rallyKey(rally)
-                  const seg = session.segments.find(
-                    (s) => s.index === rally.recordingIndex
-                  )
-                  const minGlobalMs = seg?.offsetMs ?? 0
-                  const maxGlobalMs = minGlobalMs + (seg?.durationMs ?? 0)
-                  return (
-                    <RallyBlock
-                      key={key}
-                      rally={rally}
-                      number={i}
-                      pxPerSec={pxPerSec}
-                      editing={editing}
-                      selected={editing && key === selectedKey}
-                      drag={drag?.key === key ? drag : null}
-                      minGlobalMs={minGlobalMs}
-                      maxGlobalMs={maxGlobalMs}
-                      onSelect={() => setSelectedKey(key)}
-                      onSeek={() => onSeekGlobal(rallyLeadInMs(rally, padding))}
-                      onStartDrag={(edge, anchorGlobalMs, minMs, maxMs) =>
-                        setDrag({
-                          key,
-                          edge,
-                          anchorGlobalMs,
-                          globalMs:
-                            edge === "start"
-                              ? rally.globalStart
-                              : rally.globalEnd,
-                          snappedToPlayhead: false,
-                          minGlobalMs: minMs,
-                          maxGlobalMs: maxMs,
-                        })
-                      }
-                    />
-                  )
-                })}
-                {annotations.map((a) => {
-                  const left = (a.globalMs / 1000) * pxPerSec
-                  return (
-                    <div
-                      key={a.id}
-                      className={`pointer-events-none absolute top-0 h-2.5 w-0.5 -translate-x-1/2 rounded-b ${VERDICT_DOT[a.verdict]}`}
-                      style={{ left: `${left}px` }}
-                      title={`${a.verdict} at ${formatClock(a.globalMs)}`}
-                    />
-                  )
-                })}
               </div>
 
-              {/* Recording boundaries: a solid divider through ruler and strip,
-                  a notch on the ruler, and a numbered label over the rallies. */}
+              {/* Recording boundaries: a solid divider through lane, ruler
+                  and strip, with a notch at the top. */}
               {session.segments.map((seg) => {
-                if (seg.durationMs == null || !seg.timeline) return null
-                const left = (seg.offsetMs / 1000) * pxPerSec
-                const width = (seg.durationMs / 1000) * pxPerSec
+                if (seg.index === 0 || seg.durationMs == null || !seg.timeline)
+                  return null
                 return (
                   <div
                     key={seg.path}
                     className="pointer-events-none absolute inset-y-0 z-[5]"
-                    style={{ left: `${left}px`, width: `${width}px` }}
+                    style={{ left: `${(seg.offsetMs / 1000) * pxPerSec}px` }}
                   >
-                    {seg.index > 0 ? (
-                      <>
-                        <div className="absolute inset-y-0 left-0 w-0.5 -translate-x-1/2 bg-foreground/70" />
-                        <div className="absolute top-0 left-0 size-0 -translate-x-1/2 border-x-[5px] border-t-[6px] border-x-transparent border-t-foreground/70" />
-                      </>
-                    ) : null}
-                    <span
-                      className="absolute bottom-1 left-1.5 max-w-[calc(100%-0.75rem)] truncate rounded-sm border border-foreground/20 bg-background/85 px-1 text-[10px] leading-4 text-foreground/80 shadow-sm"
-                      title={seg.path}
-                    >
-                      <span className="font-semibold tabular-nums">
-                        {seg.index + 1}
-                      </span>{" "}
-                      · {fileName(seg.path)}
-                    </span>
+                    <div className="absolute inset-y-0 left-0 w-0.5 -translate-x-1/2 bg-foreground/70" />
+                    <div className="absolute top-0 left-0 size-0 -translate-x-1/2 border-x-[5px] border-t-[6px] border-x-transparent border-t-foreground/70" />
                   </div>
                 )
               })}
@@ -689,18 +838,19 @@ export const SessionTimeline = forwardRef<
               <div
                 ref={hoverLineRef}
                 hidden
-                className="pointer-events-none absolute inset-y-0 z-10 w-px bg-foreground/50"
+                className="pointer-events-none absolute bottom-0 z-10 w-0 border-l border-dashed border-foreground/60"
+                style={{ top: LANE_PX }}
               >
                 <span
                   ref={hoverLabelRef}
-                  className="absolute top-0.5 left-1 rounded-sm bg-foreground px-1 text-[10px] leading-4 whitespace-nowrap text-background tabular-nums"
+                  className="absolute top-px left-1 rounded-sm border border-foreground/30 bg-background px-1 text-[11px] leading-4 whitespace-nowrap text-foreground tabular-nums shadow-sm"
                 />
               </div>
 
               {playheadPx !== null && globalPlayheadMs !== null ? (
                 <div
-                  className="pointer-events-none absolute inset-y-0 z-10"
-                  style={{ left: `${playheadPx}px` }}
+                  className="pointer-events-none absolute bottom-0 z-10"
+                  style={{ left: `${playheadPx}px`, top: LANE_PX }}
                   title={
                     snappedToPlayhead
                       ? "Dragged edge snapped to playhead"
@@ -708,12 +858,14 @@ export const SessionTimeline = forwardRef<
                   }
                 >
                   <div
-                    className={`absolute inset-y-0 -translate-x-1/2 bg-red-500 shadow-[0_0_0_1px_var(--background)] transition-[width,box-shadow] ${
-                      snappedToPlayhead ? "w-1 ring-4 ring-red-500/30" : "w-0.5"
+                    className={`absolute inset-y-0 -translate-x-1/2 bg-foreground shadow-[0_0_0_1px_var(--background)] transition-[width,box-shadow] ${
+                      snappedToPlayhead
+                        ? "w-1 ring-4 ring-foreground/30"
+                        : "w-0.5"
                     }`}
                   />
-                  <span className="absolute top-0 -translate-x-1/2 rounded-sm bg-red-500 px-1 text-[10px] leading-5 font-medium whitespace-nowrap text-white tabular-nums shadow-sm">
-                    {formatTimecode(globalPlayheadMs)}
+                  <span className="absolute top-0 -translate-x-1/2 rounded-sm bg-foreground px-1.5 text-[11px] leading-5 font-semibold whitespace-nowrap text-background tabular-nums shadow-[0_0_0_1px_var(--background)]">
+                    {chipLabel}
                   </span>
                 </div>
               ) : null}
@@ -725,7 +877,8 @@ export const SessionTimeline = forwardRef<
             <button
               type="button"
               onClick={scrollToPlayhead}
-              className={`absolute top-6 z-20 flex items-center gap-0.5 rounded-full bg-red-500 py-0.5 text-[10px] font-medium text-white tabular-nums shadow-md hover:bg-red-600 ${
+              style={{ top: LANE_PX }}
+              className={`absolute z-20 flex h-5 items-center gap-0.5 rounded-full bg-foreground text-[11px] font-semibold text-background tabular-nums shadow-md hover:bg-foreground/85 ${
                 playheadOffside === "left"
                   ? "left-1 pr-2 pl-1"
                   : "right-1 pr-1 pl-2"
@@ -747,6 +900,147 @@ export const SessionTimeline = forwardRef<
   )
 })
 
+const VERDICT_LABEL = { good: "Good", bad: "Bad", mistake: "Mistake" } as const
+
+/**
+ * The verdict stripes of a merged pile, in verdict order, each as long as its
+ * share of the pile — so a pile reads "mostly mistakes" at a glance.
+ */
+function VerdictStripes({
+  counts,
+  direction,
+  className = "inset-0",
+}: {
+  counts: MarkGroup<SessionAnnotation>["counts"]
+  direction: "row" | "col"
+  /** Where the stripes sit in their (positioned) parent. */
+  className?: string
+}) {
+  return (
+    <span
+      className={`absolute flex overflow-hidden ${className} ${
+        direction === "row" ? "flex-row" : "flex-col"
+      }`}
+    >
+      {VERDICT_ORDER.filter((v) => counts[v] > 0).map((v) => (
+        <span
+          key={v}
+          className={VERDICT_DOT[v]}
+          style={{ flexGrow: counts[v], flexBasis: 0 }}
+        />
+      ))}
+    </span>
+  )
+}
+
+/**
+ * One verdict mark — or a pile of marks too close to tell apart at this zoom —
+ * on the strip. A lone mark is a 2px verdict-coloured tick down through its
+ * rally with a small head standing in the marker band; the head's hit area is
+ * wider than it (MARK_HIT_PX) and the full band tall, and it's drawn over the
+ * playhead line, so a mark just made at the playhead stays visible and
+ * grabbable. A pile is an outlined pill in the band — track-coloured fill, a
+ * "×N" count and its verdict stripes along its foot, each as long as its
+ * share — over one tick striped the same way: never a solid block hiding its
+ * rally, and a different object from the playhead's filled badge and the
+ * rallies' plain numbers. A pill the playhead line would slice moves just
+ * aside (`pillCentre`, see `dodgePlayhead`); its tick stays put. Zooming in
+ * splits a pile into its lone ticks. Both outline in the strip's track colour
+ * so they hold up over any rally fill in either theme. The head / pill is the
+ * click target: it seeks to the mark (a pile's first); its tooltip lists every
+ * mark in it.
+ */
+const VerdictMarkGroup = memo(function VerdictMarkGroup({
+  group,
+  pillCentre,
+  onSeek,
+}: {
+  group: MarkGroup<SessionAnnotation>
+  /** Where the head / pill is centred: the group's own centre, or a pile's dodged one. */
+  pillCentre: number
+  onSeek: (globalMs: number) => void
+}) {
+  const n = group.marks.length
+  const lone = n === 1
+  const list = group.marks
+    .map((m) => `${VERDICT_LABEL[m.verdict]} · ${formatClock(m.globalMs)}`)
+    .join("\n")
+  const summary = lone
+    ? `${VERDICT_LABEL[group.marks[0].verdict]} at ${formatClock(group.marks[0].globalMs)}`
+    : `${n} verdicts, ${formatClock(group.marks[0].globalMs)}–${formatClock(
+        group.marks[n - 1].globalMs
+      )}`
+  const title = lone
+    ? `${summary}\nClick to jump to it`
+    : `${summary} — zoom in to separate them\n${list}\nClick to jump to the first`
+  const ring = "shadow-[0_0_0_1px_var(--strip-track)]"
+  const onClick = (e: ReactMouseEvent) => {
+    e.stopPropagation()
+    onSeek(group.marks[0].globalMs)
+  }
+  return (
+    <>
+      {/* The tick: through the rally, under the head / pill. */}
+      <span
+        aria-hidden
+        className={`pointer-events-none absolute z-[3] rounded-[1px] ${ring} ${
+          lone ? VERDICT_DOT[group.marks[0].verdict] : ""
+        }`}
+        style={{
+          top: MARKER_PX,
+          bottom: 1,
+          left: `${group.centre - 1}px`,
+          width: 2,
+        }}
+      >
+        {lone ? null : <VerdictStripes counts={group.counts} direction="col" />}
+      </span>
+      {lone ? (
+        <button
+          type="button"
+          aria-label={summary}
+          title={title}
+          onClick={onClick}
+          className="group/mark absolute top-0 z-[11] cursor-pointer focus-visible:outline-none"
+          style={{
+            left: `${pillCentre - MARK_HIT_PX / 2}px`,
+            width: MARK_HIT_PX,
+            height: MARKER_PX,
+          }}
+        >
+          <span
+            className={`absolute bottom-0 left-1/2 -translate-x-1/2 rounded-t-[2px] ${ring} transition-shadow group-hover/mark:shadow-[0_0_0_1.5px_var(--foreground)] group-focus-visible/mark:shadow-[0_0_0_2px_var(--ring)] ${VERDICT_DOT[group.marks[0].verdict]}`}
+            style={{ width: MARK_HEAD_PX, height: MARK_HEAD_H_PX }}
+          />
+        </button>
+      ) : (
+        <button
+          type="button"
+          aria-label={summary}
+          title={title}
+          onClick={onClick}
+          className={`absolute z-[3] cursor-pointer overflow-hidden rounded-full border border-foreground/55 bg-strip-track text-foreground ${ring} transition-shadow hover:border-foreground hover:shadow-[0_0_0_1px_var(--strip-track),0_0_0_2px_var(--foreground)] focus-visible:shadow-[0_0_0_1px_var(--strip-track),0_0_0_3px_var(--ring)] focus-visible:outline-none`}
+          style={{
+            left: `${pillCentre - pillWidth(n) / 2}px`,
+            width: pillWidth(n),
+            top: (MARKER_PX - MARK_PILL_PX) / 2,
+            height: MARK_PILL_PX,
+          }}
+        >
+          <span className="block text-center text-[11px] leading-3 font-semibold tabular-nums">
+            {pillLabel(n)}
+          </span>
+          <VerdictStripes
+            counts={group.counts}
+            direction="row"
+            className="inset-x-0 bottom-0 h-[2px]"
+          />
+        </button>
+      )}
+    </>
+  )
+})
+
 /**
  * The audio waveform under the rally blocks: each downsampled peak is a vertical
  * bar centred on the strip, so shuttle hits read as spikes and rally boundaries
@@ -757,7 +1051,7 @@ const Waveform = memo(function Waveform({ peaks }: { peaks: number[] }) {
   if (peaks.length === 0) return null
   return (
     <svg
-      className="pointer-events-none absolute inset-0 size-full text-muted-foreground/50"
+      className="pointer-events-none absolute inset-0 size-full text-strip-wave"
       viewBox={`0 0 ${peaks.length} 1`}
       preserveAspectRatio="none"
       aria-hidden

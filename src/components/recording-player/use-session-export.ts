@@ -11,6 +11,14 @@ import {
   type SessionModel,
 } from "@/components/recording-player-transport"
 
+/** How many rallies each export selection holds. */
+export interface ExportCounts {
+  session: number
+  recording: number
+  flagged: number
+  mistakes: number
+}
+
 /**
  * The Export engine driven from the player (issues #12/#13/#14): the four Export
  * items point one engine at a different rally selection. The save dialog, live
@@ -78,33 +86,51 @@ export function useSessionExport({
     [day, paths, runExport, setError]
   )
 
+  // The rally selection behind each reel, computed up front so the menu can
+  // say how many rallies each item holds (and grey out an empty one).
   // Flagged rallies (#14): the rallies the user marked as ones that matter.
-  const exportFlagged = useCallback(
-    () =>
-      exportReel(
-        "flagged rallies",
-        "flagged",
-        session.rallies.filter((r) => r.flagged).map((r) => r.id)
-      ),
-    [exportReel, session]
+  const flaggedIds = useMemo(
+    () => session.rallies.filter((r) => r.flagged).map((r) => r.id),
+    [session]
   )
-
   // Rallies with mistakes (#14): a rally owns the annotations in its span
   // (glossary), so a rally is a "mistake" rally if a `mistake` verdict falls
   // inside it. Reuses the session annotations already lifted onto the axis (#11).
-  const exportMistakes = useCallback(() => {
+  const mistakeIds = useMemo(() => {
     const mistakeMs = sessionAnnotations
       .filter((a) => a.verdict === "mistake")
       .map((a) => a.globalMs)
-    const ids = session.rallies
+    return session.rallies
       .filter((r) => mistakeMs.some((ms) => rallyContains(r, ms)))
       .map((r) => r.id)
-    return exportReel("rallies with mistakes", "mistakes", ids)
-  }, [exportReel, session, sessionAnnotations])
+  }, [session, sessionAnnotations])
+
+  const exportFlagged = useCallback(
+    () => exportReel("flagged rallies", "flagged", flaggedIds),
+    [exportReel, flaggedIds]
+  )
+  const exportMistakes = useCallback(
+    () => exportReel("rallies with mistakes", "mistakes", mistakeIds),
+    [exportReel, mistakeIds]
+  )
+
+  // How many rallies each export would hold, for the menu.
+  const counts = useMemo<ExportCounts>(
+    () => ({
+      session: session.rallies.length,
+      recording: path
+        ? session.rallies.filter((r) => r.path === path).length
+        : 0,
+      flagged: flaggedIds.length,
+      mistakes: mistakeIds.length,
+    }),
+    [session, path, flaggedIds, mistakeIds]
+  )
 
   return {
     progress,
     error,
+    counts,
     exportCondensed,
     exportSession,
     exportFlagged,

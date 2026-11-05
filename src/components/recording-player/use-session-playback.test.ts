@@ -134,6 +134,23 @@ beforeEach(() => {
   harness.reset()
 })
 
+describe("Skip gaps and Loop toggles leave the playhead alone (issue 2)", () => {
+  it("toggling Skip gaps on a paused lead-in neither seeks nor moves the playhead", async () => {
+    const view = await renderPlayback({ lead_ms: 1000, tail_ms: 1500 })
+    fileLoaded()
+    act(() => view.result.current.seekSession(59_000)) // R2's lead-in
+    act(() => harness.emit("mpv:playback-restart"))
+    const before = view.result.current.globalPlayheadMs
+    const seeks = seeksSent().length
+    act(() => view.result.current.toggleGapSkip())
+    act(() => view.result.current.toggleGapSkip())
+    expect(view.result.current.globalPlayheadMs).toBe(before)
+    expect(seeksSent()).toHaveLength(seeks)
+    // Only the playhead decides the focused rally, so it stays R2's.
+    expect(before).toBe(59_000)
+  })
+})
+
 describe("session playback orchestration vs. the async mpv boundary", () => {
   it("with padding, plays each rally's tail and skips to the next lead-in (#104)", async () => {
     await renderPlayback({ lead_ms: 1000, tail_ms: 1500 })

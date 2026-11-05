@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   fileName,
   formatClock,
+  formatLength,
   formatDuration,
   formatSize,
   formatTimecode,
@@ -15,9 +16,23 @@ describe("formatClock", () => {
     expect(formatClock(600_000)).toBe("10:00")
   })
 
-  it("rounds to the nearest second", () => {
+  it("floors to the second, like formatTimecode", () => {
     expect(formatClock(1_499)).toBe("0:01")
-    expect(formatClock(1_500)).toBe("0:02")
+    expect(formatClock(1_999)).toBe("0:01")
+    expect(formatClock(2_000)).toBe("0:02")
+  })
+})
+
+describe("formatLength", () => {
+  it("floors to whole seconds under a minute", () => {
+    expect(formatLength(7_999)).toBe("7s")
+    expect(formatLength(14_600)).toBe("14s")
+    expect(formatLength(15_000)).toBe("15s")
+  })
+
+  it("switches to m:ss from a minute", () => {
+    expect(formatLength(60_000)).toBe("1:00")
+    expect(formatLength(65_900)).toBe("1:05")
   })
 })
 

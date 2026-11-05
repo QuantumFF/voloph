@@ -14,7 +14,7 @@ import type {
  * survive switching recordings and can be stitched onto the one session strip.
  * Fetched once per recording on load (annotations only change from our own
  * drops, so no polling); `add` drops one at the given recording-local time then
- * re-reads that recording so the marker appears at once.
+ * re-reads that recording so the marker appears at once, resolving to its id.
  */
 export function useAnnotations(recordings: PlaylistRecording[]) {
   const [annotations, setAnnotations] = useState<Record<string, Annotation[]>>(
@@ -31,16 +31,20 @@ export function useAnnotations(recordings: PlaylistRecording[]) {
     recordings.forEach((rec) => load(rec.path))
   }, [recordings, load])
 
+  // Resolves to the new annotation's id (null if it wasn't written), so the
+  // player can confirm the mark and offer to undo it.
   const add = useCallback(
-    (path: string, timeMs: number, verdict: Verdict) => {
-      void trackedInvoke("add_annotation", {
+    (path: string, timeMs: number, verdict: Verdict): Promise<number | null> =>
+      trackedInvoke<number | null>("add_annotation", {
         path,
         timeMs: Math.round(timeMs),
         verdict,
       })
-        .then(() => load(path))
-        .catch(() => {})
-    },
+        .then((id) => {
+          load(path)
+          return id
+        })
+        .catch(() => null),
     [load]
   )
 

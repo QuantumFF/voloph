@@ -28,3 +28,14 @@ export const VERDICT_DOT: Record<Verdict, string> = {
   bad: "bg-amber-500",
   mistake: "bg-red-500",
 }
+
+/**
+ * The hue for "uncertain" — a span the segmenter doubts. Violet, so it can't be
+ * mistaken for the amber "bad" verdict or a red "mistake". Every surface that
+ * marks uncertainty (rail icon, status-bar count, timeline block, inspector
+ * note) draws from these so they can't drift apart.
+ */
+export const UNCERTAIN_TEXT = "text-violet-600 dark:text-violet-300"
+export const UNCERTAIN_FILL = "bg-violet-500/35"
+export const UNCERTAIN_BORDER = "border-violet-500/80"
+export const UNCERTAIN_SOFT_BG = "bg-violet-500/10"
