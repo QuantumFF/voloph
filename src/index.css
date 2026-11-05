@@ -39,6 +39,15 @@
     --color-card: var(--card);
     --color-foreground: var(--foreground);
     --color-background: var(--background);
+    --color-strip-track: var(--strip-track);
+    --color-strip-rally: var(--strip-rally);
+    --color-strip-rally-hover: var(--strip-rally-hover);
+    --color-strip-rally-edge: var(--strip-rally-edge);
+    --color-strip-current: var(--strip-current);
+    --color-strip-current-edge: var(--strip-current-edge);
+    --color-strip-pad: var(--strip-pad);
+    --color-strip-pad-edge: var(--strip-pad-edge);
+    --color-strip-wave: var(--strip-wave);
     --radius-sm: calc(var(--radius) * 0.6);
     --radius-md: calc(var(--radius) * 0.8);
     --radius-lg: var(--radius);
@@ -60,7 +69,7 @@
     --secondary: oklch(0.97 0 0);
     --secondary-foreground: oklch(0.205 0 0);
     --muted: oklch(0.97 0 0);
-    --muted-foreground: oklch(0.556 0 0);
+    --muted-foreground: oklch(0.52 0 0);
     --accent: oklch(0.97 0 0);
     --accent-foreground: oklch(0.205 0 0);
     --destructive: oklch(0.577 0.245 27.325);
@@ -81,6 +90,26 @@
     --sidebar-accent-foreground: oklch(0.205 0 0);
     --sidebar-border: oklch(0.922 0 0);
     --sidebar-ring: oklch(0.708 0 0);
+    /*
+     * The session timeline strip (session-timeline / rally-block). Rallies must
+     * read against gaps at a glance in both themes, and the waveform must read
+     * through them: a pale track with a light-grey rally fill (~oklch 0.86
+     * composited) and a solid edge (~8.8:1) in light, the inverse in dark.
+     * `current` is the rally the playhead is in — the strongest mark on the
+     * strip: one step denser fill and a 2px edge in the primary colour, so it
+     * reads the same way in both themes. `pad` is the dashed clip-padding box
+     * around each rally (edge ~7:1). The waveform keeps >=3:1 even through the
+     * current rally's fill.
+     */
+    --strip-track: oklch(0.985 0 0);
+    --strip-rally: oklch(0.3 0 0 / 20%);
+    --strip-rally-hover: oklch(0.3 0 0 / 28%);
+    --strip-rally-edge: oklch(0.4 0 0);
+    --strip-current: oklch(0.3 0 0 / 34%);
+    --strip-current-edge: var(--primary);
+    --strip-pad: oklch(0.3 0 0 / 6%);
+    --strip-pad-edge: oklch(0.45 0 0);
+    --strip-wave: oklch(0.4 0 0 / 80%);
 }
 
 .dark {
@@ -95,7 +124,7 @@
     --secondary: oklch(0.269 0 0);
     --secondary-foreground: oklch(0.985 0 0);
     --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
+    --muted-foreground: oklch(0.75 0 0);
     --accent: oklch(0.269 0 0);
     --accent-foreground: oklch(0.985 0 0);
     --destructive: oklch(0.704 0.191 22.216);
@@ -115,6 +144,15 @@
     --sidebar-accent-foreground: oklch(0.985 0 0);
     --sidebar-border: oklch(1 0 0 / 10%);
     --sidebar-ring: oklch(0.556 0 0);
+    --strip-track: oklch(0.225 0 0);
+    --strip-rally: oklch(1 0 0 / 16%);
+    --strip-rally-hover: oklch(1 0 0 / 24%);
+    --strip-rally-edge: oklch(1 0 0 / 50%);
+    --strip-current: oklch(1 0 0 / 40%);
+    --strip-current-edge: var(--primary);
+    --strip-pad: oklch(1 0 0 / 5%);
+    --strip-pad-edge: oklch(1 0 0 / 30%);
+    --strip-wave: oklch(0.708 0 0 / 50%);
 }
 
 @layer base {
@@ -174,4 +212,31 @@ body {
   .ui-selectable {
     @apply select-text;
   }
+}
+
+/*
+ * `strip-scrollbar`: an always-visible thin scrollbar for a horizontally
+ * scrolling strip (the session timeline). WebKitGTK otherwise draws GTK overlay
+ * scrollbars that stay hidden until hovered, so overflow is invisible. Pair it
+ * with `overflow-x-scroll` so the 8px track is always reserved and the strip's
+ * height doesn't jump as zooming makes it overflow. Only `::-webkit-scrollbar`
+ * rules, deliberately: `scrollbar-width`/`scrollbar-color` make WebKit and
+ * Chromium (WebView2) ignore them.
+ */
+.strip-scrollbar::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+.strip-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.strip-scrollbar::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--foreground) 30%, transparent);
+  border: 2px solid transparent;
+  border-radius: 9999px;
+  background-clip: padding-box;
+}
+.strip-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklch, var(--foreground) 50%, transparent);
+  background-clip: padding-box;
 }

@@ -8,12 +8,14 @@
  * `scrollLeft` the "browser" clamps to that range, as a real one does.
  */
 import { StrictMode, useState } from "react"
-import { act, render } from "@testing-library/react"
-import { beforeAll, describe, expect, it } from "vitest"
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { afterEach, beforeAll, describe, expect, it } from "vitest"
 
 import {
   NO_PADDING,
   buildSessionModel,
+  type SessionAnnotation,
+  type Verdict,
 } from "@/components/recording-player-transport"
 import { SessionTimeline } from "./session-timeline"
 
@@ -50,10 +52,16 @@ function Harness({
   initialPx,
   playheadMs,
   onState,
+  annotations = [],
+  onSeekGlobal = noop,
+  onPlayheadVisibleChange,
 }: {
   initialPx: number
   playheadMs: number | null
   onState: (s: { pxPerSec: number; following: boolean }) => void
+  annotations?: SessionAnnotation[]
+  onSeekGlobal?: (globalMs: number) => void
+  onPlayheadVisibleChange?: (visible: boolean) => void
 }) {
   const [pxPerSec, setPxPerSec] = useState(initialPx)
   const [following, setFollowing] = useState(true)
@@ -62,7 +70,7 @@ function Harness({
   return (
     <SessionTimeline
       session={session}
-      annotations={[]}
+      annotations={annotations}
       globalPlayheadMs={playheadMs}
       padding={NO_PADDING}
       pxPerSec={pxPerSec}
@@ -74,7 +82,7 @@ function Harness({
       editing={false}
       selectedKey={selectedKey}
       setSelectedKey={setSelectedKey}
-      onSeekGlobal={noop}
+      onSeekGlobal={onSeekGlobal}
       onPrevRally={noop}
       onNextRally={noop}
       onNextUncertain={noop}
@@ -84,6 +92,7 @@ function Harness({
       onDeleteRally={noop}
       onSplitRally={noop}
       onMergeRallies={noop}
+      onPlayheadVisibleChange={onPlayheadVisibleChange}
     />
   )
 }
@@ -119,7 +128,7 @@ function setup(initialPx: number, playheadMs: number | null = null) {
       />
     </StrictMode>
   )
-  const scrollBox = container.querySelector(".overflow-x-auto") as HTMLElement
+  const scrollBox = container.querySelector(".overflow-x-scroll") as HTMLElement
   layOut(scrollBox)
   return { state, scrollBox }
 }
@@ -215,5 +224,159 @@ describe("Alt+scroll zoom", () => {
       for (let i = 0; i < 3; i++) scrollBox.dispatchEvent(altWheel(-1, 240))
     })
     expect(state.following).toBe(true)
+  })
+})
+
+describe("verdict marks", () => {
+  afterEach(cleanup)
+
+  const mark = (id: number, globalMs: number, verdict: Verdict) => ({
+    id,
+    recordingIndex: 0,
+    path: "a.mp4",
+    verdict,
+    aspect: null,
+    note: null,
+    globalMs,
+  })
+  const burst = [
+    mark(1, 12_000, "good"),
+    mark(2, 12_400, "bad"),
+    mark(3, 12_800, "mistake"),
+  ]
+
+  it("merges marks too close to tell apart into one counted pill that seeks to the first", () => {
+    const seeks: number[] = []
+    render(
+      <Harness
+        initialPx={3}
+        playheadMs={null}
+        onState={noop}
+        annotations={burst}
+        onSeekGlobal={(ms) => seeks.push(ms)}
+      />
+    )
+    const pill = screen.getByRole("button", { name: /^3 verdicts/ })
+    expect(pill.textContent).toBe("×3")
+    expect(pill.title).toContain("Good · 0:12")
+    expect(pill.title).toContain("Mistake · 0:12")
+    fireEvent.click(pill)
+    expect(seeks).toEqual([12_000])
+  })
+
+  it("moves a pile's pill aside rather than let the playhead line slice it", () => {
+    // At 3px/s the burst's pill is centred at 37.2px; a playhead at 12.4s
+    // (37.2px) would cut straight through its count.
+    const playheadPx = 37.2
+    render(
+      <Harness
+        initialPx={3}
+        playheadMs={12_400}
+        onState={noop}
+        annotations={burst}
+      />
+    )
+    const pill = screen.getByRole("button", { name: /^3 verdicts/ })
+    const left = parseFloat(pill.style.left)
+    const right = left + parseFloat(pill.style.width)
+    expect(right <= playheadPx - 2 || left >= playheadPx + 2).toBe(true)
+  })
+
+  it("gives a lone mark a hit area at least 8px wider than its head", () => {
+    render(
+      <Harness
+        initialPx={60}
+        playheadMs={null}
+        onState={noop}
+        annotations={burst}
+      />
+    )
+    const head = screen.getByRole("button", { name: "Good at 0:12" })
+    expect(parseFloat(head.style.width)).toBeGreaterThanOrEqual(6 + 8)
+  })
+
+  it("draws each mark on its own once zoomed in far enough", () => {
+    render(
+      <Harness
+        initialPx={60}
+        playheadMs={null}
+        onState={noop}
+        annotations={burst}
+      />
+    )
+    expect(screen.queryByRole("button", { name: /verdicts/ })).toBeNull()
+    expect(screen.getByRole("button", { name: "Good at 0:12" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Bad at 0:12" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "Mistake at 0:12" })).toBeTruthy()
+  })
+})
+
+describe("rally numbers", () => {
+  afterEach(cleanup)
+
+  it("labels each block with its rail number, inside it once it's wide enough", () => {
+    // 10s rally at 3px/s: 30px, room for "1".
+    render(<Harness initialPx={3} playheadMs={null} onState={noop} />)
+    const block = screen.getByRole("button", { name: "Rally 1" })
+    expect(block.textContent).toBe("1")
+    expect(block.querySelector(".opacity-0")).toBeNull()
+  })
+
+  it("keeps a too-narrow block's number for hover", () => {
+    // 10s rally at 1px/s: 10px.
+    render(<Harness initialPx={1} playheadMs={null} onState={noop} />)
+    const block = screen.getByRole("button", { name: "Rally 1" })
+    expect(block.textContent).toBe("1")
+    expect(block.querySelector(".opacity-0")?.textContent).toBe("1")
+  })
+})
+
+describe("playhead visibility", () => {
+  afterEach(cleanup)
+
+  it("reports the playhead leaving and re-entering the visible window, only on change", () => {
+    const reports: boolean[] = []
+    const { container } = render(
+      <Harness
+        initialPx={3}
+        playheadMs={100_000}
+        onState={noop}
+        onPlayheadVisibleChange={(v) => reports.push(v)}
+      />
+    )
+    const scrollBox = container.querySelector(
+      ".overflow-x-scroll"
+    ) as HTMLElement
+    layOut(scrollBox)
+    // The playhead sits at 300px; a 500px window from 0 shows it.
+    act(() => {
+      scrollBox.scrollLeft = 0
+    })
+    expect(reports).toEqual([])
+    act(() => {
+      scrollBox.scrollLeft = 1_000
+    })
+    act(() => {
+      scrollBox.scrollLeft = 1_200
+    })
+    expect(reports).toEqual([false])
+    act(() => {
+      scrollBox.scrollLeft = 100
+    })
+    expect(reports).toEqual([false, true])
+  })
+
+  it("is harmless without a listener", () => {
+    const { container } = render(
+      <Harness initialPx={3} playheadMs={100_000} onState={noop} />
+    )
+    const scrollBox = container.querySelector(
+      ".overflow-x-scroll"
+    ) as HTMLElement
+    layOut(scrollBox)
+    act(() => {
+      scrollBox.scrollLeft = 1_000
+    })
+    expect(screen.getByTitle(/playhead is off-screen/)).toBeTruthy()
   })
 })

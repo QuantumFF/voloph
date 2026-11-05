@@ -29,22 +29,110 @@ export function kindLabel(kind: string): string {
   return kind === "shared" ? "Shared" : "Local"
 }
 
-/** The stats line under a session's date: recordings, rallies, footage length. */
-export function sessionSummary(session: Session): string {
-  const parts = [
-    `${session.recordings.length} recording${session.recordings.length === 1 ? "" : "s"}`,
-  ]
-  const segmented = session.recordings.filter(
-    (r) => r.segment_state === "ready"
+/** A session's (or a whole library's) headline numbers. */
+export interface SessionStats {
+  recordings: number
+  /** Rallies across the recordings whose draft timeline is ready. */
+  rallies: number
+  /** Footage length in ms (recordings not yet measured count as 0). */
+  durationMs: number
+  /** Recordings still being prepared or analyzed in the background. */
+  processing: number
+}
+
+/** The numbers a session header (or the library overview) shows. */
+export function sessionStats(sessions: Session | Session[]): SessionStats {
+  const recordings = (Array.isArray(sessions) ? sessions : [sessions]).flatMap(
+    (s) => s.recordings
   )
-  if (segmented.length > 0) {
-    const rallies = segmented.reduce((sum, r) => sum + r.rally_count, 0)
-    parts.push(`${rallies} ${rallies === 1 ? "rally" : "rallies"}`)
+  return {
+    recordings: recordings.length,
+    rallies: recordings
+      .filter((r) => r.segment_state === "ready")
+      .reduce((sum, r) => sum + r.rally_count, 0),
+    durationMs: recordings.reduce((sum, r) => sum + (r.duration_ms ?? 0), 0),
+    processing: recordings.filter(isProcessing).length,
   }
-  const durationMs = session.recordings.reduce(
-    (sum, r) => sum + (r.duration_ms ?? 0),
-    0
-  )
-  if (durationMs > 0) parts.push(formatDuration(durationMs))
-  return parts.join(" · ")
+}
+
+/** `n thing` / `n things`. */
+export function plural(n: number, one: string, many = `${one}s`): string {
+  return `${n} ${n === 1 ? one : many}`
+}
+
+/** Coarse footage length: `45s` under a minute, else formatDuration's `Nm`. */
+export function formatFootage(ms: number): string {
+  return ms > 0 && ms < 60_000
+    ? `${Math.round(ms / 1000)}s`
+    : formatDuration(ms)
+}
+
+function dayDate(day: string): Date | null {
+  const date = new Date(`${day}T00:00:00`)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+/** A capture day's calendar-tile parts: `{ month: "JUN", day: "21" }`. */
+export function dayTile(day: string): { month: string; day: string } | null {
+  const date = dayDate(day)
+  if (!date) return null
+  return {
+    month: date.toLocaleDateString(undefined, { month: "short" }).toUpperCase(),
+    day: String(date.getDate()),
+  }
+}
+
+/** A capture day as a session title without the year: "Sunday, June 21". */
+export function sessionTitle(day: string): string {
+  const date = dayDate(day)
+  if (!date) return day
+  return date.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  })
+}
+
+/**
+ * Sessions grouped by capture month, keeping their order (the backend lists
+ * newest first). The heading carries the year the session titles leave out.
+ */
+export function groupByMonth<T extends { capture_day: string }>(
+  sessions: T[]
+): { key: string; label: string; sessions: T[] }[] {
+  const groups: { key: string; label: string; sessions: T[] }[] = []
+  for (const session of sessions) {
+    const key = session.capture_day.slice(0, 7)
+    let group = groups[groups.length - 1]
+    if (!group || group.key !== key) {
+      const date = dayDate(`${key}-01`)
+      group = {
+        key,
+        label: date
+          ? date.toLocaleDateString(undefined, {
+              month: "long",
+              year: "numeric",
+            })
+          : key,
+        sessions: [],
+      }
+      groups.push(group)
+    }
+    group.sessions.push(session)
+  }
+  return groups
+}
+
+/**
+ * A library path short enough for one menu line: the home directory as `~`,
+ * and anything deeper than the last two folders elided — `…/scratchpad/lib`.
+ * The folder's own name (the useful end) always survives; the full path goes
+ * in a tooltip wherever this is shown.
+ */
+export function shortPath(path: string): string {
+  const home = path.match(/^\/(?:home|Users)\/[^/]+(?=\/|$)/)
+  const rest = home ? `~${path.slice(home[0].length)}` : path
+  const parts = rest.split(/[\\/]/).filter((p, i) => p !== "" || i === 0)
+  if (parts.length <= 4) return rest
+  return `${parts[0] === "~" ? "~/" : ""}…/${parts.slice(-2).join("/")}`
 }

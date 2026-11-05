@@ -3,9 +3,13 @@
  * library and the player both need, so they cannot drift apart per file.
  */
 
-/** In-rally clock for the rail and inspector: `m:ss`. */
+/**
+ * In-rally clock for the rail and inspector: `m:ss`. Floored, like the
+ * transport's `formatTimecode`, so a time read off the rail matches the clock
+ * under the video at the same instant.
+ */
 export function formatClock(ms: number): string {
-  const total = Math.round(ms / 1000)
+  const total = Math.max(0, Math.floor(ms / 1000))
   const m = Math.floor(total / 60)
   const s = total % 60
   return `${m}:${s.toString().padStart(2, "0")}`
@@ -25,6 +29,18 @@ export function formatTimecode(ms: number): string {
     return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`
   }
   return `${m}:${s.toString().padStart(2, "0")}`
+}
+
+/**
+ * A rally's (or any short span's) length: `8s` under a minute, `1:05` past it.
+ * Floored, so a 14.6 s rally reads "14s" and never looks long against the 15 s
+ * threshold. The one length formatter for the rail, inspector and moment
+ * browser, so the same rally never shows two lengths.
+ */
+export function formatLength(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  if (total < 60) return `${total}s`
+  return formatClock(total * 1000)
 }
 
 /** Coarse footage length for the session stats line: `Nm` or `Nh MMm`. */

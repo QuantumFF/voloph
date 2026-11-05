@@ -167,6 +167,27 @@ export function rallyLeadInMs(r: SessionRally, pad: Padding): number {
 }
 
 /**
+ * How far past a rally's strict start correction mode opens it. An exact seek
+ * lands on the frame shown at the target, whose timestamp sits up to a frame
+ * *before* it — on the start itself that's the lead-in, outside the rally, and
+ * Split would refuse. 50 ms clears one frame down to 20 fps while still
+ * showing the boundary frame.
+ */
+export const RALLY_START_INSET_MS = 50
+
+/**
+ * Where correction mode opens a session rally: its true start (not the clip
+ * padding before it), nudged inside by `RALLY_START_INSET_MS` — but never past
+ * the rally's midpoint, so a very short rally is still entered.
+ */
+export function rallyEditSeekMs(
+  r: Pick<SessionRally, "globalStart" | "globalEnd">
+): number {
+  const mid = (r.globalStart + r.globalEnd) / 2
+  return Math.min(r.globalStart + RALLY_START_INSET_MS, mid)
+}
+
+/**
  * How far a rally's padding reaches on the session axis (#104) — the span the
  * strip draws behind its strict block: `pad.lead_ms` before and `pad.tail_ms`
  * after, clamped into its own recording `[recordingStart, recordingEnd]`, as
@@ -469,6 +490,393 @@ export function rallyAt(
 }
 
 /**
+ * Which rally the review surfaces (rail highlight, inspector, flag and verdict
+ * keys) are about with the playhead at session-global `globalMs`:
+ *
+ * - `live`: inside a rally's strict span, or its clip padding (ADR 0020) — the
+ *   lead-in before it or the tail after it, clamped to its recording. Playback
+ *   is showing that rally, so it counts as that rally. Where one rally's tail
+ *   meets the next one's lead-in, the nearer strict span wins.
+ * - `after`: in a gap — the most recent rally to end, so what was just marked
+ *   stays in view until the next rally's lead-in opens.
+ * - `none`: before the first rally (or there are none); `index` is -1.
+ *
+ * `nextIndex` is the rally that starts next (-1 if none follows), for the gap's
+ * "Rally 13 in 2s" and the rail's up-next marker; only set when not `live`.
+ * Ownership of annotations is untouched: that stays the strict span
+ * (`rallyContains`).
+ */
+export interface RallyFocus {
+  kind: "live" | "after" | "none"
+  index: number
+  nextIndex: number
+}
+
+export function rallyFocusAt(
+  session: SessionModel,
+  pad: Padding,
+  globalMs: number
+): RallyFocus {
+  const { rallies } = session
+  const strict = rallyIndexAt(rallies, globalMs)
+  if (strict >= 0) return { kind: "live", index: strict, nextIndex: -1 }
+
+  let padded = -1
+  let paddedDist = Number.POSITIVE_INFINITY
+  let after = -1
+  let next = -1
+  for (let i = 0; i < rallies.length; i++) {
+    const r = rallies[i]
+    const recordingStart = r.globalStart - r.localStart
+    const durationMs =
+      session.segments.find((s) => s.index === r.recordingIndex)?.durationMs ??
+      Number.POSITIVE_INFINITY
+    const { start, end } = paddedSpanMs(
+      r.globalStart,
+      r.globalEnd,
+      pad,
+      recordingStart,
+      recordingStart + durationMs
+    )
+    if (globalMs >= start && globalMs < end) {
+      const dist =
+        globalMs < r.globalStart
+          ? r.globalStart - globalMs
+          : globalMs - r.globalEnd
+      if (dist < paddedDist) {
+        padded = i
+        paddedDist = dist
+      }
+    }
+    if (
+      r.globalEnd <= globalMs &&
+      (after < 0 || r.globalEnd > rallies[after].globalEnd)
+    ) {
+      after = i
+    }
+    if (
+      r.globalStart > globalMs &&
+      (next < 0 || r.globalStart < rallies[next].globalStart)
+    ) {
+      next = i
+    }
+  }
+  if (padded >= 0) return { kind: "live", index: padded, nextIndex: -1 }
+  // Just short of the next rally's lead-in, by no more than a seek's frame:
+  // that's where a jump to the lead-in lands, so it's that rally's.
+  if (next >= 0) {
+    const r = rallies[next]
+    const recordingStart = r.globalStart - r.localStart
+    const leadIn = Math.max(recordingStart, r.globalStart - pad.lead_ms)
+    if (leadIn > recordingStart && globalMs >= leadIn - FOCUS_SEEK_SLACK_MS) {
+      return { kind: "live", index: next, nextIndex: -1 }
+    }
+  }
+  return after >= 0
+    ? { kind: "after", index: after, nextIndex: next }
+    : { kind: "none", index: -1, nextIndex: next }
+}
+
+/**
+ * How far short of a rally's lead-in the playhead still counts as in it
+ * (`rallyFocusAt`). A seek is exact but lands on the frame shown at the
+ * target, whose timestamp sits up to a frame *before* it — so a jump to a
+ * lead-in can report a moment in the gap just ahead of it, and the review
+ * surfaces would flip back to the previous rally when that report arrives
+ * (often on an unrelated redraw, like toggling Skip gaps). One
+ * `RALLY_START_INSET_MS` absorbs that frame. Never applied where the lead-in
+ * is clamped to its recording's start: a seek can't land before a file's 0.
+ */
+export const FOCUS_SEEK_SLACK_MS = RALLY_START_INSET_MS
+
+/**
+ * Where a rally-targeted jump (a rail click, `[`/`]`, Next unmarked, Loop)
+ * opens a rally: while playing, on its lead-in — that's what clip padding is
+ * for; while paused or correcting the timeline, on its true start nudged
+ * inside (`rallyEditSeekMs`), so the playhead is in the rally and a verdict
+ * pressed right away is that rally's, and Split can act.
+ */
+export function rallyOpenMs(
+  r: SessionRally,
+  pad: Padding,
+  { atStrictStart }: { atStrictStart: boolean }
+): number {
+  return atStrictStart ? rallyEditSeekMs(r) : rallyLeadInMs(r, pad)
+}
+
+/**
+ * Which rally `[` / `]` step to from session-global `globalMs`, rally by rally
+ * (the rail's rows) — for when the jump opens the rally on its true start
+ * (`rallyOpenMs`) rather than walking the merged play intervals. Next: the
+ * rally after the one in focus, or the one up next from a gap. Prev, the
+ * music-player rule: well into a rally (or in the gap after it) restarts it,
+ * near its start steps to the one before; before the first rally it snaps to
+ * the first. -1 when there's nowhere to go.
+ */
+export function rallyStepIndex(
+  session: SessionModel,
+  pad: Padding,
+  globalMs: number,
+  direction: "next" | "prev"
+): number {
+  const n = session.rallies.length
+  if (n === 0) return -1
+  const focus = rallyFocusAt(session, pad, globalMs)
+  if (direction === "next") {
+    if (focus.kind === "live") return focus.index + 1 < n ? focus.index + 1 : -1
+    return focus.nextIndex
+  }
+  if (focus.kind === "none") return 0
+  const r = session.rallies[focus.index]
+  if (globalMs > r.globalStart + PREV_RESTART_SLACK_MS) return focus.index
+  return Math.max(0, focus.index - 1)
+}
+
+/**
+ * How many rallies own at least one annotation — the review's progress
+ * ("5/18 marked"), on the same rule as the session list's: a rally owns only
+ * the marks in its strict span, so a mark in a gap counts for none.
+ */
+export function markedRallyCount(
+  rallies: SessionRally[],
+  annotations: SessionAnnotation[]
+): number {
+  return annotationsByRally(rallies, annotations).size
+}
+
+/**
+ * The next rally after `fromIndex` that owns no annotation yet, wrapping
+ * round to the session's start so repeated presses walk every unmarked rally;
+ * -1 once every rally is marked. `fromIndex` -1 starts from the first rally.
+ */
+export function nextUnmarkedIndex(
+  rallies: SessionRally[],
+  annotations: SessionAnnotation[],
+  fromIndex: number
+): number {
+  const owned = annotationsByRally(rallies, annotations)
+  const n = rallies.length
+  for (let step = 1; step <= n; step++) {
+    const i = (((fromIndex + step) % n) + n) % n
+    if (!owned.has(rallyKey(rallies[i]))) return i
+  }
+  return -1
+}
+
+/** "2 corrected rallies and 1 flag" — `handCorrections` in words, or null if none. */
+export function describeHandCorrections({
+  corrected,
+  flagged,
+}: HandCorrections): string | null {
+  const parts = [
+    corrected > 0
+      ? `${corrected} corrected ${corrected === 1 ? "rally" : "rallies"}`
+      : null,
+    flagged > 0 ? `${flagged} ${flagged === 1 ? "flag" : "flags"}` : null,
+  ].filter((p) => p !== null)
+  return parts.length > 0 ? parts.join(" and ") : null
+}
+
+/**
+ * Where a moment sits relative to the rallies, for saying where a verdict lands:
+ * `in` a rally's strict span (that rally owns it), or in a gap — `before` the
+ * rally whose lead-in it is in (or the next one), `after` the rally whose tail
+ * or following gap it is in — or `none` with no rallies around. `padded` says
+ * the moment is in that rally's clip padding (its lead-in or tail) rather than
+ * the open gap. Read off `rallyFocusAt`, so it names the rally the inspector is
+ * showing. A moment outside every strict span belongs to no rally (glossary:
+ * a rally owns only the annotations in its strict span); this only says which
+ * rally it's next to.
+ */
+export type MomentPlace =
+  | { kind: "in"; index: number }
+  | { kind: "before" | "after"; index: number; padded: boolean }
+  | { kind: "none" }
+
+export function momentPlace(
+  session: SessionModel,
+  pad: Padding,
+  globalMs: number
+): MomentPlace {
+  const strict = rallyIndexAt(session.rallies, globalMs)
+  if (strict >= 0) return { kind: "in", index: strict }
+  const focus = rallyFocusAt(session, pad, globalMs)
+  if (focus.kind === "live") {
+    const r = session.rallies[focus.index]
+    return {
+      kind: globalMs < r.globalStart ? "before" : "after",
+      index: focus.index,
+      padded: true,
+    }
+  }
+  if (focus.kind === "after") {
+    return { kind: "after", index: focus.index, padded: false }
+  }
+  return focus.nextIndex >= 0
+    ? { kind: "before", index: focus.nextIndex, padded: false }
+    : { kind: "none" }
+}
+
+/**
+ * Where a mark at `place` lands, receiver first: the rally that will own it
+ * ("Rally 3"), else "Gap" — a moment outside every strict span belongs to no
+ * rally, so a gap never claims one — with the rally it's next to as context
+ * ("Rally 3 lead-in", "Rally 2 tail", "before Rally 1", "after Rally 2").
+ */
+export interface MomentLanding {
+  /** "Rally 3" when a rally owns the moment, else "Gap". */
+  receiver: string
+  /** The rally it sits beside, when in a gap; null inside a rally. */
+  context: string | null
+  /** Whether a rally owns the moment. */
+  owned: boolean
+}
+
+export function momentLanding(place: MomentPlace): MomentLanding {
+  if (place.kind === "none") {
+    return { receiver: "Gap", context: null, owned: false }
+  }
+  const name = `Rally ${place.index + 1}`
+  if (place.kind === "in") return { receiver: name, context: null, owned: true }
+  const context = place.padded
+    ? `${name} ${place.kind === "before" ? "lead-in" : "tail"}`
+    : `${place.kind} ${name}`
+  return { receiver: "Gap", context, owned: false }
+}
+
+/**
+ * `momentPlace` in words, receiver first and without a time — what a burst of
+ * marks is confirmed against: "Rally 3", "Gap (Rally 3 lead-in)",
+ * "Gap (after Rally 2)".
+ */
+export function describeMomentPlace(place: MomentPlace): string {
+  const { receiver, context } = momentLanding(place)
+  return context ? `${receiver} (${context})` : receiver
+}
+
+/**
+ * Where a verdict pressed now would land, in the one wording the inspector's
+ * slot, its verdict buttons and the held-rally chip share — receiver first,
+ * then the exact time it's pinned to (`clock`), then the context in a gap:
+ * "→ Rally 13 · 3:36", "→ Gap · 3:34 (Rally 13 lead-in)".
+ */
+export function describeLanding(place: MomentPlace, clock: string): string {
+  const { receiver, context } = momentLanding(place)
+  return `→ ${receiver} · ${clock}${context ? ` (${context})` : ""}`
+}
+
+/** One verdict in a `MarkBurst`: the annotation's own id, so Undo deletes it. */
+export interface BurstMark {
+  path: string
+  id: number
+  verdict: Verdict
+  /** Session-global timestamp it was pinned to (never moved). */
+  globalMs: number
+}
+
+/**
+ * The verdicts just dropped in quick succession on one place — confirmed
+ * together ("Good · Bad · Mistake → Rally 1") rather than only the last, so
+ * pressing 1, 2, 3 mid-play acknowledges all three.
+ */
+export interface MarkBurst {
+  /** Where they landed, in words (`describeMomentPlace`). */
+  place: string
+  /** In press order; never empty. */
+  marks: BurstMark[]
+}
+
+/**
+ * Add a mark to the confirmation burst: it joins the shown burst when it landed
+ * on the same place, else starts a new one. The caller drops the burst once its
+ * confirmation times out, so a stale burst is never extended.
+ */
+export function extendMarkBurst(
+  burst: MarkBurst | null,
+  place: string,
+  mark: BurstMark
+): MarkBurst {
+  return burst && burst.place === place
+    ? { place, marks: [...burst.marks, mark] }
+    : { place, marks: [mark] }
+}
+
+/**
+ * Keep only the burst's marks that still exist (Undo, or a delete from the
+ * annotation list, may have removed some); null once none are left.
+ */
+export function pruneMarkBurst(
+  burst: MarkBurst | null,
+  exists: (mark: BurstMark) => boolean
+): MarkBurst | null {
+  if (!burst) return null
+  const marks = burst.marks.filter(exists)
+  if (marks.length === burst.marks.length) return burst
+  return marks.length > 0 ? { ...burst, marks } : null
+}
+
+const VERDICT_WORD: Record<Verdict, string> = {
+  good: "Good",
+  bad: "Bad",
+  mistake: "Mistake",
+}
+
+/**
+ * A burst's verdicts in words, in verdict order with repeats counted:
+ * "Good · Bad · Mistake", "Good ×2 · Mistake".
+ */
+export function describeMarkBurst(burst: MarkBurst): string {
+  return VERDICTS.map((v) => {
+    const n = burst.marks.filter((m) => m.verdict === v).length
+    if (n === 0) return null
+    return n > 1 ? `${VERDICT_WORD[v]} ×${n}` : VERDICT_WORD[v]
+  })
+    .filter((s) => s !== null)
+    .join(" · ")
+}
+
+/**
+ * Whole seconds until session-global `targetMs`, rounded **up**, so a countdown
+ * never reads "0s" while there is still time to wait (it reaches 0 only at the
+ * moment itself). Never negative.
+ */
+export function secondsUntil(fromMs: number, targetMs: number): number {
+  return Math.max(0, Math.ceil((targetMs - fromMs) / 1000))
+}
+
+/**
+ * The confidence an inline correction stamps on a rally (`db::CORRECTED_CONFIDENCE`):
+ * every machine draft stays strictly below it, so a rally at it was put there by
+ * hand (adjusted, split, merged or added).
+ */
+export const CORRECTED_CONFIDENCE = 1
+
+/**
+ * What a re-analysis of this timeline would throw away (ADR 0002): re-analyze
+ * discards every rally, so hand-corrected boundaries and flags go with them. The
+ * same "hand-touched" reading as `db::is_hand_touched`, minus annotations —
+ * those are pinned to time, not to a rally, so a re-analysis keeps them. Errs
+ * toward caution: v6 can clamp a fully-active span to the sentinel too, so one of
+ * its drafts may count a rally as corrected that nobody touched.
+ */
+export interface HandCorrections {
+  corrected: number
+  flagged: number
+}
+
+export function handCorrections(
+  timeline: Timeline | null | undefined
+): HandCorrections {
+  let corrected = 0
+  let flagged = 0
+  for (const r of timeline?.rallies ?? []) {
+    if (r.confidence >= CORRECTED_CONFIDENCE) corrected += 1
+    if (r.flagged) flagged += 1
+  }
+  return { corrected, flagged }
+}
+
+/**
  * Each annotation grouped under the rally that owns it (`rallyAt` its moment),
  * keyed by `rallyKey`. Annotations in a gap belong to no rally and are dropped;
  * each group keeps the input order.
@@ -487,6 +895,51 @@ export function annotationsByRally(
     else out.set(key, [a])
   }
   return out
+}
+
+/**
+ * Annotations folded into one row per verdict per displayed second — the
+ * inspector's list, where five Goods pressed at 0:20 read as "Good ×5 · 0:20"
+ * rather than five identical rows. Keyed by verdict and whole session second
+ * (what `formatClock` shows), in order of first appearance, so a time-ordered
+ * input gives time-ordered groups; each group keeps its marks in input order.
+ */
+export interface AnnotationGroup {
+  /** Stable across renders: verdict and whole session second. */
+  key: string
+  verdict: Verdict
+  /** The first mark's session-global time. */
+  globalMs: number
+  /** Never empty. */
+  marks: SessionAnnotation[]
+}
+
+export function groupAnnotations(
+  annotations: SessionAnnotation[]
+): AnnotationGroup[] {
+  const groups = new Map<string, AnnotationGroup>()
+  for (const a of annotations) {
+    const key = `${a.verdict}@${Math.floor(a.globalMs / 1000)}`
+    const group = groups.get(key)
+    if (group) group.marks.push(a)
+    else
+      groups.set(key, {
+        key,
+        verdict: a.verdict,
+        globalMs: a.globalMs,
+        marks: [a],
+      })
+  }
+  return [...groups.values()]
+}
+
+/** Per-verdict tallies of a list of annotations (zero for a verdict absent). */
+export function countVerdicts(
+  annotations: Pick<SessionAnnotation, "verdict">[]
+): Record<Verdict, number> {
+  const counts: Record<Verdict, number> = { good: 0, bad: 0, mistake: 0 }
+  for (const a of annotations) counts[a.verdict] += 1
+  return counts
 }
 
 /** The whole session stitched onto one continuous axis. */
@@ -907,4 +1360,41 @@ export function editAffordances(
     playheadMs !== null &&
     splitRallyEdit(target, playheadMs, offset).kind === "ops"
   return { target, mergeTarget, canSplit, canMerge: mergeTarget !== null }
+}
+
+/** Why each edit-toolbar action is unavailable, or null when it's available. */
+export interface EditBlockedReasons {
+  split: string | null
+  merge: string | null
+  delete: string | null
+}
+
+/**
+ * The reason a disabled edit control gives (issue 9: a greyed button must say
+ * why, and how to enable it). `rallyNumber` is the selected rally's 1-based
+ * session-wide number, or null when nothing is selected; `canSplit`/`canMerge`
+ * come from `editAffordances`.
+ */
+export function editBlockedReasons(
+  rallyNumber: number | null,
+  canSplit: boolean,
+  canMerge: boolean
+): EditBlockedReasons {
+  if (rallyNumber === null) {
+    const pick = "Select a rally first — click it on the strip or in the rail"
+    return {
+      split: `${pick} to split it.`,
+      merge: `${pick} to merge it.`,
+      delete: `${pick} to delete it.`,
+    }
+  }
+  return {
+    split: canSplit
+      ? null
+      : `Move the playhead inside Rally ${rallyNumber} to split it there.`,
+    merge: canMerge
+      ? null
+      : `Rally ${rallyNumber} has no next rally in the same recording to merge with.`,
+    delete: null,
+  }
 }
